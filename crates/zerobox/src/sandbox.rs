@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::Child;
@@ -22,6 +23,8 @@ use crate::proxy;
 use crate::secret;
 
 pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
+const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const RESERVED_CHILD_ENV_KEYS: &[&str] = &["ZEROBOX_HOME", "CODEX_HOME"];
 
 pub struct SandboxOutput {
     pub status: ExitStatus,
@@ -29,13 +32,54 @@ pub struct SandboxOutput {
     pub stderr: Vec<u8>,
 }
 
+/// A typed failure that occurred before the sandboxed target crossed its final
+/// setup boundary. Target exit statuses are always returned separately.
+#[derive(Debug)]
+pub enum SandboxSetupError {
+    Preparation(anyhow::Error),
+    Spawn(anyhow::Error),
+    HelperExited { status: ExitStatus },
+    HelperProtocol(String),
+    HelperTimeout,
+}
+
+impl std::fmt::Display for SandboxSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preparation(error) => write!(f, "sandbox preparation failed: {error:#}"),
+            Self::Spawn(error) => write!(f, "sandbox spawn failed: {error:#}"),
+            Self::HelperExited { status } => {
+                write!(f, "Linux sandbox helper exited during setup: {status}")
+            }
+            Self::HelperProtocol(message) => {
+                write!(f, "Linux sandbox helper setup protocol failed: {message}")
+            }
+            Self::HelperTimeout => write!(f, "Linux sandbox helper did not confirm target startup"),
+        }
+    }
+}
+
+impl std::error::Error for SandboxSetupError {}
+
+impl From<anyhow::Error> for SandboxSetupError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Preparation(error)
+    }
+}
+
 pub struct SandboxChild {
     inner: Child,
+    started_pid: u32,
     _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
+    _proxy_root: Option<PrivateProxyRoot>,
+    _setup_channel: Option<PrivateSetupChannel>,
 }
 
 impl SandboxChild {
+    pub fn pid(&self) -> u32 {
+        self.started_pid
+    }
     pub fn stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.inner.stdout.take()
     }
@@ -45,6 +89,16 @@ impl SandboxChild {
     }
 
     pub async fn wait(mut self) -> Result<ExitStatus> {
+        Ok(self.inner.wait().await?)
+    }
+
+    #[doc(hidden)]
+    pub async fn kill_and_wait(mut self) -> Result<ExitStatus> {
+        if let Err(error) = self.inner.kill().await
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            return Err(error.into());
+        }
         Ok(self.inner.wait().await?)
     }
 }
@@ -72,6 +126,7 @@ pub struct Sandbox {
     profile_names: Vec<String>,
     use_profile: bool,
     linux_sandbox_exe: Option<PathBuf>,
+    setup_status: bool,
 }
 
 impl Sandbox {
@@ -99,6 +154,7 @@ impl Sandbox {
             profile_names: Vec::new(),
             use_profile: true,
             linux_sandbox_exe: None,
+            setup_status: false,
         }
     }
 
@@ -252,13 +308,23 @@ impl Sandbox {
         self
     }
 
-    pub async fn run(self) -> Result<SandboxOutput> {
-        let mut prepared = self.prepare().await?;
-        let output = prepared
-            .cmd
-            .output()
+    #[doc(hidden)]
+    pub fn setup_status(mut self, enabled: bool) -> Self {
+        self.setup_status = enabled;
+        self
+    }
+
+    pub async fn run(self) -> std::result::Result<SandboxOutput, SandboxSetupError> {
+        let mut prepared = self.setup_status(true).prepare().await?;
+        prepared.cmd.stdin(std::process::Stdio::null());
+        prepared.cmd.stdout(std::process::Stdio::piped());
+        prepared.cmd.stderr(std::process::Stdio::piped());
+        let (child, _) = prepared.spawn_checked().await?;
+        let output = child
+            .wait_with_output()
             .await
-            .context("failed to execute command")?;
+            .context("failed to execute command")
+            .map_err(SandboxSetupError::Spawn)?;
         Ok(SandboxOutput {
             status: output.status,
             stdout: output.stdout,
@@ -266,27 +332,63 @@ impl Sandbox {
         })
     }
 
-    pub async fn spawn(self) -> Result<SandboxChild> {
-        let mut prepared = self.prepare().await?;
+    pub async fn spawn(self) -> std::result::Result<SandboxChild, SandboxSetupError> {
+        let mut prepared = self.setup_status(true).prepare().await?;
         prepared.cmd.stdout(std::process::Stdio::piped());
         prepared.cmd.stderr(std::process::Stdio::piped());
         prepared.cmd.stdin(std::process::Stdio::null());
-        let child = prepared.cmd.spawn().context("failed to spawn command")?;
+        let (child, started_pid) = prepared.spawn_checked().await?;
         Ok(SandboxChild {
             inner: child,
+            started_pid,
             _proxy_handle: prepared._proxy_handle,
             _proxy: prepared._proxy,
+            _proxy_root: prepared._proxy_root,
+            _setup_channel: prepared._setup_channel,
         })
     }
 
-    pub async fn status(self) -> Result<ExitStatus> {
+    /// Spawn with inherited stdin and piped output for a streaming CLI relay.
+    #[doc(hidden)]
+    pub async fn spawn_streaming(self) -> std::result::Result<SandboxChild, SandboxSetupError> {
         let mut prepared = self.prepare().await?;
-        let status = prepared
-            .cmd
-            .status()
+        prepared.cmd.stdout(std::process::Stdio::piped());
+        prepared.cmd.stderr(std::process::Stdio::piped());
+        let (child, started_pid) = prepared.spawn_checked().await?;
+        Ok(SandboxChild {
+            inner: child,
+            started_pid,
+            _proxy_handle: prepared._proxy_handle,
+            _proxy: prepared._proxy,
+            _proxy_root: prepared._proxy_root,
+            _setup_channel: prepared._setup_channel,
+        })
+    }
+
+    /// Spawn using the caller's inherited stdio. This is intended for CLI
+    /// frontends that must stream pipes as well as terminals.
+    #[doc(hidden)]
+    pub async fn spawn_inherited(self) -> std::result::Result<SandboxChild, SandboxSetupError> {
+        let mut prepared = self.prepare().await?;
+        let (child, started_pid) = prepared.spawn_checked().await?;
+        Ok(SandboxChild {
+            inner: child,
+            started_pid,
+            _proxy_handle: prepared._proxy_handle,
+            _proxy: prepared._proxy,
+            _proxy_root: prepared._proxy_root,
+            _setup_channel: prepared._setup_channel,
+        })
+    }
+
+    pub async fn status(self) -> std::result::Result<ExitStatus, SandboxSetupError> {
+        let mut prepared = self.setup_status(true).prepare().await?;
+        let (mut child, _) = prepared.spawn_checked().await?;
+        child
+            .wait()
             .await
-            .context("failed to execute command")?;
-        Ok(status)
+            .context("failed to execute command")
+            .map_err(SandboxSetupError::Spawn)
     }
 
     /// Re-exec the current binary inside a sandbox.
@@ -314,7 +416,7 @@ impl Sandbox {
         std::process::exit(status.code().unwrap_or(1));
     }
 
-    pub async fn prepare(self) -> Result<PreparedCommand> {
+    pub async fn prepare(self) -> std::result::Result<PreparedCommand, SandboxSetupError> {
         init_home();
 
         let Sandbox {
@@ -340,6 +442,7 @@ impl Sandbox {
             profile_names,
             use_profile,
             linux_sandbox_exe,
+            setup_status,
         } = self;
 
         let cwd = match cwd {
@@ -347,30 +450,37 @@ impl Sandbox {
             None => std::env::current_dir().context("cannot determine working directory")?,
         };
 
-        if use_profile && !disabled && !full_access {
+        let mut effective_strict = strict;
+
+        if use_profile {
             let profile = if profile_names.is_empty() {
                 crate::profile_core::load_profile("default", &cwd)?
             } else {
                 crate::profile_core::load_profiles(&profile_names, &cwd)?
             };
-            apply_profile(
-                &profile,
-                &mut allow_read,
-                &mut deny_read,
-                &mut allow_write,
-                &mut deny_write,
-                &mut full_write,
-                &mut allow_net,
-                &mut deny_net,
-                &mut env,
-                &mut allow_env,
-                &mut deny_env,
-                &mut secrets,
-                &mut secret_hosts,
-                &mut disabled,
-                &mut full_access,
-            );
+            effective_strict = is_strict(effective_strict, &profile);
+            if !disabled && !full_access {
+                apply_profile(
+                    &profile,
+                    &mut allow_read,
+                    &mut deny_read,
+                    &mut allow_write,
+                    &mut deny_write,
+                    &mut full_write,
+                    &mut allow_net,
+                    &mut deny_net,
+                    &mut env,
+                    &mut allow_env,
+                    &mut deny_env,
+                    &mut secrets,
+                    &mut secret_hosts,
+                    &mut disabled,
+                    &mut full_access,
+                );
+            }
         }
+
+        validate_sandbox_configuration(effective_strict, disabled, full_access)?;
 
         #[cfg(unix)]
         if use_profile
@@ -382,6 +492,7 @@ impl Sandbox {
             apply_claude_json_redirect(&home);
         }
 
+        validate_literal_deny_paths(&deny_read, &deny_write)?;
         if !full_access {
             validate_paths(&allow_read, &deny_read, &allow_write, &deny_write, &cwd)?;
         }
@@ -396,16 +507,19 @@ impl Sandbox {
             allow_read.push(ca_path);
         }
 
-        let mut child_env = build_env(inherit_env, allow_env.as_deref(), &deny_env, &env);
-        for (key, placeholder) in secret_store.get_env_overrides() {
-            child_env.insert(key, placeholder);
-        }
+        let strict_path =
+            select_strict_path(effective_strict, env.get("PATH").map(String::as_str))?;
+        let child_env = finalize_child_env(
+            build_env(inherit_env, allow_env.as_deref(), &deny_env, &env),
+            secret_store.get_env_overrides(),
+            strict_path.as_deref(),
+        );
 
         let net_enabled = allow_net.is_some() || !secret_store.is_empty();
         let (sandbox_type, use_legacy_landlock) = if disabled || full_access {
             (SandboxType::None, false)
         } else {
-            select_sandbox_type(strict)?
+            select_sandbox_type(effective_strict)?
         };
 
         let linux_sandbox_exe: Option<PathBuf> = if cfg!(target_os = "linux") {
@@ -413,6 +527,15 @@ impl Sandbox {
         } else {
             None
         };
+
+        #[cfg(target_os = "linux")]
+        let setup_channel = if setup_status && sandbox_type == SandboxType::LinuxSeccomp {
+            Some(PrivateSetupChannel::create()?)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let setup_channel: Option<PrivateSetupChannel> = None;
 
         let fs_policy = build_fs_policy(
             &allow_read,
@@ -445,6 +568,12 @@ impl Sandbox {
             None => None,
         };
 
+        let proxy_root = if proxy.is_some() && sandbox_type == SandboxType::LinuxSeccomp {
+            Some(PrivateProxyRoot::create()?)
+        } else {
+            None
+        };
+
         let cwd_abs = AbsolutePathBuf::from_absolute_path(&cwd)
             .context("working directory must be absolute")?;
 
@@ -463,6 +592,8 @@ impl Sandbox {
                 sandbox: sandbox_type,
                 enforce_managed_network: proxy.is_some(),
                 network: proxy.as_ref(),
+                proxy_root: proxy_root.as_ref().map(PrivateProxyRoot::path),
+                setup_status_fd: setup_channel.as_ref().map(PrivateSetupChannel::write_fd),
                 sandbox_policy_cwd: &cwd,
                 zerobox_linux_sandbox_exe: linux_sandbox_exe.as_deref(),
                 use_legacy_landlock,
@@ -489,6 +620,9 @@ impl Sandbox {
         let mut final_env = exec_request.env;
         if let Some(ref proxy) = proxy {
             proxy.apply_to_env(&mut final_env);
+            for key in zerobox_network_proxy::NO_PROXY_ENV_KEYS {
+                final_env.remove(*key);
+            }
         }
         if !net_enabled {
             final_env.insert(
@@ -512,12 +646,15 @@ impl Sandbox {
                 final_env.insert(var.to_string(), ca.clone());
             }
         }
+        remove_reserved_child_env(&mut final_env);
         cmd.envs(&final_env);
 
         Ok(PreparedCommand {
             cmd,
             _proxy_handle,
             _proxy: proxy,
+            _proxy_root: proxy_root,
+            _setup_channel: setup_channel,
         })
     }
 }
@@ -526,12 +663,384 @@ pub struct PreparedCommand {
     cmd: tokio::process::Command,
     _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
+    _proxy_root: Option<PrivateProxyRoot>,
+    _setup_channel: Option<PrivateSetupChannel>,
 }
 
+/// A prepared command cannot be detached while it owns resources that must
+/// remain alive for the child process.
+#[derive(Debug, thiserror::Error)]
+#[error("resource-managed prepared commands must be spawned through PreparedCommand::spawn")]
+pub struct PreparedCommandIntoCommandError;
+
 impl PreparedCommand {
-    pub fn into_command(self) -> tokio::process::Command {
-        self.cmd
+    /// Borrow the raw Tokio command to customize stdio or other spawn options.
+    pub fn command_mut(&mut self) -> &mut tokio::process::Command {
+        &mut self.cmd
     }
+
+    /// Recover the raw command when no managed resources are attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreparedCommandIntoCommandError`] when detaching the raw
+    /// command would drop a proxy, private proxy root, or setup channel needed
+    /// by the child.
+    pub fn into_command(
+        self,
+    ) -> std::result::Result<tokio::process::Command, PreparedCommandIntoCommandError> {
+        if self._proxy_handle.is_some()
+            || self._proxy.is_some()
+            || self._proxy_root.is_some()
+            || self._setup_channel.is_some()
+        {
+            return Err(PreparedCommandIntoCommandError);
+        }
+        Ok(self.cmd)
+    }
+
+    /// Spawn the prepared command while transferring all managed resources to
+    /// the returned child.
+    ///
+    /// This preserves the preparation mode selected by [`Sandbox::prepare`].
+    /// Unlike [`Sandbox::spawn`], a directly prepared command does not request
+    /// Linux helper confirmation of the final target execution by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxSetupError`] if spawning fails, or if a setup channel
+    /// was explicitly attached and the helper rejects the final execution.
+    pub async fn spawn(mut self) -> std::result::Result<SandboxChild, SandboxSetupError> {
+        let (inner, started_pid) = self.spawn_checked().await?;
+        Ok(SandboxChild {
+            inner,
+            started_pid,
+            _proxy_handle: self._proxy_handle,
+            _proxy: self._proxy,
+            _proxy_root: self._proxy_root,
+            _setup_channel: self._setup_channel,
+        })
+    }
+
+    async fn spawn_checked(&mut self) -> std::result::Result<(Child, u32), SandboxSetupError> {
+        #[cfg(target_os = "linux")]
+        if let Some(channel) = self._setup_channel.as_ref() {
+            let fd = channel.write_fd();
+            unsafe {
+                self.cmd.pre_exec(move || clear_cloexec(fd));
+            }
+        }
+        let mut child = self
+            .cmd
+            .spawn()
+            .context("failed to spawn command")
+            .map_err(SandboxSetupError::Spawn)?;
+        let host_pid = child.id();
+        if let Some(channel) = self._setup_channel.as_mut() {
+            channel.close_parent_write();
+        }
+        let started_pid = if let Some(channel) = self._setup_channel.as_ref() {
+            let _inner_pid = channel.wait_for_started(&mut child).await?;
+            host_pid.ok_or_else(|| {
+                SandboxSetupError::HelperProtocol(
+                    "spawned helper has no host process id".to_string(),
+                )
+            })?
+        } else {
+            child.id().ok_or_else(|| {
+                SandboxSetupError::HelperProtocol("spawned target has no process id".to_string())
+            })?
+        };
+        Ok((child, started_pid))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateSetupChannel {
+    read: std::fs::File,
+    write: Option<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl PrivateSetupChannel {
+    fn create() -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to create private setup pipe");
+        }
+        Ok(Self {
+            read: unsafe { std::fs::File::from_raw_fd(fds[0]) },
+            write: Some(unsafe { std::fs::File::from_raw_fd(fds[1]) }),
+        })
+    }
+
+    fn write_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.write.as_ref().expect("setup pipe is open").as_raw_fd()
+    }
+
+    fn close_parent_write(&mut self) {
+        self.write.take();
+    }
+
+    async fn wait_for_started(
+        &self,
+        child: &mut Child,
+    ) -> std::result::Result<u32, SandboxSetupError> {
+        let wait_for_message = async {
+            let mut pending = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        let mut reader = &self.read;
+                        match read_setup_frame(&mut reader, &mut pending) {
+                            Ok(Some(frame)) if frame == "STARTED" => return Ok(0),
+                            Ok(Some(frame)) if frame.starts_with("ERR:") => {
+                                return Err(SandboxSetupError::HelperProtocol(frame));
+                            }
+                            Ok(Some(_)) => return Err(SandboxSetupError::HelperProtocol("unexpected setup frame".to_string())),
+                            Ok(None) => {}
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData) => {
+                                return Err(SandboxSetupError::HelperProtocol(error.to_string()));
+                            }
+                            Err(error) => return Err(SandboxSetupError::Spawn(anyhow::Error::from(error))),
+                        }
+                        if let Some(status) = child.try_wait().context("failed to poll Linux sandbox helper").map_err(SandboxSetupError::Spawn)? {
+                            return Err(SandboxSetupError::HelperExited { status });
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait_for_message)
+            .await
+            .map_err(|_| SandboxSetupError::HelperTimeout)?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_setup_frame<R: std::io::Read + ?Sized>(
+    reader: &mut R,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    loop {
+        if let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let frame = pending.drain(..=newline).collect::<Vec<_>>();
+            let frame = std::str::from_utf8(&frame[..newline]).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 setup frame")
+            })?;
+            return Ok(Some(frame.to_string()));
+        }
+        if pending.len() >= 128 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "setup frame exceeds 128 bytes",
+            ));
+        }
+
+        let mut bytes = [0u8; 128];
+        match reader.read(&mut bytes[..128 - pending.len()]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "setup pipe closed before a complete frame",
+                ));
+            }
+            Ok(size) => pending.extend_from_slice(&bytes[..size]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct PrivateSetupChannel;
+
+#[cfg(not(target_os = "linux"))]
+impl PrivateSetupChannel {
+    fn write_fd(&self) -> i32 {
+        unreachable!("Linux setup channel unavailable")
+    }
+
+    fn close_parent_write(&mut self) {}
+
+    async fn wait_for_started(
+        &self,
+        _child: &mut Child,
+    ) -> std::result::Result<u32, SandboxSetupError> {
+        Err(SandboxSetupError::HelperProtocol(
+            "Linux setup channel unavailable".to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clear_cloexec(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A per-execution owner-only directory used by the Linux helper's host-side
+/// proxy bridge. Keeping this handle with the prepared command (and then the
+/// child) prevents cleanup before the helper has consumed `--proxy-root`.
+#[derive(Debug)]
+struct PrivateProxyRoot {
+    path: PathBuf,
+}
+
+impl PrivateProxyRoot {
+    fn create() -> Result<Self> {
+        Self::create_in(&crate::zerobox_home().join("tmp").join("runs"))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    fn create_in(runs_root: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        ensure_private_proxy_directory(runs_root)?;
+
+        for _ in 0..128 {
+            // Keep this component short: Linux AF_UNIX paths are limited to
+            // 107 bytes and the helper adds its own socket-directory names.
+            let mut random = [0u8; 4];
+            getrandom::fill(&mut random).context("failed to generate proxy root nonce")?;
+            let nonce = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let candidate = runs_root.join(format!("p-{nonce}"));
+            validate_linux_proxy_socket_path_budget(&candidate)?;
+
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => {
+                    ensure_private_proxy_directory(&candidate)?;
+                    return Ok(Self { path: candidate });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create private proxy root {}",
+                            candidate.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        anyhow::bail!("could not allocate a unique private proxy root")
+    }
+
+    #[cfg(not(unix))]
+    fn create_in(_runs_root: &Path) -> Result<Self> {
+        anyhow::bail!("managed proxy roots require Unix filesystem permissions")
+    }
+}
+
+#[cfg(unix)]
+fn validate_linux_proxy_socket_path_budget(proxy_root: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // The helper creates `p-<pid>-<attempt>/r-<index>.sock` below this root.
+    // Reserve for the widest numeric forms so every generated AF_UNIX path
+    // remains below Linux's 108-byte sun_path including its trailing NUL.
+    let worst_case = proxy_root.join(format!("p-{}-127/r-{}.sock", u32::MAX, usize::MAX));
+    if worst_case.as_os_str().as_bytes().len() >= 108 {
+        anyhow::bail!(
+            "ZEROBOX_HOME is too long for private Linux proxy sockets: {}",
+            proxy_root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+impl Drop for PrivateProxyRoot {
+    fn drop(&mut self) {
+        if ensure_private_proxy_directory(&self.path).is_ok() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for PrivateProxyRoot {
+    fn drop(&mut self) {}
+}
+
+#[cfg(unix)]
+fn ensure_private_proxy_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(path).with_context(|| {
+        format!(
+            "failed to create private proxy directory {}",
+            path.display()
+        )
+    })?;
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect private proxy directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "private proxy directory must be a non-symlink directory: {}",
+            path.display()
+        );
+    }
+    let current_uid = std::fs::metadata("/proc/self")
+        .context("failed to determine current process owner")?
+        .uid();
+    if metadata.uid() != current_uid {
+        anyhow::bail!(
+            "private proxy directory is not owned by the current user: {}",
+            path.display()
+        );
+    }
+
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).with_context(|| {
+        format!(
+            "failed to restrict private proxy directory {}",
+            path.display()
+        )
+    })?;
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to re-inspect private proxy directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != current_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        anyhow::bail!(
+            "private proxy directory failed ownership or mode validation: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -806,6 +1315,7 @@ fn validate_paths(
             .with_context(|| format!("invalid allow_read path: {}", p.display()))?;
     }
     for p in deny_read {
+        validate_literal_deny_path("deny_read", p)?;
         resolve_path(cwd, p).with_context(|| format!("invalid deny_read path: {}", p.display()))?;
     }
     for p in allow_write {
@@ -813,10 +1323,93 @@ fn validate_paths(
             .with_context(|| format!("invalid allow_write path: {}", p.display()))?;
     }
     for p in deny_write {
+        validate_literal_deny_path("deny_write", p)?;
         resolve_path(cwd, p)
             .with_context(|| format!("invalid deny_write path: {}", p.display()))?;
     }
     Ok(())
+}
+
+fn validate_literal_deny_paths(deny_read: &[PathBuf], deny_write: &[PathBuf]) -> Result<()> {
+    for path in deny_read {
+        validate_literal_deny_path("deny_read", path)?;
+    }
+    for path in deny_write {
+        validate_literal_deny_path("deny_write", path)?;
+    }
+    Ok(())
+}
+
+fn validate_sandbox_configuration(strict: bool, disabled: bool, full_access: bool) -> Result<()> {
+    if strict && (disabled || full_access) {
+        anyhow::bail!("strict sandbox cannot be combined with no sandbox or full access");
+    }
+    Ok(())
+}
+
+fn is_strict(explicit_strict: bool, profile: &crate::profile_core::Profile) -> bool {
+    explicit_strict || profile.strict_sandbox.unwrap_or(false)
+}
+
+fn validate_literal_deny_path(field: &str, path: &Path) -> Result<()> {
+    let path = path.to_string_lossy();
+    if let Some(character) = path
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+    {
+        anyhow::bail!(
+            "{field} paths must be literal; found glob character '{character}' in '{path}'"
+        );
+    }
+    Ok(())
+}
+
+fn select_strict_path(strict: bool, configured: Option<&str>) -> Result<Option<String>> {
+    if !strict {
+        return Ok(None);
+    }
+
+    let raw = configured.unwrap_or(STRICT_PATH);
+    let segments = std::env::split_paths(raw).collect::<Vec<_>>();
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| segment.as_os_str().is_empty())
+    {
+        anyhow::bail!("strict PATH must contain only non-empty absolute path segments");
+    }
+    if let Some(segment) = segments.iter().find(|segment| !segment.is_absolute()) {
+        anyhow::bail!(
+            "strict PATH segment must be absolute: {}",
+            segment.display()
+        );
+    }
+
+    let joined = std::env::join_paths(segments)
+        .context("strict PATH contains a segment that cannot be represented")?;
+    let joined = joined
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("strict PATH must be valid UTF-8"))?;
+    Ok(Some(joined))
+}
+
+fn finalize_child_env(
+    mut env: HashMap<String, String>,
+    secret_overrides: HashMap<String, String>,
+    strict_path: Option<&str>,
+) -> HashMap<String, String> {
+    env.extend(secret_overrides);
+    if let Some(path) = strict_path {
+        env.insert("PATH".to_string(), path.to_string());
+    }
+    remove_reserved_child_env(&mut env);
+    env
+}
+
+fn remove_reserved_child_env(env: &mut HashMap<String, String>) {
+    for key in RESERVED_CHILD_ENV_KEYS {
+        env.remove(*key);
+    }
 }
 
 fn init_home() {
@@ -979,14 +1572,44 @@ fn select_sandbox_type(strict: bool) -> Result<(SandboxType, bool)> {
 
 #[cfg(target_os = "linux")]
 fn can_create_user_namespace() -> bool {
-    use std::process::Command;
-    Command::new("unshare")
-        .args(["--user", "--", "true"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        let exit_code = if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
+            0
+        } else {
+            1
+        };
+        unsafe { libc::_exit(exit_code) };
+    }
+
+    wait_for_user_namespace_probe_with(pid, |status| {
+        let waited = unsafe { libc::waitpid(pid, status, 0) };
+        if waited < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(waited)
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_user_namespace_probe_with(
+    pid: libc::pid_t,
+    mut wait: impl FnMut(&mut libc::c_int) -> std::io::Result<libc::pid_t>,
+) -> bool {
+    let mut status = 0;
+    loop {
+        match wait(&mut status) {
+            Ok(waited) if waited == pid => break,
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -997,6 +1620,60 @@ fn can_create_user_namespace() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    struct InterruptedFragmentedReader {
+        reads: usize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl std::io::Read for InterruptedFragmentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            match self.reads {
+                1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                2 => {
+                    buffer[..3].copy_from_slice(b"STA");
+                    Ok(3)
+                }
+                3 => {
+                    buffer[..5].copy_from_slice(b"RTED\n");
+                    Ok(5)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_frame_reader_retries_eintr_and_assembles_fragments() {
+        let mut reader = InterruptedFragmentedReader { reads: 0 };
+        let mut pending = Vec::new();
+        let frame = read_setup_frame(&mut reader, &mut pending)
+            .expect("read setup frame")
+            .expect("complete frame");
+
+        assert_eq!(frame, "STARTED");
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_namespace_probe_wait_retries_eintr() {
+        let mut waits = 0;
+        let available = wait_for_user_namespace_probe_with(42, |status| {
+            waits += 1;
+            if waits == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            *status = 0;
+            Ok(42)
+        });
+
+        assert!(available);
+        assert_eq!(waits, 2);
+    }
     use std::path::PathBuf;
 
     fn p(s: &str) -> PathBuf {
@@ -1017,6 +1694,232 @@ mod tests {
         let aw: Vec<_> = aw.iter().map(|s| p(s)).collect();
         let dw: Vec<_> = dw.iter().map(|s| p(s)).collect();
         build_fs_policy(&ar, &dr, &aw, &dw, fw, fa, net, Path::new("/work"))
+    }
+
+    #[test]
+    fn profile_strictness_is_effective_without_explicit_strict_flag() {
+        let strict_profile = crate::profile_core::Profile {
+            strict_sandbox: Some(true),
+            ..Default::default()
+        };
+        let relaxed_profile = crate::profile_core::Profile {
+            strict_sandbox: Some(false),
+            ..Default::default()
+        };
+
+        assert!(is_strict(false, &strict_profile));
+        assert!(is_strict(true, &relaxed_profile));
+        assert!(!is_strict(false, &relaxed_profile));
+    }
+
+    #[test]
+    fn strict_profile_conflicts_are_rejected_after_profile_application() {
+        let profile = crate::profile_core::Profile {
+            strict_sandbox: Some(true),
+            allow_all: Some(true),
+            ..Default::default()
+        };
+        let mut allow_read = Vec::new();
+        let mut deny_read = Vec::new();
+        let mut allow_write = Vec::new();
+        let mut deny_write = Vec::new();
+        let mut full_write = false;
+        let mut allow_net = None;
+        let mut deny_net = Vec::new();
+        let mut env = HashMap::new();
+        let mut allow_env = None;
+        let mut deny_env = Vec::new();
+        let mut secrets = Vec::new();
+        let mut secret_hosts = Vec::new();
+        let mut disabled = false;
+        let mut full_access = false;
+
+        apply_profile(
+            &profile,
+            &mut allow_read,
+            &mut deny_read,
+            &mut allow_write,
+            &mut deny_write,
+            &mut full_write,
+            &mut allow_net,
+            &mut deny_net,
+            &mut env,
+            &mut allow_env,
+            &mut deny_env,
+            &mut secrets,
+            &mut secret_hosts,
+            &mut disabled,
+            &mut full_access,
+        );
+
+        let error =
+            validate_sandbox_configuration(is_strict(false, &profile), disabled, full_access)
+                .expect_err("a strict profile must not downgrade itself to full access");
+        assert!(error.to_string().contains("strict sandbox"));
+    }
+
+    #[test]
+    fn explicit_strict_path_overrides_default_inherited_and_secret_paths() {
+        let strict_path = select_strict_path(true, Some("/opt/tools/bin:/usr/bin"))
+            .expect("explicit strict PATH should validate")
+            .expect("strict mode should select a PATH");
+        let env = finalize_child_env(
+            HashMap::from([("PATH".to_string(), "/host/bin".to_string())]),
+            HashMap::from([(
+                "PATH".to_string(),
+                "ZEROBOX_SECRET_PATH_PLACEHOLDER".to_string(),
+            )]),
+            Some(&strict_path),
+        );
+
+        assert_eq!(
+            env.get("PATH"),
+            Some(&"/opt/tools/bin:/usr/bin".to_string())
+        );
+    }
+
+    #[test]
+    fn strict_path_uses_minimal_default_without_a_configured_value() {
+        assert_eq!(
+            select_strict_path(true, None).unwrap(),
+            Some(STRICT_PATH.to_string())
+        );
+        assert_eq!(select_strict_path(false, Some("relative")).unwrap(), None);
+    }
+
+    #[test]
+    fn strict_path_rejects_empty_and_relative_segments() {
+        for invalid in [
+            "",
+            ":/usr/bin",
+            "/usr/bin:",
+            "/usr/bin::/bin",
+            "bin:/usr/bin",
+        ] {
+            assert!(
+                select_strict_path(true, Some(invalid)).is_err(),
+                "strict PATH should reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_home_variables_are_removed_after_inherit_and_explicit_overrides() {
+        let env = finalize_child_env(
+            HashMap::from([
+                ("ZEROBOX_HOME".to_string(), "/inherited/zerobox".to_string()),
+                ("CODEX_HOME".to_string(), "/inherited/codex".to_string()),
+                ("SAFE".to_string(), "inherited".to_string()),
+            ]),
+            HashMap::from([
+                ("ZEROBOX_HOME".to_string(), "/explicit/zerobox".to_string()),
+                ("CODEX_HOME".to_string(), "/explicit/codex".to_string()),
+                ("SAFE".to_string(), "secret".to_string()),
+            ]),
+            None,
+        );
+
+        assert!(!env.contains_key("ZEROBOX_HOME"));
+        assert!(!env.contains_key("CODEX_HOME"));
+        assert_eq!(env.get("SAFE"), Some(&"secret".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_proxy_root_is_owner_only_and_removed_with_its_handle() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("create temporary run root");
+        let path;
+        {
+            let root = PrivateProxyRoot::create_in(temp.path()).expect("create private root");
+            path = root.path().to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path).expect("inspect private root");
+            let current_uid = std::fs::metadata("/proc/self")
+                .expect("inspect current process")
+                .uid();
+
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(metadata.uid(), current_uid);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_proxy_root_rejects_paths_that_cannot_fit_linux_unix_sockets() {
+        let long_root = PathBuf::from("/").join("a".repeat(108));
+        let error = validate_linux_proxy_socket_path_budget(&long_root)
+            .expect_err("overlong private root must fail before helper launch");
+        assert!(error.to_string().contains("too long"));
+    }
+
+    async fn prepare_error(sandbox: Sandbox) -> anyhow::Error {
+        match sandbox.prepare().await {
+            Ok(_) => panic!("sandbox preparation unexpectedly succeeded"),
+            Err(error) => error.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_a_strict_profile_with_no_sandbox() {
+        let error = prepare_error(
+            Sandbox::command("/bin/true")
+                .profile("analysis-strict")
+                .no_sandbox(),
+        )
+        .await;
+
+        assert!(error.to_string().contains("strict sandbox"));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_a_strict_profile_with_full_access() {
+        let error = prepare_error(
+            Sandbox::command("/bin/true")
+                .profile("analysis-strict")
+                .full_access(),
+        )
+        .await;
+
+        assert!(error.to_string().contains("strict sandbox"));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_deny_read_globs_with_full_access() {
+        let error = prepare_error(
+            Sandbox::command("/bin/true")
+                .no_profile()
+                .full_access()
+                .deny_read("/safe/deny*"),
+        )
+        .await;
+
+        assert!(error.to_string().contains("deny_read"));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_deny_write_globs_with_full_access() {
+        let error = prepare_error(
+            Sandbox::command("/bin/true")
+                .no_profile()
+                .full_access()
+                .deny_write("/safe/deny*"),
+        )
+        .await;
+
+        assert!(error.to_string().contains("deny_write"));
+    }
+
+    #[test]
+    fn deny_paths_reject_glob_metacharacters() {
+        for path in ["/safe/deny*", "/safe/deny?", "/safe/[deny]", "/safe/{deny}"] {
+            let error = validate_paths(&[], &[p(path)], &[], &[], Path::new("/work"))
+                .expect_err("deny paths must be literal");
+            assert!(error.to_string().contains("deny_read"), "error: {error:#}");
+        }
     }
 
     // filesystem policy
@@ -1369,6 +2272,64 @@ mod tests {
         assert_eq!(s.profile_names, vec!["workspace".to_string()]);
         assert!(!s.use_profile);
         assert_eq!(s.linux_sandbox_exe, None);
+        assert!(!s.setup_status);
+    }
+
+    #[test]
+    fn prepared_command_into_command_remains_available_without_managed_resources() {
+        let prepared = PreparedCommand {
+            cmd: tokio::process::Command::new("echo"),
+            _proxy_handle: None,
+            _proxy: None,
+            _proxy_root: None,
+            _setup_channel: None,
+        };
+        let command = prepared.into_command().expect("unmanaged raw command");
+        assert!(format!("{command:?}").contains("echo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_command_into_command_does_not_panic_with_managed_resources() {
+        let runs = tempfile::tempdir().expect("temporary runs root");
+        let proxy_root = PrivateProxyRoot::create_in(runs.path()).expect("private proxy root");
+        let prepared = PreparedCommand {
+            cmd: tokio::process::Command::new("true"),
+            _proxy_handle: None,
+            _proxy: None,
+            _proxy_root: Some(proxy_root),
+            _setup_channel: None,
+        };
+
+        let conversion =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.into_command()));
+        let conversion = conversion.expect("conversion must return an error, not panic");
+        assert!(conversion.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_command_spawn_keeps_managed_resources_until_child_wait() {
+        let runs = tempfile::tempdir().expect("temporary runs root");
+        let proxy_root = PrivateProxyRoot::create_in(runs.path()).expect("private proxy root");
+        let proxy_root_path = proxy_root.path().to_path_buf();
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "test -d \"$MANAGED_ROOT\""])
+            .env("MANAGED_ROOT", &proxy_root_path);
+        let prepared = PreparedCommand {
+            cmd,
+            _proxy_handle: None,
+            _proxy: None,
+            _proxy_root: Some(proxy_root),
+            _setup_channel: None,
+        };
+
+        let child = prepared.spawn().await.expect("spawn prepared command");
+        assert!(proxy_root_path.is_dir());
+        let status = child.wait().await.expect("wait prepared command");
+
+        assert!(status.success());
+        assert!(!proxy_root_path.exists());
     }
 
     #[test]
@@ -1522,20 +2483,6 @@ mod tests {
     #[test]
     fn is_sandboxed_false_by_default() {
         assert!(!Sandbox::is_sandboxed());
-    }
-
-    // PreparedCommand
-
-    #[test]
-    fn prepared_command_into_command() {
-        let cmd = tokio::process::Command::new("echo");
-        let prepared = PreparedCommand {
-            cmd,
-            _proxy_handle: None,
-            _proxy: None,
-        };
-        let cmd = prepared.into_command();
-        assert!(format!("{cmd:?}").contains("echo"));
     }
 
     // is_claude_invocation

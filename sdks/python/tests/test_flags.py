@@ -44,6 +44,13 @@ def test_strict_sandbox_coexists_with_profile():
     assert "--allow-write=/tmp" in flags
 
 
+def test_explicit_strict_path_is_forwarded_through_env():
+    flags = build_flags({"strict_sandbox": True, "env": {"PATH": "/opt/tools/bin:/usr/bin"}})
+    assert "--strict-sandbox" in flags
+    path_index = flags.index("--env")
+    assert flags[path_index + 1] == "PATH=/opt/tools/bin:/usr/bin"
+
+
 def test_allow_read():
     flags = build_flags({"allow_read": ["/tmp", "/data"]})
     assert "--allow-read=/tmp,/data" in flags

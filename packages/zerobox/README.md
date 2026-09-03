@@ -11,11 +11,20 @@
 
 TypeScript / Node SDK for [zerobox](https://github.com/afshinm/zerobox). Sandbox any command with file, network, and credential controls.
 
+⚠️ This fork is Linux/WSL2 local-only and does **not** publish/consume the npm package.
+For local development in this fork (non-global, non-published):
+
 ```bash
-npm install zerobox
+git checkout --detach <commit>
+./scripts/sync.sh
+cargo build --locked --release -p zerobox
+export ZEROBOX_BIN="$PWD/target/release/zerobox"
+pnpm install --frozen-lockfile
+pnpm --filter zerobox build
+pnpm --filter zerobox test
 ```
 
-Installing the package drops the `zerobox` CLI into your `node_modules/.bin/` and exposes a TypeScript SDK.
+In this fork, npm publishing is not exposed; examples below use the workspace package `packages/zerobox`.
 
 > For CLI usage, secrets concepts, the full flag reference, performance numbers, and platform support see the [main README](https://github.com/afshinm/zerobox).
 

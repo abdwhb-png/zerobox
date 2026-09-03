@@ -1,0 +1,152 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -1488,53 +1488,124 @@
+         panic!("Failed to execvp {}: {err}", command[0].as_str());
+     };
+
++    let setup_signal_mask = ForwardedSignalMask::block();
++    let parent_pid = unsafe { libc::getpid() };
+     let mut exec_error_pipe = [0; 2];
+     if unsafe { libc::pipe2(exec_error_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+-        write_setup_frame(status_fd, "ERR:exec_pipe");
++        let _ = write_setup_frame(status_fd, "ERR:exec_pipe");
++        setup_signal_mask.restore();
+         std::process::exit(126);
+     }
+     let child = unsafe { libc::fork() };
+     if child < 0 {
+-        write_setup_frame(status_fd, "ERR:fork");
++        let _ = write_setup_frame(status_fd, "ERR:fork");
++        setup_signal_mask.restore();
+         std::process::exit(126);
+     }
+     if child == 0 {
++        reset_forwarded_signal_handlers_to_default();
++        setup_signal_mask.restore();
+         unsafe {
+             libc::close(exec_error_pipe[0]);
+             libc::close(status_fd);
+-            libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr());
+         }
++        if unsafe { libc::setpgid(0, 0) } < 0 {
++            let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
++            let _ = write_exec_error(exec_error_pipe[1], error);
++            unsafe { libc::_exit(127); }
++        }
++        terminate_with_parent(parent_pid);
++        unsafe { libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr()); }
+         let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
+-        let _ = unsafe { libc::write(exec_error_pipe[1], (&error as *const i32).cast(), std::mem::size_of::<i32>()) };
+-        std::process::exit(127);
++        let _ = write_exec_error(exec_error_pipe[1], error);
++        unsafe { libc::_exit(127); }
+     }
+     unsafe { libc::close(exec_error_pipe[1]); }
+-    let mut exec_error = 0i32;
+-    let read = unsafe { libc::read(exec_error_pipe[0], (&mut exec_error as *mut i32).cast(), std::mem::size_of::<i32>()) };
++    let signal_forwarders = install_bwrap_signal_forwarders(child);
++    setup_signal_mask.restore();
++    let exec_error = read_exec_error(exec_error_pipe[0]);
+     unsafe { libc::close(exec_error_pipe[0]); }
+-    if read == 0 {
+-        write_setup_frame(status_fd, "STARTED");
+-    } else {
+-        write_setup_frame(status_fd, "ERR:exec_failed");
+-    }
++    let started = matches!(exec_error, Ok(None));
++    let frame = if started { "STARTED" } else { "ERR:exec_failed" };
++    let frame_written = write_setup_frame(status_fd, frame).is_ok();
+     unsafe { libc::close(status_fd); }
+-    let mut wait_status = 0;
+-    while unsafe { libc::waitpid(child, &mut wait_status, 0) } < 0 {
+-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) { std::process::exit(126); }
+-    }
+-    if read != 0 { std::process::exit(127); }
+-    if libc::WIFEXITED(wait_status) { std::process::exit(libc::WEXITSTATUS(wait_status)); }
+-    if libc::WIFSIGNALED(wait_status) {
+-        let signal = libc::WTERMSIG(wait_status);
+-        unsafe { libc::signal(signal, libc::SIG_DFL); libc::raise(signal); }
+-        std::process::exit(128 + signal);
++    if !frame_written {
++        send_signal_to_bwrap_child(child, libc::SIGKILL);
+     }
+-    std::process::exit(1);
++    let wait_status = wait_for_bwrap_child(child);
++    let cleanup_signal_mask = ForwardedSignalMask::block();
++    signal_forwarders.restore();
++    cleanup_signal_mask.restore();
++    if !started || !frame_written {
++        std::process::exit(127);
++    }
++    exit_with_wait_status(wait_status);
+ }
+
+-fn write_setup_frame(fd: i32, frame: &str) {
++fn read_exec_error(fd: i32) -> std::io::Result<Option<i32>> {
++    let mut bytes = [0_u8; std::mem::size_of::<i32>()];
++    let mut offset = 0;
++    loop {
++        let read = unsafe {
++            libc::read(fd, bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset)
++        };
++        if read == 0 {
++            return if offset == 0 {
++                Ok(None)
++            } else {
++                Err(std::io::Error::new(
++                    std::io::ErrorKind::UnexpectedEof,
++                    "partial exec error frame",
++                ))
++            };
++        }
++        if read > 0 {
++            offset += read as usize;
++            if offset == bytes.len() {
++                return Ok(Some(i32::from_ne_bytes(bytes)));
++            }
++            continue;
++        }
++        let error = std::io::Error::last_os_error();
++        if error.kind() != std::io::ErrorKind::Interrupted {
++            return Err(error);
++        }
++    }
++}
++
++fn write_exec_error(fd: i32, error: i32) -> std::io::Result<()> {
++    write_all_fd(fd, &error.to_ne_bytes())
++}
++
++fn write_setup_frame(fd: i32, frame: &str) -> std::io::Result<()> {
+     let line = format!("{frame}\n");
+-    let _ = unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
++    write_all_fd(fd, line.as_bytes())
++}
++
++fn write_all_fd(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        let written = unsafe {
++            libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset)
++        };
++        if written > 0 {
++            offset += written as usize;
++            continue;
++        }
++        let error = std::io::Error::last_os_error();
++        if written < 0 && error.kind() == std::io::ErrorKind::Interrupted {
++            continue;
++        }
++        return if written == 0 {
++            Err(std::io::Error::new(
++                std::io::ErrorKind::WriteZero,
++                "failed to write complete setup frame",
++            ))
++        } else {
++            Err(error)
++        };
++    }
++    Ok(())
+ }
+
+ #[cfg(test)]

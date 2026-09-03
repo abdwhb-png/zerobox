@@ -11,11 +11,19 @@
 
 Python SDK for [zerobox](https://github.com/afshinm/zerobox). Sandbox any command with file, network, and credential controls.
 
+⚠️ This fork is Linux/WSL2 local-only and does **not** publish/consume the PyPI package.
+For local development in this fork (non-global, non-published):
+
 ```bash
-pip install zerobox
+git checkout --detach <commit>
+./scripts/sync.sh
+cargo build --locked --release -p zerobox
+export ZEROBOX_BIN="$PWD/target/release/zerobox"
+uv sync --project sdks/python
+uv run --project sdks/python python -m pip list
 ```
 
-Installing the wheel drops the `zerobox` CLI into your environment's `bin/` and exposes a Python SDK.
+In this fork, PyPI publishing is not exposed; examples below use the workspace SDK in `sdks/python`.
 
 > For CLI usage, secrets concepts, the full flag reference, performance numbers, and platform support see the [main README](https://github.com/afshinm/zerobox).
 

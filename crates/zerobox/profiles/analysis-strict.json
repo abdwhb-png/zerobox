@@ -1,0 +1,25 @@
+{
+  "$schema": "./schema.json",
+  "description": "Read-only analysis with strict sandbox enforcement and a deterministic command path.",
+  "strict_sandbox": true,
+  "allow_read": [
+    "$CWD",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/lib",
+    "/usr/lib",
+    "/lib",
+    "/lib64",
+    "/etc/alternatives",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/localtime",
+    "/usr/share/locale",
+    "/usr/share/terminfo"
+  ],
+  "set_env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin"
+  }
+}

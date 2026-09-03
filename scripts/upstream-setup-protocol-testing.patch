@@ -1,0 +1,156 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -1543,13 +1543,28 @@
+ }
+
+ fn read_exec_error(fd: i32) -> std::io::Result<Option<i32>> {
++    read_exec_error_with(|bytes| {
++        let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
++        if read >= 0 {
++            Ok(read as usize)
++        } else {
++            Err(std::io::Error::last_os_error())
++        }
++    })
++}
++
++fn read_exec_error_with(
++    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
++) -> std::io::Result<Option<i32>> {
+     let mut bytes = [0_u8; std::mem::size_of::<i32>()];
+     let mut offset = 0;
+     loop {
+-        let read = unsafe {
+-            libc::read(fd, bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset)
++        let count = match read(&mut bytes[offset..]) {
++            Ok(count) => count,
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++            Err(error) => return Err(error),
+         };
+-        if read == 0 {
++        if count == 0 {
+             return if offset == 0 {
+                 Ok(None)
+             } else {
+@@ -1559,16 +1574,9 @@
+                 ))
+             };
+         }
+-        if read > 0 {
+-            offset += read as usize;
+-            if offset == bytes.len() {
+-                return Ok(Some(i32::from_ne_bytes(bytes)));
+-            }
+-            continue;
+-        }
+-        let error = std::io::Error::last_os_error();
+-        if error.kind() != std::io::ErrorKind::Interrupted {
+-            return Err(error);
++        offset += count;
++        if offset == bytes.len() {
++            return Ok(Some(i32::from_ne_bytes(bytes)));
+         }
+     }
+ }
+@@ -1583,27 +1591,35 @@
+ }
+
+ fn write_all_fd(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
++    write_all_with(bytes, |remaining| {
++        let written = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
++        if written >= 0 {
++            Ok(written as usize)
++        } else {
++            Err(std::io::Error::last_os_error())
++        }
++    })
++}
++
++fn write_all_with(
++    bytes: &[u8],
++    mut write: impl FnMut(&[u8]) -> std::io::Result<usize>,
++) -> std::io::Result<()> {
+     let mut offset = 0;
+     while offset < bytes.len() {
+-        let written = unsafe {
+-            libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset)
++        let written = match write(&bytes[offset..]) {
++            Ok(written) => written,
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++            Err(error) => return Err(error),
+         };
+         if written > 0 {
+-            offset += written as usize;
++            offset += written;
+             continue;
+         }
+-        let error = std::io::Error::last_os_error();
+-        if written < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+-            continue;
+-        }
+-        return if written == 0 {
+-            Err(std::io::Error::new(
+-                std::io::ErrorKind::WriteZero,
+-                "failed to write complete setup frame",
+-            ))
+-        } else {
+-            Err(error)
+-        };
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::WriteZero,
++            "failed to write complete setup frame",
++        ));
+     }
+     Ok(())
+ }
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -461,6 +461,48 @@
+ }
+
+ #[test]
++fn exec_error_reader_retries_interrupted_and_assembles_exact_frame() {
++    let expected = libc::ENOENT.to_ne_bytes();
++    let mut call = 0;
++    let result = read_exec_error_with(|buffer| {
++        call += 1;
++        match call {
++            1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
++            2 => {
++                buffer[..2].copy_from_slice(&expected[..2]);
++                Ok(2)
++            }
++            3 => {
++                buffer[..2].copy_from_slice(&expected[2..]);
++                Ok(2)
++            }
++            _ => Ok(0),
++        }
++    })
++    .expect("read exact exec error frame");
++
++    assert_eq!(result, Some(libc::ENOENT));
++}
++
++#[test]
++fn setup_writer_retries_interrupted_and_completes_partial_writes() {
++    let mut call = 0;
++    let mut written = Vec::new();
++    write_all_with(b"STARTED\n", |remaining| {
++        call += 1;
++        if call == 1 {
++            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
++        }
++        let count = remaining.len().min(2);
++        written.extend_from_slice(&remaining[..count]);
++        Ok(count)
++    })
++    .expect("write complete setup frame");
++
++    assert_eq!(written, b"STARTED\n");
++}
++
++#[test]
+ fn managed_proxy_inner_command_includes_route_spec() {
+     let permission_profile = read_only_permission_profile();
+     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {

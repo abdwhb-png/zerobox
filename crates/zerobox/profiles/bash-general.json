@@ -1,0 +1,27 @@
+{
+  "$schema": "./schema.json",
+  "description": "General Bash execution with an explicit system runtime and workspace access.",
+  "allow_read": [
+    "$CWD",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/lib",
+    "/usr/lib",
+    "/lib",
+    "/lib64",
+    "/etc/alternatives",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/localtime",
+    "/usr/share/locale",
+    "/usr/share/terminfo"
+  ],
+  "allow_write": [
+    "$CWD"
+  ],
+  "set_env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin"
+  }
+}

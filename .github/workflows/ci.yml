@@ -72,43 +72,16 @@ jobs:
       - name: Clippy (workspace, excluding upstream)
         run: >
           cargo clippy --workspace
-          --exclude codex-sandboxing
-          --exclude codex-linux-sandbox
-          --exclude codex-windows-sandbox
-          --exclude codex-process-hardening
-          --exclude codex-protocol
-          --exclude codex-execpolicy
-          --exclude codex-utils-absolute-path
-          --exclude codex-utils-cache
-          --exclude codex-utils-home-dir
-          --exclude codex-utils-image
-          --exclude codex-utils-pty
-          --exclude codex-utils-string
-          --exclude codex-utils-template
-          --exclude codex-network-proxy
-          --exclude codex-utils-rustls-provider
+          --exclude zerobox-sandboxing
+          --exclude zerobox-linux-sandbox
+          --exclude zerobox-windows-sandbox
+          --exclude zerobox-process-hardening
+          --exclude zerobox-utils-absolute-path
+          --exclude zerobox-utils-pty
+          --exclude zerobox-utils-string
+          --exclude zerobox-network-proxy
+          --exclude zerobox-utils-rustls-provider
           -- -D warnings -A clippy::result_large_err
-
-  test-macos:
-    name: Test (macOS)
-    needs: sync
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: upstream
-          path: upstream/
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release -p zerobox
-      - name: Rust unit tests
-        run: cargo test --workspace --lib
-      - name: Rust E2E sandbox tests
-        env:
-          ZEROBOX_EXEC: ./target/release/zerobox
-        run: cargo test -p zerobox --test integration
 
   test-linux:
     name: Test (Linux)
@@ -149,7 +122,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
           - os: ubuntu-latest
             system-deps: bubblewrap libcap-dev
             enable-userns: true
@@ -202,7 +174,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
           - os: ubuntu-latest
             system-deps: bubblewrap libcap-dev
             enable-userns: true
@@ -250,7 +221,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [deny, fmt, clippy, test-macos, test-linux, sdk, sdk-py]
+    needs: [deny, fmt, clippy, test-linux, sdk, sdk-py]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

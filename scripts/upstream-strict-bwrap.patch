@@ -1,0 +1,147 @@
+--- upstream/linux-sandbox/src/bwrap.rs
++++ upstream/linux-sandbox/src/bwrap.rs
+@@ -276,6 +276,8 @@
+         // Always enter a fresh user namespace so root inside a container does
+         // not need ambient CAP_SYS_ADMIN to create the remaining namespaces.
+         "--unshare-user".to_string(),
++        // Prevent the target from creating nested user namespaces after setup.
++        "--disable-userns".to_string(),
+         "--unshare-pid".to_string(),
+     ];
+     if options.network_mode.should_unshare_network() {
+@@ -325,6 +327,9 @@
+     // Request a user namespace explicitly rather than relying on bubblewrap's
+     // auto-enable behavior, which is skipped when the caller runs as uid 0.
+     args.push("--unshare-user".to_string());
++    // This must immediately follow --unshare-user: user namespaces are only
++    // needed for bubblewrap setup, never for the sandboxed target.
++    args.push("--disable-userns".to_string());
+     args.push("--unshare-pid".to_string());
+     if options.network_mode.should_unshare_network() {
+         args.push("--unshare-net".to_string());
+@@ -1415,6 +1420,40 @@
+
+     use pretty_assertions::assert_eq;
+     use tempfile::TempDir;
++
++    #[test]
++    fn bwrap_user_namespace_is_immediately_locked_down_in_both_build_paths() {
++        let full_filesystem = create_bwrap_flags_full_filesystem(
++            vec!["/bin/true".to_string()],
++            BwrapOptions::default(),
++        );
++        assert_eq!(
++            full_filesystem
++                .args
++                .windows(2)
++                .find(|args| args[0] == "--unshare-user")
++                .map(|args| args[1].as_str()),
++            Some("--disable-userns")
++        );
++
++        let temp_dir = TempDir::new().expect("temp dir");
++        let restricted = create_bwrap_command_args(
++            vec!["/bin/true".to_string()],
++            &FileSystemSandboxPolicy::restricted(Vec::new()),
++            temp_dir.path(),
++            temp_dir.path(),
++            BwrapOptions::default(),
++        )
++        .expect("restricted bwrap args");
++        assert_eq!(
++            restricted
++                .args
++                .windows(2)
++                .find(|args| args[0] == "--unshare-user")
++                .map(|args| args[1].as_str()),
++            Some("--disable-userns")
++        );
++    }
+     use zerobox_protocol::protocol::FileSystemAccessMode;
+     use zerobox_protocol::protocol::FileSystemPath;
+     use zerobox_protocol::protocol::FileSystemSandboxEntry;
+@@ -1486,6 +1525,7 @@
+                 "/".to_string(),
+                 "/".to_string(),
+                 "--unshare-user".to_string(),
++                "--disable-userns".to_string(),
+                 "--unshare-pid".to_string(),
+                 "--unshare-net".to_string(),
+                 "--proc".to_string(),
+--- upstream/linux-sandbox/src/launcher.rs
++++ upstream/linux-sandbox/src/launcher.rs
+@@ -31,6 +31,7 @@
+ struct SystemBwrapCapabilities {
+     supports_argv0: bool,
+     supports_perms: bool,
++    supports_disable_userns: bool,
+ }
+
+ pub(crate) fn exec_bwrap(argv: Vec<String>, preserved_files: Vec<File>) -> ! {
+@@ -81,6 +82,7 @@
+     let Some(SystemBwrapCapabilities {
+         supports_argv0,
+         supports_perms: true,
++        supports_disable_userns: true,
+     }) = system_bwrap_capabilities(system_bwrap_path)
+     else {
+         return None;
+@@ -120,6 +122,8 @@
+     Some(SystemBwrapCapabilities {
+         supports_argv0: stdout.contains("--argv0") || stderr.contains("--argv0"),
+         supports_perms: stdout.contains("--perms") || stderr.contains("--perms"),
++        supports_disable_userns: stdout.contains("--disable-userns")
++            || stderr.contains("--disable-userns"),
+     })
+ }
+
+@@ -168,6 +172,7 @@
+                 Some(SystemBwrapCapabilities {
+                     supports_argv0: true,
+                     supports_perms: true,
++                    supports_disable_userns: true,
+                 })
+             }),
+             Some(SystemBwrapLauncher {
+@@ -187,6 +192,7 @@
+                 Some(SystemBwrapCapabilities {
+                     supports_argv0: false,
+                     supports_perms: true,
++                    supports_disable_userns: true,
+                 })
+             }),
+             Some(SystemBwrapLauncher {
+@@ -205,6 +211,23 @@
+                 Some(SystemBwrapCapabilities {
+                     supports_argv0: false,
+                     supports_perms: false,
++                    supports_disable_userns: true,
++                })
++            }),
++            None
++        );
++    }
++
++    #[test]
++    fn rejects_system_bwrap_when_it_cannot_disable_user_namespaces() {
++        let fake_bwrap = NamedTempFile::new().expect("temp file");
++
++        assert_eq!(
++            system_bwrap_launcher_for_path_with_probe(fake_bwrap.path(), |_| {
++                Some(SystemBwrapCapabilities {
++                    supports_argv0: true,
++                    supports_perms: true,
++                    supports_disable_userns: false,
+                 })
+             }),
+             None
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -80,6 +80,7 @@
+             "--dev".to_string(),
+             "/dev".to_string(),
+             "--unshare-user".to_string(),
++            "--disable-userns".to_string(),
+             "--unshare-pid".to_string(),
+             "--proc".to_string(),
+             "/proc".to_string(),

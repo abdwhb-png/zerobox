@@ -36,14 +36,42 @@ def _read_version() -> str:
         return "0.0.0"
 
 
-VERSION = _read_version()
+_SEMVER = re.compile(
+    r"^(?P<release>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))"
+    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+_SEMVER_VERSION = _read_version()
 
-_SEMVER = re.compile(r"^\d+\.\d+\.\d+([.-][A-Za-z0-9.]+)?$")
-if not _SEMVER.match(VERSION):
-    raise RuntimeError(
-        f"zerobox version {VERSION!r} does not look like a valid semver. "
+
+def _invalid_semver(version: str) -> RuntimeError:
+    return RuntimeError(
+        f"zerobox version {version!r} does not look like a valid semver. "
         f"Check {NPM_PACKAGE_JSON}."
     )
+
+
+def semver_to_pep440(version: str) -> str:
+    """Represent SemVer prerelease/build identifiers as a PEP 440 local version."""
+    match = _SEMVER.fullmatch(version)
+    if match is None:
+        raise _invalid_semver(version)
+
+    prerelease = match["prerelease"]
+    if prerelease is not None and any(
+        identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0")
+        for identifier in prerelease.split(".")
+    ):
+        raise _invalid_semver(version)
+
+    local = [part for part in (match["prerelease"], match["build"]) if part]
+    normalized_local = ".".join(local).replace("-", ".")
+    return match["release"] + (f"+{normalized_local}" if normalized_local else "")
+
+# Hatchling requires PEP 440 metadata. Keep the repository/package identity as
+# SemVer while representing prerelease/build labels as a Python local version
+# (`0.3.3-fork.1` -> `0.3.3+fork.1`).
+VERSION = semver_to_pep440(_SEMVER_VERSION)
 
 
 class ZeroboxBuildHook(BuildHookInterface):

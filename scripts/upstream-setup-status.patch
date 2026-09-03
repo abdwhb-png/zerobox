@@ -1,0 +1,278 @@
+--- upstream/sandboxing/src/manager.rs
++++ upstream/sandboxing/src/manager.rs
+@@ -98,6 +98,7 @@
+     pub network: Option<&'a NetworkProxy>,
+     /// Owner-only host directory for managed Linux proxy bridge sockets.
+     pub proxy_root: Option<&'a Path>,
++    pub setup_status_fd: Option<i32>,
+     pub sandbox_policy_cwd: &'a Path,
+     pub zerobox_linux_sandbox_exe: Option<&'a Path>,
+     pub use_legacy_landlock: bool,
+@@ -185,6 +186,7 @@
+             enforce_managed_network,
+             network,
+             proxy_root,
++            setup_status_fd,
+             sandbox_policy_cwd,
+             zerobox_linux_sandbox_exe,
+             use_legacy_landlock,
+@@ -246,6 +248,7 @@
+                     use_legacy_landlock,
+                     allow_proxy_network,
+                     proxy_root,
++                    setup_status_fd,
+                 );
+                 let mut full_command = Vec::with_capacity(1 + args.len());
+                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
+--- upstream/sandboxing/src/landlock.rs
++++ upstream/sandboxing/src/landlock.rs
+@@ -28,6 +28,7 @@
+     use_legacy_landlock: bool,
+     allow_network_for_proxy: bool,
+     proxy_root: Option<&Path>,
++    setup_status_fd: Option<i32>,
+ ) -> Vec<String> {
+     let permission_profile_json = serde_json::to_string(permission_profile)
+         .unwrap_or_else(|err| panic!("failed to serialize permission profile: {err}"));
+@@ -57,6 +58,10 @@
+         linux_cmd.push("--proxy-root".to_string());
+         linux_cmd.push(proxy_root.to_string_lossy().into_owned());
+     }
++    if let Some(setup_status_fd) = setup_status_fd {
++        linux_cmd.push("--setup-status-fd".to_string());
++        linux_cmd.push(setup_status_fd.to_string());
++    }
+     linux_cmd.push("--".to_string());
+     linux_cmd.extend(command);
+     linux_cmd
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -130,6 +130,9 @@
+     #[arg(long = "proxy-root", hide = true)]
+     pub proxy_root: Option<PathBuf>,
+
++    #[arg(long = "setup-status-fd", hide = true)]
++    pub setup_status_fd: Option<i32>,
++
+     /// When set, skip mounting a fresh `/proc` even though PID isolation is
+     /// still enabled. This is primarily intended for restrictive container
+     /// environments that deny `--proc /proc`.
+@@ -158,6 +161,7 @@
+         allow_network_for_proxy,
+         proxy_route_spec,
+         proxy_root,
++        setup_status_fd,
+         no_proc,
+         command,
+     } = LandlockCommand::parse();
+@@ -199,7 +203,7 @@
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+-        exec_or_panic(command);
++        exec_or_panic(command, setup_status_fd);
+     }
+
+     if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
+@@ -212,7 +216,7 @@
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+-        exec_or_panic(command);
++        exec_or_panic(command, setup_status_fd);
+     }
+
+     if !use_legacy_landlock {
+@@ -237,6 +241,7 @@
+             permission_profile: &permission_profile,
+             allow_network_for_proxy,
+             proxy_route_spec,
++            setup_status_fd,
+             command,
+         });
+         run_bwrap_with_proc_fallback(
+@@ -260,7 +265,7 @@
+     ) {
+         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
+     }
+-    exec_or_panic(command);
++    exec_or_panic(command, setup_status_fd);
+ }
+
+ #[derive(Debug, Clone)]
+@@ -1409,6 +1414,7 @@
+     permission_profile: &'a PermissionProfile,
+     allow_network_for_proxy: bool,
+     proxy_route_spec: Option<String>,
++    setup_status_fd: Option<i32>,
+     command: Vec<String>,
+ }
+
+@@ -1420,6 +1426,7 @@
+         permission_profile,
+         allow_network_for_proxy,
+         proxy_route_spec,
++        setup_status_fd,
+         command,
+     } = args;
+     let current_exe = match std::env::current_exe() {
+@@ -1452,13 +1459,17 @@
+         inner.push("--proxy-route-spec".to_string());
+         inner.push(proxy_route_spec);
+     }
++    if let Some(setup_status_fd) = setup_status_fd {
++        inner.push("--setup-status-fd".to_string());
++        inner.push(setup_status_fd.to_string());
++    }
+     inner.push("--".to_string());
+     inner.extend(command);
+     inner
+ }
+
+ /// Exec the provided argv, panicking with context if it fails.
+-fn exec_or_panic(command: Vec<String>) -> ! {
++fn exec_or_panic(command: Vec<String>, setup_status_fd: Option<i32>) -> ! {
+     #[expect(clippy::expect_used)]
+     let c_command =
+         CString::new(command[0].as_str()).expect("Failed to convert command to CString");
+@@ -1471,13 +1482,59 @@
+     let mut c_args_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+     c_args_ptrs.push(std::ptr::null());
+
+-    unsafe {
+-        libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr());
++    let Some(status_fd) = setup_status_fd else {
++        unsafe { libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr()); }
++        let err = std::io::Error::last_os_error();
++        panic!("Failed to execvp {}: {err}", command[0].as_str());
++    };
++
++    let mut exec_error_pipe = [0; 2];
++    if unsafe { libc::pipe2(exec_error_pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
++        write_setup_frame(status_fd, "ERR:exec_pipe");
++        std::process::exit(126);
++    }
++    let child = unsafe { libc::fork() };
++    if child < 0 {
++        write_setup_frame(status_fd, "ERR:fork");
++        std::process::exit(126);
++    }
++    if child == 0 {
++        unsafe {
++            libc::close(exec_error_pipe[0]);
++            libc::close(status_fd);
++            libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr());
++        }
++        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
++        let _ = unsafe { libc::write(exec_error_pipe[1], (&error as *const i32).cast(), std::mem::size_of::<i32>()) };
++        std::process::exit(127);
++    }
++    unsafe { libc::close(exec_error_pipe[1]); }
++    let mut exec_error = 0i32;
++    let read = unsafe { libc::read(exec_error_pipe[0], (&mut exec_error as *mut i32).cast(), std::mem::size_of::<i32>()) };
++    unsafe { libc::close(exec_error_pipe[0]); }
++    if read == 0 {
++        write_setup_frame(status_fd, "STARTED");
++    } else {
++        write_setup_frame(status_fd, "ERR:exec_failed");
++    }
++    unsafe { libc::close(status_fd); }
++    let mut wait_status = 0;
++    while unsafe { libc::waitpid(child, &mut wait_status, 0) } < 0 {
++        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) { std::process::exit(126); }
++    }
++    if read != 0 { std::process::exit(127); }
++    if libc::WIFEXITED(wait_status) { std::process::exit(libc::WEXITSTATUS(wait_status)); }
++    if libc::WIFSIGNALED(wait_status) {
++        let signal = libc::WTERMSIG(wait_status);
++        unsafe { libc::signal(signal, libc::SIG_DFL); libc::raise(signal); }
++        std::process::exit(128 + signal);
+     }
++    std::process::exit(1);
++}
+
+-    // If execvp returns, there was an error.
+-    let err = std::io::Error::last_os_error();
+-    panic!("Failed to execvp {}: {err}", command[0].as_str());
++fn write_setup_frame(fd: i32, frame: &str) {
++    let line = format!("{frame}\n");
++    let _ = unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+ }
+
+ #[cfg(test)]
+--- upstream/sandboxing/src/manager_tests.rs
++++ upstream/sandboxing/src/manager_tests.rs
+@@ -91,6 +91,7 @@
+             enforce_managed_network: false,
+             network: None,
+             proxy_root: None,
++            setup_status_fd: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -143,6 +144,7 @@
+             enforce_managed_network: false,
+             network: None,
+             proxy_root: None,
++            setup_status_fd: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -212,6 +214,7 @@
+             enforce_managed_network: false,
+             network: None,
+             proxy_root: None,
++            setup_status_fd: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -266,6 +269,7 @@
+             enforce_managed_network: false,
+             network: None,
+             proxy_root: None,
++            setup_status_fd: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: Some(zerobox_linux_sandbox_exe),
+             use_legacy_landlock: false,
+@@ -294,6 +298,7 @@
+         enforce_managed_network: true,
+         network: None,
+         proxy_root: None,
++        setup_status_fd: None,
+         sandbox_policy_cwd: cwd.as_path(),
+         zerobox_linux_sandbox_exe: Some(std::path::Path::new("/tmp/zerobox-linux-sandbox")),
+         use_legacy_landlock: false,
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -469,6 +469,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: true,
+         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
++        setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+
+@@ -485,6 +486,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         proxy_route_spec: None,
++        setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+
+@@ -504,6 +506,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         proxy_route_spec: None,
++        setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+
+@@ -520,6 +523,7 @@
+             permission_profile: &permission_profile,
+             allow_network_for_proxy: true,
+             proxy_route_spec: None,
++            setup_status_fd: None,
+             command: vec!["/bin/true".to_string()],
+         })
+     });

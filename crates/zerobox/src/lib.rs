@@ -31,9 +31,11 @@ mod sandbox;
 pub mod secret;
 
 pub use sandbox::PreparedCommand;
+pub use sandbox::PreparedCommandIntoCommandError;
 pub use sandbox::Sandbox;
 pub use sandbox::SandboxChild;
 pub use sandbox::SandboxOutput;
+pub use sandbox::SandboxSetupError;
 
 pub fn zerobox_home() -> std::path::PathBuf {
     let path = std::env::var_os("ZEROBOX_HOME")

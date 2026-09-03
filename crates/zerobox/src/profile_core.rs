@@ -103,6 +103,14 @@ const BUILTIN_PROFILES: &[(&str, &str)] = &[
         "opencode-linux",
         include_str!("../profiles/opencode-linux.json"),
     ),
+    (
+        "bash-general",
+        include_str!("../profiles/bash-general.json"),
+    ),
+    (
+        "analysis-strict",
+        include_str!("../profiles/analysis-strict.json"),
+    ),
     ("default", include_str!("../profiles/default.json")),
     ("workspace", include_str!("../profiles/workspace.json")),
     ("claude", include_str!("../profiles/claude.json")),
@@ -368,6 +376,7 @@ pub fn load_profile(name: &str, cwd: &Path) -> Result<Profile> {
     let mut chain = Vec::new();
     let mut profile = resolve(name, &mut chain, 0)?;
     expand_with_env(&mut profile, cwd);
+    validate_literal_deny_paths(&profile)?;
     Ok(profile)
 }
 
@@ -386,6 +395,7 @@ pub fn load_profiles<S: AsRef<str>>(names: &[S], cwd: &Path) -> Result<Profile> 
         merged = merge_profiles(&merged, &resolved);
     }
     expand_with_env(&mut merged, cwd);
+    validate_literal_deny_paths(&merged)?;
     Ok(merged)
 }
 
@@ -395,6 +405,30 @@ fn expand_with_env(profile: &mut Profile, cwd: &Path) {
     expand_profile(profile, &home, cwd, &tmpdir);
 }
 
+/// Deny rules are interpreted as literal filesystem paths. Wildcards would
+/// make a policy dependent on ambient filesystem state and can widen a deny
+/// rule differently across sandbox backends.
+pub(crate) fn validate_literal_deny_paths(profile: &Profile) -> Result<()> {
+    for (field, paths) in [
+        ("deny_read", profile.deny_read.as_deref()),
+        ("deny_write", profile.deny_write.as_deref()),
+    ] {
+        if let Some(paths) = paths {
+            for path in paths {
+                if let Some(character) = path
+                    .chars()
+                    .find(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+                {
+                    bail!(
+                        "{field} paths must be literal; found glob character '{character}' in '{path}'"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn builtin_profiles() -> &'static [(&'static str, &'static str)] {
     BUILTIN_PROFILES
 }
@@ -402,4 +436,74 @@ pub fn builtin_profiles() -> &'static [(&'static str, &'static str)] {
 /// Raw `use:` list from a profile, without resolving composition.
 pub fn load_profile_uses(name: &str) -> Option<Vec<String>> {
     load_raw(name).ok().map(|p| p.uses)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::load_profile;
+
+    const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+    #[test]
+    fn builtin_generic_profiles_resolve_without_composition_or_tmp_access() {
+        let cwd = Path::new("/work");
+        let bash = load_profile("bash-general", cwd).expect("bash-general must resolve");
+        let analysis = load_profile("analysis-strict", cwd).expect("analysis-strict must resolve");
+
+        for profile in [&bash, &analysis] {
+            assert!(profile.uses.is_empty());
+            for paths in [
+                profile.allow_read.as_ref(),
+                profile.deny_read.as_ref(),
+                profile.allow_write.as_ref(),
+                profile.deny_write.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    paths.iter().all(|path| !path.contains("/tmp")),
+                    "generic profiles must not grant host /tmp access: {paths:?}"
+                );
+            }
+        }
+
+        assert_eq!(analysis.strict_sandbox, Some(true));
+        assert_eq!(
+            analysis
+                .set_env
+                .as_ref()
+                .and_then(|env| env.get("PATH"))
+                .map(String::as_str),
+            Some(STRICT_PATH)
+        );
+    }
+
+    #[test]
+    fn merged_deny_paths_reject_glob_syntax_after_template_expansion() {
+        let profile = super::merge_profiles(
+            &super::Profile {
+                deny_read: Some(vec!["$CWD/secret/*".to_string()]),
+                ..Default::default()
+            },
+            &super::Profile {
+                deny_write: Some(vec!["$CWD/output?[0]".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut profile = profile;
+        super::expand_profile(
+            &mut profile,
+            Path::new("/home/tester"),
+            Path::new("/work"),
+            Path::new("/safe-temp"),
+        );
+
+        let error = super::validate_literal_deny_paths(&profile)
+            .expect_err("merged deny paths with glob syntax must be rejected");
+        assert!(error.to_string().contains("deny_read"));
+        assert!(error.to_string().contains("*"));
+    }
 }

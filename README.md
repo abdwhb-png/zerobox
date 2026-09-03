@@ -28,7 +28,7 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 - **Network filtering:** Allow or deny outbound traffic by domain
 - **Clean environment:** Only essential env vars (PATH, HOME, etc.) are inherited by default
 - **SDKs for Rust, TypeScript, and Python** with a consistent API across languages
-- **Cross-platform:** macOS and Linux. Windows support planned
+- **Scope:** Local Linux / WSL2 only for this fork
 - **Single binary:** No Docker, no VMs, ~10ms overhead
 
 <p align="center">
@@ -37,55 +37,83 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
   </a>
 </p>
 
-## Install
+## Fork provenance
 
-| Channel | Command |
-| --- | --- |
-| Shell (macOS / Linux) | `curl -fsSL https://raw.githubusercontent.com/afshinm/zerobox/main/install.sh \| sh` |
-| npm | `npm install -g zerobox` |
-| PyPI | `pip install zerobox` |
-| Cargo | `cargo install zerobox` |
-| From source | `git clone https://github.com/afshinm/zerobox && cd zerobox && ./scripts/sync.sh && cargo build --release -p zerobox` |
+- Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`
+- Codex rust shim baseline: `rust-v0.131.0-alpha.22` at commit `9b8cf56cdefb09f54564ccc295fd42f6647f558f`
+- Version identity for this fork: `0.3.3-fork.1` (Python: `0.3.3+fork.1`)
+
+## Build and usage (local Linux / WSL2 only)
+
+No published install artifacts are exposed in this fork.
+
+Reproducible external install recipe:
+
+```bash
+git checkout --detach <commit>
+./scripts/sync.sh
+cargo build --locked --release -p zerobox
+install -Dm755 target/release/zerobox "$DEST/zerobox"
+```
+
+Optional local verification commands:
+
+```bash
+cargo test --workspace --lib
+cargo test -p zerobox --test integration
+```
+
+Run with no flags:
+
+```bash
+./target/release/zerobox -- node -e "console.log('hello')"
+```
+
+Limitations:
+
+- No macOS or Windows packaging is published from this fork
+- This fork is only intended for local Linux and WSL2 usage
+- SDK docs reference upstream interfaces but behavior is local to this fork
 
 ## Quick start
 
 Run a command with no writes and no network access:
 
 ```bash
-zerobox -- node -e "console.log('hello')"
+./target/release/zerobox -- node -e "console.log('hello')"
 ```
 
 Allow writes to a specific directory:
 
 ```bash
-zerobox --allow-write=. -- node script.js
+./target/release/zerobox --allow-write=. -- node script.js
 ```
 
 Allow network to a specific domain:
 
 ```bash
-zerobox --allow-net=api.openai.com -- node agent.js
+./target/release/zerobox --allow-net=api.openai.com -- node agent.js
 ```
 
 Pass a secret to a specific host and the inner process never sees the real value:
 
 ```bash
-zerobox --secret OPENAI_API_KEY=sk-proj-123 --secret-host OPENAI_API_KEY=api.openai.com -- node agent.js
+./target/release/zerobox --secret OPENAI_API_KEY=sk-proj-123 --secret-host OPENAI_API_KEY=api.openai.com -- node agent.js
 ```
 
 Record filesystem changes and undo them after execution:
 
 ```bash
-zerobox --restore --allow-write=. -- npm install
+./target/release/zerobox --restore --allow-write=. -- npm install
 ```
 
 Or record without restoring, then inspect and undo later:
 
 ```bash
-zerobox --snapshot --allow-write=. -- npm install
-zerobox snapshot list
-zerobox snapshot diff <session-id>
-zerobox snapshot restore <session-id>
+./target/release/zerobox --snapshot --allow-write=. -- npm install
+./target/release/zerobox snapshot list
+./target/release/zerobox snapshot diff <session-id>
+./target/release/zerobox snapshot restore <session-id>
 ```
 
 For programmatic usage jump to the SDK that matches your stack:
@@ -116,19 +144,19 @@ sandbox process: curl -H "Authorization: Bearer $OPENAI_API_KEY" https://api.ope
 Pass a secret with `--secret` and restrict it to a specific domain with `--secret-host`:
 
 ```bash
-zerobox --secret OPENAI_API_KEY=sk-proj-123 --secret-host OPENAI_API_KEY=api.openai.com -- node app.js
+./target/release/zerobox --secret OPENAI_API_KEY=sk-proj-123 --secret-host OPENAI_API_KEY=api.openai.com -- node app.js
 ```
 
 Without `--secret-host`, the secret is passed to all domains:
 
 ```bash
-zerobox --secret TOKEN=abc123 -- node app.js
+./target/release/zerobox --secret TOKEN=abc123 -- node app.js
 ```
 
 Multiple secrets with different hosts:
 
 ```bash
-zerobox \
+./target/release/zerobox \
   --secret OPENAI_API_KEY=sk-proj-123 --secret-host OPENAI_API_KEY=api.openai.com \
   --secret GITHUB_TOKEN=ghp-456 --secret-host GITHUB_TOKEN=api.github.com \
   -- node app.js
@@ -145,26 +173,45 @@ By default only essential variables are passed to the sandbox, e.g. `PATH`, `HOM
 Inherit all parent env vars:
 
 ```bash
-zerobox --allow-env -- node app.js
+./target/release/zerobox --allow-env -- node app.js
 ```
 
 Inherit specific env vars only:
 
 ```bash
-zerobox --allow-env=PATH,HOME,DATABASE_URL -- node app.js
+./target/release/zerobox --allow-env=PATH,HOME,DATABASE_URL -- node app.js
 ```
 
 Block specific env vars:
 
 ```bash
-zerobox --allow-env --deny-env=AWS_SECRET_ACCESS_KEY -- node app.js
+./target/release/zerobox --allow-env --deny-env=AWS_SECRET_ACCESS_KEY -- node app.js
 ```
 
 Or set explicit variables:
 
 ```bash
-zerobox --env NODE_ENV=production --env DEBUG=false -- node app.js
+./target/release/zerobox --env NODE_ENV=production --env DEBUG=false -- node app.js
 ```
+
+In strict mode, `PATH` is always explicit. Precedence is the built-in
+`/usr/local/bin:/usr/bin:/bin`, then profile `set_env.PATH`, then caller
+`--env PATH=...`. A host `PATH` requested through `--allow-env` is ignored.
+Segments must be non-empty absolute paths; they do not need to exist. The
+selected value is restored after secret placeholders are prepared, so a secret
+named `PATH` cannot replace it.
+
+For network rules, `localhost`, `127.0.0.1`, and `::1` are the same loopback
+class only when the rule names one of those three aliases and includes the
+exact destination port. This does not allow the rest of `127.0.0.0/8` or any
+other private address.
+
+On Linux, `--status-fd=N` emits protocol-v1 JSONL lifecycle records to a
+writable pipe/FIFO or Unix `SOCK_STREAM`: `setup_error`, or `child_started`
+followed by `child_exit`. Writes are nonblocking, the FD is `CLOEXEC`, and the
+channel reaches EOF after every terminal path. Status reporting does not
+buffer stdin/stdout/stderr. Setup/delivery errors exit 125; a real target exit
+125 remains identifiable because it follows `child_started`.
 
 ## Examples
 
@@ -173,13 +220,13 @@ zerobox --env NODE_ENV=production --env DEBUG=false -- node app.js
 Run AI-generated code without risking file corruption or data leaks:
 
 ```bash
-zerobox -- python3 /tmp/task.py
+./target/release/zerobox -- python3 /tmp/task.py
 ```
 
 Or allow writes only to an output directory:
 
 ```bash
-zerobox --allow-write=/tmp/output -- python3 /tmp/task.py
+./target/release/zerobox --allow-write=/tmp/output -- python3 /tmp/task.py
 ```
 
 ### Restrict LLM tool calls
@@ -195,13 +242,13 @@ Each AI tool call can be sandboxed individually. The parent agent process runs n
 Run a build with network access but writes confined to `./dist`:
 
 ```bash
-zerobox --allow-write=./dist --allow-net -- npm run build
+./target/release/zerobox --allow-write=./dist --allow-net -- npm run build
 ```
 
 Run tests with no network and catch accidental external calls:
 
 ```bash
-zerobox --allow-write=/tmp -- npm test
+./target/release/zerobox --allow-write=/tmp -- npm test
 ```
 
 ## Performance
@@ -222,8 +269,9 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 
 | Platform | Backend                             | Status          |
 | -------- | ----------------------------------- | --------------- |
-| macOS    | Seatbelt (`sandbox-exec`)           | Fully supported |
 | Linux    | Bubblewrap + Seccomp + Namespaces   | Fully supported |
+| WSL2     | Same as Linux                        | Fully supported |
+| macOS    | Seatbelt (`sandbox-exec`)           | Not supported   |
 | Windows  | Restricted Tokens + ACLs + Firewall | Planned         |
 
 ## CLI reference
@@ -244,6 +292,7 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 | `-A`, `--allow-all`             | `-A`                                   | Grant all filesystem and network permissions. Env and secrets still apply.                                   |
 | `--no-sandbox`                  | `--no-sandbox`                         | Disable the sandbox entirely.                                                                                |
 | `--strict-sandbox`              | `--strict-sandbox`                     | Require full sandbox (bubblewrap). Fail instead of falling back to weaker isolation.                         |
+| `--status-fd <fd>`              | `--status-fd=3`                        | Emit protocol-v1 JSONL lifecycle events to a writable Unix pipe/FIFO or stream socket.                       |
 | `--debug`                       | `--debug`                              | Print sandbox config and proxy decisions to stderr.                                                          |
 | `--snapshot`                    | `--snapshot`                           | Record filesystem changes during execution.                                                                  |
 | `--restore`                     | `--restore`                            | Record and restore tracked files to pre-execution state after exit. Implies `--snapshot`.                    |
@@ -257,10 +306,10 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 
 | Command                                      | Description                                 |
 | -------------------------------------------- | ------------------------------------------- |
-| `zerobox snapshot list`                      | List recorded sessions.                     |
-| `zerobox snapshot diff <id>`                 | Show changes from a session.                |
-| `zerobox snapshot restore <id>`              | Restore filesystem to a session's baseline. |
-| `zerobox snapshot clean --older-than=<days>` | Remove old snapshot sessions.               |
+| `./target/release/zerobox snapshot list`                      | List recorded sessions.                     |
+| `./target/release/zerobox snapshot diff <id>`                 | Show changes from a session.                |
+| `./target/release/zerobox snapshot restore <id>`              | Restore filesystem to a session's baseline. |
+| `./target/release/zerobox snapshot clean --older-than=<days>` | Remove old snapshot sessions.               |
 
 ## SDKs
 

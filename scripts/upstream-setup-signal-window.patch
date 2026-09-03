@@ -1,0 +1,36 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -1550,9 +1550,14 @@
+         unsafe { libc::_exit(127); }
+     }
+     unsafe { libc::close(exec_error_pipe[1]); }
+-    let signal_forwarders = install_bwrap_signal_forwarders(child);
+-    setup_signal_mask.restore();
+-    let exec_error = read_exec_error(exec_error_pipe[0]);
++    let (exec_error, signal_forwarders) = confirm_exec_before_enabling_signal_forwarding(
++        || read_exec_error(exec_error_pipe[0]),
++        || {
++            let signal_forwarders = install_bwrap_signal_forwarders(child);
++            setup_signal_mask.restore();
++            signal_forwarders
++        },
++    );
+     unsafe { libc::close(exec_error_pipe[0]); }
+     let started = matches!(exec_error, Ok(None));
+     let frame = if started { "STARTED" } else { "ERR:exec_failed" };
+@@ -1571,6 +1576,15 @@
+     exit_with_wait_status(wait_status);
+ }
+
++fn confirm_exec_before_enabling_signal_forwarding<T>(
++    confirm_exec: impl FnOnce() -> std::io::Result<Option<i32>>,
++    enable_signal_forwarding: impl FnOnce() -> T,
++) -> (std::io::Result<Option<i32>>, T) {
++    let exec_error = confirm_exec();
++    let signal_forwarding = enable_signal_forwarding();
++    (exec_error, signal_forwarding)
++}
++
+ fn read_exec_error(fd: i32) -> std::io::Result<Option<i32>> {
+     read_exec_error_with(|bytes| {
+         let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };

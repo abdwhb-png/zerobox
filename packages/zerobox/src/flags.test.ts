@@ -133,6 +133,16 @@ describe("buildFlags", () => {
     expect(flags).toContain("B=2");
   });
 
+  it("preserves an explicit strict PATH override", () => {
+    const flags = buildFlags({
+      strictSandbox: true,
+      env: { PATH: "/opt/tools/bin:/usr/bin" },
+    });
+    expect(flags).toContain("--strict-sandbox");
+    expect(flags).toContain("--env");
+    expect(flags).toContain("PATH=/opt/tools/bin:/usr/bin");
+  });
+
   it("builds --allow-env as boolean", () => {
     const flags = buildFlags({ allowEnv: true });
     expect(flags).toContain("--allow-env");

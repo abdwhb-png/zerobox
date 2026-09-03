@@ -1,0 +1,30 @@
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -501,6 +501,26 @@
+     assert_eq!(written, b"STARTED\n");
+ }
+
++#[test]
++fn setup_handshake_confirms_exec_before_enabling_signal_forwarding() {
++    let events = std::cell::RefCell::new(Vec::new());
++    let (exec_error, ()) = confirm_exec_before_enabling_signal_forwarding(
++        || {
++            events.borrow_mut().push("exec-confirmed");
++            Ok(None)
++        },
++        || {
++            events.borrow_mut().push("signal-forwarding-enabled");
++        },
++    );
++
++    assert_eq!(exec_error.expect("exec confirmation"), None);
++    assert_eq!(
++        events.into_inner(),
++        vec!["exec-confirmed", "signal-forwarding-enabled"]
++    );
++}
++
+ #[test]
+ fn managed_proxy_inner_command_includes_route_spec() {
+     let permission_profile = read_only_permission_profile();
+     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {

@@ -29,3 +29,4 @@ packages/cli-linux-x64-musl/zerobox
 # Runtime
 *.log
 *.pid
+skills-lock.json

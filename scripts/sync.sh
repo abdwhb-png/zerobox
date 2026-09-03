@@ -22,6 +22,7 @@ VERSION_FILE="$ROOT/UPSTREAM_VERSION"
 
 if [ $# -ge 1 ]; then
     REF="$1"
+    PINNED_COMMIT=""
 else
     if [ ! -f "$VERSION_FILE" ]; then
         echo "error: no ref specified and no UPSTREAM_VERSION file found"
@@ -29,6 +30,11 @@ else
         exit 1
     fi
     REF="$(head -1 "$VERSION_FILE" | tr -d '[:space:]')"
+    PINNED_COMMIT="$(sed -n 's/^# commit: \([0-9a-fA-F]\{40,64\}\)$/\1/p' "$VERSION_FILE" | head -1)"
+    if [ -z "$PINNED_COMMIT" ]; then
+        echo "error: UPSTREAM_VERSION has no valid '# commit: <SHA>' pin"
+        exit 1
+    fi
 fi
 
 echo "==> Syncing from openai/codex @ $REF"
@@ -48,6 +54,12 @@ fi
 
 COMMIT_SHA="$(git -C "$WORK_DIR/codex" rev-parse HEAD)"
 echo "==> Resolved to commit $COMMIT_SHA"
+
+if [ -n "$PINNED_COMMIT" ] && [ "$COMMIT_SHA" != "$PINNED_COMMIT" ]; then
+    echo "error: ref '$REF' resolved to $COMMIT_SHA, not pinned commit $PINNED_COMMIT"
+    echo "       pass an explicit ref to accept and record a new upstream commit"
+    exit 1
+fi
 
 CRATES=(
     sandboxing
@@ -257,7 +269,7 @@ cd "$ROOT"
 PATCH="$SCRIPT_DIR/upstream-secret-substitution.patch"
 if [ -f "$PATCH" ]; then
     echo "    secret-substitution"
-    patch -p1 < "$PATCH"
+    patch --fuzz=0 -p1 < "$PATCH"
     if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
         cargo fmt -- \
             upstream/network-proxy/src/certs.rs \
@@ -272,19 +284,19 @@ fi
 PLATFORM_PATCH="$SCRIPT_DIR/upstream-platform-defaults.patch"
 if [ -f "$PLATFORM_PATCH" ]; then
     echo "    platform-defaults"
-    patch -p0 < "$PLATFORM_PATCH"
+    patch --fuzz=0 -p0 < "$PLATFORM_PATCH"
 fi
 
 DENY_WRITE_PATCH="$SCRIPT_DIR/upstream-deny-default-write.patch"
 if [ -f "$DENY_WRITE_PATCH" ]; then
     echo "    deny-default-write"
-    patch -p0 < "$DENY_WRITE_PATCH"
+    patch --fuzz=0 -p0 < "$DENY_WRITE_PATCH"
 fi
 
 CODEX_PROTECT_PATCH="$SCRIPT_DIR/upstream-no-preemptive-codex-protect.patch"
 if [ -f "$CODEX_PROTECT_PATCH" ]; then
     echo "    no-preemptive-codex-protect"
-    patch -p0 < "$CODEX_PROTECT_PATCH"
+    patch --fuzz=0 -p0 < "$CODEX_PROTECT_PATCH"
     if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
         cargo fmt -- \
             upstream/sandboxing/src/seatbelt_tests.rs \
@@ -296,25 +308,87 @@ fi
 HOME_ENV_PATCH="$SCRIPT_DIR/upstream-zerobox-home-env.patch"
 if [ -f "$HOME_ENV_PATCH" ]; then
     echo "    zerobox-home-env"
-    patch -p0 < "$HOME_ENV_PATCH"
+    patch --fuzz=0 -p0 < "$HOME_ENV_PATCH"
 fi
 
 NODE_PROXY_PATCH="$SCRIPT_DIR/upstream-node-env-proxy.patch"
 if [ -f "$NODE_PROXY_PATCH" ]; then
     echo "    node-env-proxy"
-    patch -p0 < "$NODE_PROXY_PATCH"
+    patch --fuzz=0 -p0 < "$NODE_PROXY_PATCH"
 fi
 
 PROXY_ZOMBIE_PATCH="$SCRIPT_DIR/upstream-proxy-zombie-cleanup.patch"
 if [ -f "$PROXY_ZOMBIE_PATCH" ]; then
     echo "    proxy-zombie-cleanup"
-    patch -p0 < "$PROXY_ZOMBIE_PATCH"
+    patch --fuzz=0 -p0 < "$PROXY_ZOMBIE_PATCH"
 fi
 
 BWRAP_FIXES_PATCH="$SCRIPT_DIR/upstream-bwrap-fixes.patch"
 if [ -f "$BWRAP_FIXES_PATCH" ]; then
     echo "    bwrap-fixes"
-    patch -p0 < "$BWRAP_FIXES_PATCH"
+    patch --fuzz=0 -p0 < "$BWRAP_FIXES_PATCH"
+fi
+
+STRICT_BWRAP_PATCH="$SCRIPT_DIR/upstream-strict-bwrap.patch"
+if [ -f "$STRICT_BWRAP_PATCH" ]; then
+    echo "    strict-bwrap"
+    patch --fuzz=0 -p0 < "$STRICT_BWRAP_PATCH"
+fi
+
+NETWORK_HARDENING_PATCH="$SCRIPT_DIR/upstream-network-hardening.patch"
+if [ -f "$NETWORK_HARDENING_PATCH" ]; then
+    echo "    network-hardening"
+    patch --fuzz=0 -p0 < "$NETWORK_HARDENING_PATCH"
+fi
+
+PROXY_ROOT_PLUMBING_PATCH="$SCRIPT_DIR/upstream-proxy-root-plumbing.patch"
+if [ -f "$PROXY_ROOT_PLUMBING_PATCH" ]; then
+    echo "    proxy-root-plumbing"
+    patch --fuzz=0 -p0 < "$PROXY_ROOT_PLUMBING_PATCH"
+fi
+
+SETUP_STATUS_PATCH="$SCRIPT_DIR/upstream-setup-status.patch"
+if [ -f "$SETUP_STATUS_PATCH" ]; then
+    echo "    setup-status"
+    patch --fuzz=0 -p0 < "$SETUP_STATUS_PATCH"
+fi
+
+SETUP_SUPERVISOR_HARDENING_PATCH="$SCRIPT_DIR/upstream-setup-supervisor-hardening.patch"
+if [ -f "$SETUP_SUPERVISOR_HARDENING_PATCH" ]; then
+    echo "    setup-supervisor-hardening"
+    patch --fuzz=0 -p0 < "$SETUP_SUPERVISOR_HARDENING_PATCH"
+fi
+
+SETUP_PROTOCOL_TESTING_PATCH="$SCRIPT_DIR/upstream-setup-protocol-testing.patch"
+if [ -f "$SETUP_PROTOCOL_TESTING_PATCH" ]; then
+    echo "    setup-protocol-testing"
+    patch --fuzz=0 -p0 < "$SETUP_PROTOCOL_TESTING_PATCH"
+fi
+
+SETUP_POSTFORK_ERRORS_PATCH="$SCRIPT_DIR/upstream-setup-postfork-errors.patch"
+if [ -f "$SETUP_POSTFORK_ERRORS_PATCH" ]; then
+    echo "    setup-postfork-errors"
+    patch --fuzz=0 -p0 < "$SETUP_POSTFORK_ERRORS_PATCH"
+fi
+
+SETUP_SIGNAL_ORDER_TEST_PATCH="$SCRIPT_DIR/upstream-setup-signal-order-test.patch"
+if [ -f "$SETUP_SIGNAL_ORDER_TEST_PATCH" ]; then
+    echo "    setup-signal-order-test"
+    patch --fuzz=0 -p0 < "$SETUP_SIGNAL_ORDER_TEST_PATCH"
+fi
+
+SETUP_SIGNAL_WINDOW_PATCH="$SCRIPT_DIR/upstream-setup-signal-window.patch"
+if [ -f "$SETUP_SIGNAL_WINDOW_PATCH" ]; then
+    echo "    setup-signal-window"
+    patch --fuzz=0 -p0 < "$SETUP_SIGNAL_WINDOW_PATCH"
+fi
+
+# Keep generated Rust sources canonical after all local patches have landed.
+if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+    cargo fmt -- \
+        upstream/linux-sandbox/src/linux_run_main.rs \
+        upstream/linux-sandbox/src/proxy_routing.rs \
+        upstream/network-proxy/src/config.rs
 fi
 
 cd -
@@ -322,7 +396,6 @@ cd -
 {
     echo "$REF"
     echo "# commit: $COMMIT_SHA"
-    echo "# synced: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$VERSION_FILE"
 
 echo "==> Done. Synced to $REF ($COMMIT_SHA)"

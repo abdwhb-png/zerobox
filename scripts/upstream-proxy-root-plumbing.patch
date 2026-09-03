@@ -1,0 +1,247 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -41,7 +41,7 @@
+     "DOCKER_HTTPS_PROXY",
+ ];
+
+-const PROXY_SOCKET_DIR_PREFIX: &str = "zerobox-linux-sandbox-proxy-";
++const PROXY_SOCKET_DIR_PREFIX: &str = "p-";
+ const HOST_BRIDGE_READY: u8 = 1;
+ const LOOPBACK_INTERFACE_NAME: &[u8] = b"lo";
+
+@@ -91,7 +91,7 @@
+         if socket_by_endpoint.contains_key(&route.endpoint) {
+             continue;
+         }
+-        let socket_path = socket_dir.join(format!("proxy-route-{next_index}.sock"));
++        let socket_path = socket_dir.join(format!("r-{next_index}.sock"));
+         next_index += 1;
+         socket_by_endpoint.insert(route.endpoint, socket_path);
+     }
+@@ -808,11 +808,11 @@
+     #[test]
+     fn parse_proxy_socket_dir_owner_pid_reads_owner_pid() {
+         assert_eq!(
+-            parse_proxy_socket_dir_owner_pid("zerobox-linux-sandbox-proxy-1234-0"),
++            parse_proxy_socket_dir_owner_pid("p-1234-0"),
+             Some(1234)
+         );
+         assert_eq!(
+-            parse_proxy_socket_dir_owner_pid("zerobox-linux-sandbox-proxy-x"),
++            parse_proxy_socket_dir_owner_pid("p-x"),
+             None
+         );
+         assert_eq!(parse_proxy_socket_dir_owner_pid("not-a-proxy-dir"), None);
+--- upstream/sandboxing/src/manager.rs
++++ upstream/sandboxing/src/manager.rs
+@@ -96,6 +96,8 @@
+     // TODO(viyatb): Evaluate switching this to Option<Arc<NetworkProxy>>
+     // to make shared ownership explicit across runtime/sandbox plumbing.
+     pub network: Option<&'a NetworkProxy>,
++    /// Owner-only host directory for managed Linux proxy bridge sockets.
++    pub proxy_root: Option<&'a Path>,
+     pub sandbox_policy_cwd: &'a Path,
+     pub zerobox_linux_sandbox_exe: Option<&'a Path>,
+     pub use_legacy_landlock: bool,
+@@ -106,6 +108,7 @@
+ #[derive(Debug)]
+ pub enum SandboxTransformError {
+     MissingLinuxSandboxExecutable,
++    MissingPrivateProxyRoot,
+     #[cfg(target_os = "linux")]
+     Wsl1UnsupportedForBubblewrap,
+     #[cfg(not(target_os = "macos"))]
+@@ -118,6 +121,9 @@
+             Self::MissingLinuxSandboxExecutable => {
+                 write!(f, "missing zerobox-linux-sandbox executable path")
+             }
++            Self::MissingPrivateProxyRoot => {
++                write!(f, "managed proxy mode requires an explicit private proxy root")
++            }
+             #[cfg(target_os = "linux")]
+             Self::Wsl1UnsupportedForBubblewrap => write!(f, "{WSL1_BWRAP_WARNING}"),
+             #[cfg(not(target_os = "macos"))]
+@@ -175,6 +181,7 @@
+             sandbox,
+             enforce_managed_network,
+             network,
++            proxy_root,
+             sandbox_policy_cwd,
+             zerobox_linux_sandbox_exe,
+             use_legacy_landlock,
+@@ -218,6 +225,9 @@
+                 let exe = zerobox_linux_sandbox_exe
+                     .ok_or(SandboxTransformError::MissingLinuxSandboxExecutable)?;
+                 let allow_proxy_network = allow_network_for_proxy(enforce_managed_network);
++                if allow_proxy_network && proxy_root.is_none() {
++                    return Err(SandboxTransformError::MissingPrivateProxyRoot);
++                }
+                 #[cfg(target_os = "linux")]
+                 ensure_linux_bubblewrap_is_supported(
+                     &effective_file_system_policy,
+@@ -232,6 +242,7 @@
+                     sandbox_policy_cwd,
+                     use_legacy_landlock,
+                     allow_proxy_network,
++                    proxy_root,
+                 );
+                 let mut full_command = Vec::with_capacity(1 + args.len());
+                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
+--- upstream/sandboxing/src/manager_tests.rs
++++ upstream/sandboxing/src/manager_tests.rs
+@@ -90,6 +90,7 @@
+             sandbox: SandboxType::None,
+             enforce_managed_network: false,
+             network: None,
++            proxy_root: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -141,6 +142,7 @@
+             sandbox: SandboxType::None,
+             enforce_managed_network: false,
+             network: None,
++            proxy_root: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -209,6 +211,7 @@
+             sandbox: SandboxType::None,
+             enforce_managed_network: false,
+             network: None,
++            proxy_root: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: None,
+             use_legacy_landlock: false,
+@@ -262,6 +265,7 @@
+             sandbox: SandboxType::LinuxSeccomp,
+             enforce_managed_network: false,
+             network: None,
++            proxy_root: None,
+             sandbox_policy_cwd: cwd.as_path(),
+             zerobox_linux_sandbox_exe: Some(zerobox_linux_sandbox_exe),
+             use_legacy_landlock: false,
+@@ -272,6 +276,37 @@
+ }
+
+ #[cfg(target_os = "linux")]
++#[test]
++fn managed_proxy_rejects_missing_private_root_before_helper_launch() {
++    let manager = SandboxManager::new();
++    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
++    let permissions = PermissionProfile::Disabled;
++    let result = manager.transform(SandboxTransformRequest {
++        command: SandboxCommand {
++            program: "true".into(),
++            args: Vec::new(),
++            cwd: cwd.clone(),
++            env: HashMap::new(),
++            additional_permissions: None,
++        },
++        permissions: &permissions,
++        sandbox: SandboxType::LinuxSeccomp,
++        enforce_managed_network: true,
++        network: None,
++        proxy_root: None,
++        sandbox_policy_cwd: cwd.as_path(),
++        zerobox_linux_sandbox_exe: Some(std::path::Path::new("/tmp/zerobox-linux-sandbox")),
++        use_legacy_landlock: false,
++        windows_sandbox_level: WindowsSandboxLevel::Disabled,
++        windows_sandbox_private_desktop: false,
++    });
++    assert!(matches!(
++        result,
++        Err(super::SandboxTransformError::MissingPrivateProxyRoot)
++    ));
++}
++
++#[cfg(target_os = "linux")]
+ #[test]
+ fn wsl1_rejects_linux_bubblewrap_path() {
+     let restricted_policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+--- upstream/sandboxing/src/landlock.rs
++++ upstream/sandboxing/src/landlock.rs
+@@ -27,6 +27,7 @@
+     sandbox_policy_cwd: &Path,
+     use_legacy_landlock: bool,
+     allow_network_for_proxy: bool,
++    proxy_root: Option<&Path>,
+ ) -> Vec<String> {
+     let permission_profile_json = serde_json::to_string(permission_profile)
+         .unwrap_or_else(|err| panic!("failed to serialize permission profile: {err}"));
+@@ -52,6 +53,11 @@
+     }
+     if allow_network_for_proxy {
+         linux_cmd.push("--allow-network-for-proxy".to_string());
++        let Some(proxy_root) = proxy_root else {
++            panic!("managed proxy mode requires an explicit private root");
++        };
++        linux_cmd.push("--proxy-root".to_string());
++        linux_cmd.push(proxy_root.to_string_lossy().into_owned());
+     }
+     linux_cmd.push("--".to_string());
+     linux_cmd.extend(command);
+@@ -67,6 +73,7 @@
+     sandbox_policy_cwd: &Path,
+     use_legacy_landlock: bool,
+     allow_network_for_proxy: bool,
++    proxy_root: Option<&Path>,
+ ) -> Vec<String> {
+     let command_cwd = command_cwd
+         .to_str()
+@@ -88,6 +95,11 @@
+     }
+     if allow_network_for_proxy {
+         linux_cmd.push("--allow-network-for-proxy".to_string());
++        let Some(proxy_root) = proxy_root else {
++            panic!("managed proxy mode requires an explicit private root");
++        };
++        linux_cmd.push("--proxy-root".to_string());
++        linux_cmd.push(proxy_root.to_string_lossy().into_owned());
+     }
+
+     // Separator so that command arguments starting with `-` are not parsed as
+--- upstream/sandboxing/src/landlock_tests.rs
++++ upstream/sandboxing/src/landlock_tests.rs
+@@ -13,6 +13,7 @@
+         cwd,
+         /*use_legacy_landlock*/ false,
+         /*allow_network_for_proxy*/ false,
++        None,
+     );
+     assert_eq!(
+         default_bwrap.contains(&"--use-legacy-landlock".to_string()),
+@@ -25,6 +26,7 @@
+         cwd,
+         /*use_legacy_landlock*/ true,
+         /*allow_network_for_proxy*/ false,
++        None,
+     );
+     assert_eq!(
+         legacy_landlock.contains(&"--use-legacy-landlock".to_string()),
+@@ -44,11 +46,16 @@
+         cwd,
+         /*use_legacy_landlock*/ true,
+         /*allow_network_for_proxy*/ true,
++        Some(Path::new("/private/proxy-root")),
+     );
+     assert_eq!(
+         args.contains(&"--allow-network-for-proxy".to_string()),
+         true
+     );
++    assert!(
++        args.windows(2)
++            .any(|window| { window[0] == "--proxy-root" && window[1] == "/private/proxy-root" })
++    );
+ }
+
+ #[test]
+@@ -65,6 +72,8 @@
+         cwd,
+         /*use_legacy_landlock*/ true,
+         /*allow_network_for_proxy*/ false,
++        None,
++        None,
+     );
+
+     assert_eq!(

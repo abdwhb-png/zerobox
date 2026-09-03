@@ -1,6 +1,44 @@
 use crate::support::*;
 
 #[test]
+fn managed_network_removes_every_no_proxy_variant() {
+    const NO_PROXY_KEYS: &[&str] = &[
+        "NO_PROXY",
+        "no_proxy",
+        "npm_config_noproxy",
+        "NPM_CONFIG_NOPROXY",
+        "YARN_NO_PROXY",
+        "BUNDLE_NO_PROXY",
+    ];
+    let allowed = NO_PROXY_KEYS.join(",");
+    let mut command = Command::new(zerobox_exec());
+    command.args([
+        format!("--allow-env={allowed}"),
+        "--allow-all".to_string(),
+        "--allow-net=example.com".to_string(),
+        "--".to_string(),
+        "env".to_string(),
+    ]);
+    for key in NO_PROXY_KEYS {
+        command.env(key, "must-not-reach-target");
+    }
+
+    let out = command
+        .output()
+        .expect("spawn managed-network environment check");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let child_env = stdout(&out);
+    for key in NO_PROXY_KEYS {
+        assert!(
+            !child_env
+                .lines()
+                .any(|line| line.starts_with(&format!("{key}="))),
+            "{key} leaked into child environment:\n{child_env}"
+        );
+    }
+}
+
+#[test]
 fn default_env_has_path() {
     let out = run(&["--allow-all", "--", "sh", "-c", "echo $PATH"]);
     assert!(out.status.success());
@@ -247,4 +285,72 @@ fn env_without_equals_fails() {
         "should hint at format, got: {}",
         stderr(&out)
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_path_uses_profile_default_and_ignores_host_inheritance() {
+    let out = Command::new(zerobox_exec())
+        .args([
+            "--profile=analysis-strict",
+            "--allow-env=PATH",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf %s \"$PATH\"",
+        ])
+        .env("PATH", "/host/must/not/leak")
+        .output()
+        .expect("spawn strict PATH check");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "/usr/local/bin:/usr/bin:/bin");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_strict_path_beats_profile_and_secret() {
+    let out = run(&[
+        "--profile=analysis-strict",
+        "--env",
+        "PATH=/opt/tools/bin:/usr/bin",
+        "--secret",
+        "PATH=must-not-win",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf %s \"$PATH\"",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "/opt/tools/bin:/usr/bin");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_path_rejects_empty_and_relative_segments_at_preparation() {
+    for invalid in [
+        "",
+        ":/usr/bin",
+        "/usr/bin:",
+        "/usr/bin::/bin",
+        "bin:/usr/bin",
+    ] {
+        let out = run(&[
+            "--profile=analysis-strict",
+            "--env",
+            &format!("PATH={invalid}"),
+            "--",
+            "/bin/true",
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "PATH={invalid:?}: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("strict PATH"),
+            "PATH={invalid:?}: {}",
+            stderr(&out)
+        );
+    }
 }

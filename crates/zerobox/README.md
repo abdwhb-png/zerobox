@@ -11,6 +11,8 @@
 
 Rust SDK for [zerobox](https://github.com/afshinm/zerobox). Sandbox any command with file, network, and credential controls.
 
+This fork is Linux/WSL2 local-only. Upstream crates.io/package references in this document are for upstream only and are **not applicable** here.
+
 ```toml
 [dependencies]
 zerobox = "0.2"
@@ -36,6 +38,22 @@ println!("exit: {}", output.status);
 ```
 
 ## Execution modes
+
+### Supervisor status channel
+
+On Linux, `zerobox --status-fd=N` uses protocol version 1 and writes one JSON
+object per line to a caller-owned writable pipe/FIFO or Unix `SOCK_STREAM`
+socket. Pipe descriptors are made nonblocking and socket writes use
+nonblocking send semantics. Setup failures emit `setup_error` and exit 125;
+successful setup emits `child_started`, then `child_exit` when the target ends.
+A target that exits 125 is therefore distinguishable from a setup failure.
+
+The descriptor is marked `CLOEXEC`, is never inherited by the target, and is
+closed after every terminal event and on timeout, interruption, or delivery
+failure so the caller observes EOF. Failure to deliver `child_started` kills
+and reaps the target before Zerobox exits 125. Status reporting does not buffer
+or otherwise change the direct stdin/stdout/stderr streams. Regular files and
+non-stream Unix sockets are rejected.
 
 ### Collect output
 
@@ -88,6 +106,14 @@ let output = Sandbox::command("node")
 See the [main README](https://github.com/afshinm/zerobox#secrets) for how placeholder substitution works.
 
 ## Environment variables
+
+Strict mode always selects an explicit `PATH`. Precedence is the built-in
+`/usr/local/bin:/usr/bin:/bin`, then profile `set_env.PATH`, then an explicit
+caller `env`/`--env PATH=...`. Host `PATH` inherited with `allow_env` is ignored.
+Every selected segment must be non-empty and absolute; directory existence is
+not required. The selected value is applied after secrets, so a secret named
+`PATH` cannot replace it. Invalid strict paths fail preparation (and emit
+`setup_error`, then exit 125 when `--status-fd` is active).
 
 ```rust
 let output = Sandbox::command("node")

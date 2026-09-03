@@ -19,6 +19,7 @@
     "/usr/local/lib",
     "/usr/local/lib64",
     "/etc/resolv.conf",
+    "/mnt/wsl/resolv.conf",
     "/etc/hosts",
     "/etc/nsswitch.conf",
     "/etc/gai.conf",

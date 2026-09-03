@@ -3771,7 +3771,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3779,12 +3779,14 @@ dependencies = [
  "clap",
  "dirs",
  "getrandom 0.3.4",
+ "libc",
  "rama-http",
  "schemars",
  "serde",
  "serde_json",
  "tabwriter",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing-subscriber",
  "zerobox-linux-sandbox",
@@ -3798,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-linux-sandbox"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "clap",
  "globset",
@@ -3821,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-network-proxy"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3852,14 +3854,14 @@ dependencies = [
 
 [[package]]
 name = "zerobox-otel"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zerobox-process-hardening"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "libc",
  "pretty_assertions",
@@ -3867,7 +3869,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-protocol"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "globset",
  "pretty_assertions",
@@ -3884,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-sandboxing"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3905,7 +3907,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-snapshot"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3924,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-utils-absolute-path"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "dirs",
  "dunce",
@@ -3938,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-utils-home-dir"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "dirs",
  "zerobox-utils-absolute-path",
@@ -3946,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-utils-pty"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "filedescriptor",
@@ -3962,14 +3964,14 @@ dependencies = [
 
 [[package]]
 name = "zerobox-utils-rustls-provider"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "rustls",
 ]
 
 [[package]]
 name = "zerobox-utils-string"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "pretty_assertions",
  "regex-lite",
@@ -3979,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "zerobox-windows-sandbox"
-version = "0.3.1"
+version = "0.3.3-fork.1"
 dependencies = [
  "anyhow",
  "base64",
