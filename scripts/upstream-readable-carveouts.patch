@@ -1,0 +1,353 @@
+--- upstream/linux-sandbox/src/bwrap.rs
++++ upstream/linux-sandbox/src/bwrap.rs
+@@ -371,13 +371,15 @@
+ ///    `--tmpfs /` and layer scoped `--ro-bind` mounts.
+ /// 2. `--dev /dev` mounts a minimal writable `/dev` with standard device nodes
+ ///    (including `/dev/urandom`) even under a read-only root.
+-/// 3. Unreadable ancestors of writable roots are masked before their child
+-///    mounts are rebound so nested writable carveouts can be reopened safely.
+-/// 4. `--bind <root> <root>` re-enables writes for allowed roots, including
++/// 3. Unreadable ancestors of explicitly reopened roots are masked before
++///    their child mounts are rebound so nested carveouts can be reopened safely.
++/// 4. Explicit readable carveouts under those masks are rebound read-only and
++///    any narrower unreadable paths are masked again.
++/// 5. `--bind <root> <root>` re-enables writes for allowed roots, including
+ ///    writable subpaths under `/dev` (for example, `/dev/shm`).
+-/// 5. `--ro-bind <subpath> <subpath>` re-applies read-only protections under
++/// 6. `--ro-bind <subpath> <subpath>` re-applies read-only protections under
+ ///    those writable roots so protected subpaths win.
+-/// 6. Nested unreadable carveouts under a writable root are masked after that
++/// 7. Nested unreadable carveouts under a writable root are masked after that
+ ///    root is bound, and unrelated unreadable roots are masked afterward.
+ fn create_filesystem_args(
+     file_system_sandbox_policy: &FileSystemSandboxPolicy,
+@@ -451,7 +453,6 @@
+     );
+     unreadable_roots.sort();
+     unreadable_roots.dedup();
+-
+     let mut used_tmpfs_root = false;
+     let args = if file_system_sandbox_policy.has_full_disk_read_access() {
+         // Read-only root, then mount a minimal device tree.
+@@ -556,29 +557,86 @@
+             allowed_write_paths.push(target);
+         }
+     }
++    let mut readable_carveouts: Vec<PathBuf> = file_system_sandbox_policy
++        .get_explicit_read_only_roots_with_cwd(cwd)
++        .into_iter()
++        .map(AbsolutePathBuf::into_path_buf)
++        .filter(|root| root != Path::new("/") && root.exists())
++        .filter(|root| {
++            unreadable_roots
++                .iter()
++                .any(|unreadable_root| root != unreadable_root && root.starts_with(unreadable_root))
++        })
++        // Read-only subpaths below writable roots are already enforced by the
++        // WritableRoot pass. Rebinding them here would run before the writable
++        // mount and either be redundant or be overwritten by that later bind.
++        .filter(|root| {
++            !allowed_write_paths
++                .iter()
++                .any(|writable_root| root.starts_with(writable_root))
++        })
++        .collect();
++    readable_carveouts.sort_by_key(|path| path_depth(path));
++    readable_carveouts.dedup();
++    let mut allowed_reopened_paths = allowed_write_paths.clone();
++    allowed_reopened_paths.extend(readable_carveouts.iter().cloned());
+     let unreadable_paths: HashSet<PathBuf> = unreadable_roots.iter().cloned().collect();
+     let mut sorted_writable_roots = writable_roots;
+     sorted_writable_roots.sort_by_key(|writable_root| path_depth(writable_root.root.as_path()));
+-    // Mask only the unreadable ancestors that sit outside every writable root.
+-    // Unreadable paths nested under a broader writable root are applied after
+-    // that broader root is bound, then reopened by any deeper writable child.
+-    let mut unreadable_ancestors_of_writable_roots: Vec<PathBuf> = unreadable_roots
++    // Mask only the unreadable ancestors that sit outside every reopened root.
++    // Unreadable paths nested under a broader writable/readable root are applied
++    // after that broader root is bound, then reopened by any deeper child.
++    let mut unreadable_ancestors_of_reopened_roots: Vec<PathBuf> = unreadable_roots
+         .iter()
+         .filter(|path| {
+             let unreadable_root = path.as_path();
+-            !allowed_write_paths
++            !allowed_reopened_paths
+                 .iter()
+                 .any(|root| unreadable_root.starts_with(root))
+-                && allowed_write_paths
++                && allowed_reopened_paths
+                     .iter()
+                     .any(|root| root.starts_with(unreadable_root))
+         })
+         .cloned()
+         .collect();
+-    unreadable_ancestors_of_writable_roots.sort_by_key(|path| path_depth(path));
++    unreadable_ancestors_of_reopened_roots.sort_by_key(|path| path_depth(path));
+ 
+-    for unreadable_root in &unreadable_ancestors_of_writable_roots {
+-        append_unreadable_root_args(&mut bwrap_args, unreadable_root, &allowed_write_paths)?;
++    for unreadable_root in &unreadable_ancestors_of_reopened_roots {
++        append_unreadable_root_args(
++            &mut bwrap_args,
++            unreadable_root,
++            &allowed_write_paths,
++            &allowed_reopened_paths,
++        )?;
++    }
++
++    for readable_root in &readable_carveouts {
++        if let Some(masking_root) = unreadable_roots
++            .iter()
++            .map(PathBuf::as_path)
++            .filter(|unreadable_root| readable_root.starts_with(unreadable_root))
++            .max_by_key(|unreadable_root| path_depth(unreadable_root))
++        {
++            append_mount_target_parent_dir_args(&mut bwrap_args.args, readable_root, masking_root);
++        }
++        bwrap_args.args.push("--ro-bind".to_string());
++        bwrap_args.args.push(path_to_string(readable_root));
++        bwrap_args.args.push(path_to_string(readable_root));
++
++        let mut nested_unreadable_roots: Vec<PathBuf> = unreadable_roots
++            .iter()
++            .filter(|path| path.as_path() != readable_root && path.starts_with(readable_root))
++            .cloned()
++            .collect();
++        nested_unreadable_roots.sort_by_key(|path| path_depth(path));
++        for unreadable_root in nested_unreadable_roots {
++            append_unreadable_root_args(
++                &mut bwrap_args,
++                &unreadable_root,
++                &allowed_write_paths,
++                &allowed_reopened_paths,
++            )?;
++        }
+     }
+ 
+     for writable_root in &sorted_writable_roots {
+@@ -639,7 +697,12 @@
+         }
+         nested_unreadable_roots.sort_by_key(|path| path_depth(path));
+         for unreadable_root in nested_unreadable_roots {
+-            append_unreadable_root_args(&mut bwrap_args, &unreadable_root, &allowed_write_paths)?;
++            append_unreadable_root_args(
++                &mut bwrap_args,
++                &unreadable_root,
++                &allowed_write_paths,
++                &allowed_reopened_paths,
++            )?;
+         }
+     }
+ 
+@@ -647,7 +710,7 @@
+         .iter()
+         .filter(|path| {
+             let unreadable_root = path.as_path();
+-            !allowed_write_paths
++            !allowed_reopened_paths
+                 .iter()
+                 .any(|root| unreadable_root.starts_with(root) || root.starts_with(unreadable_root))
+         })
+@@ -655,7 +718,12 @@
+         .collect();
+     rootless_unreadable_roots.sort_by_key(|path| path_depth(path));
+     for unreadable_root in rootless_unreadable_roots {
+-        append_unreadable_root_args(&mut bwrap_args, &unreadable_root, &allowed_write_paths)?;
++        append_unreadable_root_args(
++            &mut bwrap_args,
++            &unreadable_root,
++            &allowed_write_paths,
++            &allowed_reopened_paths,
++        )?;
+     }
+ 
+     Ok(bwrap_args)
+@@ -1178,6 +1246,7 @@
+     bwrap_args: &mut BwrapArgs,
+     unreadable_root: &Path,
+     allowed_write_paths: &[PathBuf],
++    allowed_reopened_paths: &[PathBuf],
+ ) -> Result<()> {
+     if let Some(symlink) =
+         first_writable_symlink_component_in_path(unreadable_root, allowed_write_paths)
+@@ -1209,7 +1278,7 @@
+         return Ok(());
+     }
+ 
+-    append_existing_unreadable_path_args(bwrap_args, unreadable_root, allowed_write_paths)
++    append_existing_unreadable_path_args(bwrap_args, unreadable_root, allowed_reopened_paths)
+ }
+ 
+ fn append_missing_unreadable_root_args(
+@@ -2384,6 +2453,171 @@
+     }
+ 
+     #[test]
++    fn split_policy_reopens_readable_subpath_after_unreadable_parent() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let blocked = temp_dir.path().join("blocked");
++        let readable = blocked.join("readable");
++        std::fs::create_dir_all(&readable).expect("create readable dir");
++        let blocked = AbsolutePathBuf::from_absolute_path(&blocked).expect("absolute blocked");
++        let readable = AbsolutePathBuf::from_absolute_path(&readable).expect("absolute readable");
++        let policy = FileSystemSandboxPolicy::restricted(vec![
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Special {
++                    value: FileSystemSpecialPath::Root,
++                },
++                access: FileSystemAccessMode::Read,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: blocked.clone(),
++                },
++                access: FileSystemAccessMode::None,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: readable.clone(),
++                },
++                access: FileSystemAccessMode::Read,
++            },
++        ]);
++
++        let args =
++            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
++                .expect("filesystem args");
++        let blocked_str = path_to_string(blocked.as_path());
++        let readable_str = path_to_string(readable.as_path());
++        let blocked_none_index = args
++            .args
++            .windows(4)
++            .position(|window| window == ["--perms", "111", "--tmpfs", blocked_str.as_str()])
++            .expect("blocked parent should allow traversal into the readable carveout");
++        let readable_dir_index = args
++            .args
++            .windows(2)
++            .position(|window| window == ["--dir", readable_str.as_str()])
++            .expect("readable mount target should be recreated");
++        let readable_bind_index = args
++            .args
++            .windows(3)
++            .position(|window| {
++                window == ["--ro-bind", readable_str.as_str(), readable_str.as_str()]
++            })
++            .expect("readable carveout should be rebound read-only");
++
++        assert!(
++            blocked_none_index < readable_dir_index && readable_dir_index < readable_bind_index,
++            "expected unreadable parent mask before recreating and rebinding readable child: {:#?}",
++            args.args
++        );
++    }
++
++    #[test]
++    fn split_policy_reapplies_unreadable_subpath_after_readable_carveout() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let blocked = temp_dir.path().join("blocked");
++        let readable = blocked.join("readable");
++        let secret = readable.join("secret");
++        std::fs::create_dir_all(&secret).expect("create nested secret dir");
++        let blocked = AbsolutePathBuf::from_absolute_path(&blocked).expect("absolute blocked");
++        let readable = AbsolutePathBuf::from_absolute_path(&readable).expect("absolute readable");
++        let secret = AbsolutePathBuf::from_absolute_path(&secret).expect("absolute secret");
++        let policy = FileSystemSandboxPolicy::restricted(vec![
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Special {
++                    value: FileSystemSpecialPath::Root,
++                },
++                access: FileSystemAccessMode::Read,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: blocked.clone(),
++                },
++                access: FileSystemAccessMode::None,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: readable.clone(),
++                },
++                access: FileSystemAccessMode::Read,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: secret.clone(),
++                },
++                access: FileSystemAccessMode::None,
++            },
++        ]);
++
++        let args =
++            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
++                .expect("filesystem args");
++        let readable_str = path_to_string(readable.as_path());
++        let secret_str = path_to_string(secret.as_path());
++        let readable_bind_index = args
++            .args
++            .windows(3)
++            .position(|window| {
++                window == ["--ro-bind", readable_str.as_str(), readable_str.as_str()]
++            })
++            .expect("readable carveout should be rebound read-only");
++        let secret_mask_index = args
++            .args
++            .windows(4)
++            .position(|window| window == ["--perms", "000", "--tmpfs", secret_str.as_str()])
++            .expect("nested unreadable directory should remain masked");
++
++        assert!(
++            readable_bind_index < secret_mask_index,
++            "expected nested unreadable path to be remasked after readable carveout: {:#?}",
++            args.args
++        );
++    }
++
++    #[test]
++    fn split_policy_does_not_rebind_writable_carveout_read_only() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let blocked = temp_dir.path().join("blocked");
++        let writable = blocked.join("writable");
++        std::fs::create_dir_all(&writable).expect("create writable dir");
++        let blocked = AbsolutePathBuf::from_absolute_path(&blocked).expect("absolute blocked");
++        let writable = AbsolutePathBuf::from_absolute_path(&writable).expect("absolute writable");
++        let policy = FileSystemSandboxPolicy::restricted(vec![
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Special {
++                    value: FileSystemSpecialPath::Root,
++                },
++                access: FileSystemAccessMode::Read,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: blocked.clone(),
++                },
++                access: FileSystemAccessMode::None,
++            },
++            FileSystemSandboxEntry {
++                path: FileSystemPath::Path {
++                    path: writable.clone(),
++                },
++                access: FileSystemAccessMode::Write,
++            },
++        ]);
++
++        let args =
++            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
++                .expect("filesystem args");
++        let writable_str = path_to_string(writable.as_path());
++
++        assert!(
++            args.args.windows(3).any(|window| {
++                window == ["--bind", writable_str.as_str(), writable_str.as_str()]
++            })
++        );
++        assert!(!args.args.windows(3).any(|window| {
++            window == ["--ro-bind", writable_str.as_str(), writable_str.as_str()]
++        }));
++    }
++
++    #[test]
+     fn split_policy_reapplies_unreadable_carveouts_after_writable_binds() {
+         let temp_dir = TempDir::new().expect("temp dir");
+         let writable_root = temp_dir.path().join("workspace");

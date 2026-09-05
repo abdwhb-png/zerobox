@@ -836,6 +836,27 @@ impl FileSystemSandboxPolicy {
         )
     }
 
+    /// Returns explicit effective read-only entries resolved against the
+    /// provided cwd, including narrower read carveouts in a full-read policy.
+    pub fn get_explicit_read_only_roots_with_cwd(&self, cwd: &Path) -> Vec<AbsolutePathBuf> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+
+        dedup_absolute_paths(
+            self.resolved_entries_with_cwd(cwd)
+                .into_iter()
+                .filter(|entry| entry.access == FileSystemAccessMode::Read)
+                .filter(|entry| {
+                    self.resolve_access_with_cwd(entry.path.as_path(), cwd)
+                        == FileSystemAccessMode::Read
+                })
+                .map(|entry| entry.path)
+                .collect(),
+            /*normalize_effective_paths*/ true,
+        )
+    }
+
     /// Returns the writable roots together with read-only carveouts resolved
     /// against the provided cwd.
     pub fn get_writable_roots_with_cwd(&self, cwd: &Path) -> Vec<WritableRoot> {

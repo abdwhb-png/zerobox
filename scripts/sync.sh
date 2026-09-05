@@ -389,6 +389,12 @@ if [ -f "$PROXY_ROUTED_SOCKET_FILTER_PATCH" ]; then
     patch --fuzz=0 -p0 < "$PROXY_ROUTED_SOCKET_FILTER_PATCH"
 fi
 
+READABLE_CARVEOUTS_PATCH="$SCRIPT_DIR/upstream-readable-carveouts.patch"
+if [ -f "$READABLE_CARVEOUTS_PATCH" ]; then
+    echo "    readable-carveouts"
+    patch --fuzz=0 -p0 < "$READABLE_CARVEOUTS_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \
