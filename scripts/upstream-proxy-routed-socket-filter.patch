@@ -1,13 +1,12 @@
 --- upstream/linux-sandbox/src/landlock.rs
 +++ upstream/linux-sandbox/src/landlock.rs
-@@ -241,6 +241,32 @@
+@@ -241,6 +241,31 @@
                  libc::AF_UNIX as u64,
              )?])?;
 -            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
 +            // The target may connect only to the host-managed outbound TCP
 +            // bridge. It must never expose an inbound listener.
 +            deny_syscall(&mut rules, libc::SYS_bind);
-+            deny_syscall(&mut rules, libc::SYS_listen);
 +            let mut socket_rules = vec![deny_non_ip_socket];
 +            // The managed bridge is TCP-only. Match the base socket type so
 +            // SOCK_CLOEXEC/SOCK_NONBLOCK flags cannot bypass the filter.
