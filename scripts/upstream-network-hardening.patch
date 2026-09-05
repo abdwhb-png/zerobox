@@ -538,7 +538,7 @@
 
  #[cfg(test)]
  mod tests {
-@@ -141,4 +160,35 @@
+@@ -141,4 +160,58 @@
 
          assert!(result.is_ok(), "local target should be allowed: {result:?}");
      }
@@ -571,6 +571,29 @@
 +        let error = Service::serve(&wrong_port_connector, wrong_port_request)
 +            .await
 +            .expect_err("wrong-port loopback alias must be rejected");
++        assert!(format!("{error:?}").contains("network target rejected by policy"));
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn direct_connector_rechecks_a_rebound_address_at_connect_time() {
++        let initially_validated = Ipv4Addr::new(93, 184, 216, 34);
++        assert!(!is_non_public_ip(initially_validated.into()));
++
++        let rebound_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++            .await
++            .expect("bind rebound private target");
++        let rebound_target = rebound_listener.local_addr().expect("rebound target addr");
++        let mut settings = NetworkProxySettings::default();
++        settings.set_allowed_domains(vec!["rebind.example".to_string()]);
++        let connector = TargetCheckedTcpConnector::new(Arc::new(
++            network_proxy_state_for_policy(settings),
++        ));
++
++        let request: rama_tcp::client::Request =
++            rama_tcp::client::Request::new(HostWithPort::from(rebound_target));
++        let error = Service::serve(&connector, request)
++            .await
++            .expect_err("the final rebound address must be rechecked");
 +        assert!(format!("{error:?}").contains("network target rejected by policy"));
 +    }
  }
@@ -895,9 +918,10 @@
                  ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback()
 --- upstream/network-proxy/src/runtime.rs
 +++ upstream/network-proxy/src/runtime.rs
-@@ -1009,6 +1009,63 @@
+@@ -1009,5 +1009,62 @@
      }
-
+-
++
      #[tokio::test]
 +    async fn loopback_deny_rules_are_alias_equivalent_at_the_exact_port() {
 +        let allow = ["localhost:43128", "127.0.0.1:43128", "[::1]:43128"];
@@ -958,3 +982,26 @@
 +    #[tokio::test]
      async fn host_blocked_requires_allowlist_match() {
          let state = network_proxy_state_for_policy(network_settings(&["example.com"], &[]));
+--- upstream/network-proxy/src/runtime.rs
++++ upstream/network-proxy/src/runtime.rs
+@@ -1470,7 +1470,7 @@
+     }
+-
++
+     #[tokio::test]
+-    async fn host_resolves_to_non_public_ip_blocks_private_resolution() {
++    async fn host_resolves_to_non_public_ip_blocks_private_cname_chain_resolution() {
+         let blocked = host_resolves_to_non_public_ip(
+             "local.example",
+             /*port*/ 80,
+--- upstream/network-proxy/README.md
++++ upstream/network-proxy/README.md
+@@ -217,3 +217,5 @@
+-- DNS rebinding is hard to fully prevent without pinning the resolved IP(s) all the way down to the
+-  transport layer. If your threat model includes hostile DNS, enforce network egress at a lower
+-  layer too (e.g., firewall / VPC / corporate proxy policies).
++- Direct connections classify every resolved `SocketAddr` again at the transport boundary, so a
++  CNAME or rebinding answer that changes to a non-public address is rejected before `connect()`.
++- When `allow_upstream_proxy = true`, the upstream proxy may resolve the destination remotely; this
++  process cannot verify that remote address. Security-sensitive callers must disable inherited
++  upstream proxies or enforce equivalent destination policy at that proxy.

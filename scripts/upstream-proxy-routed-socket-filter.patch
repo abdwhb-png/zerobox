@@ -1,12 +1,14 @@
 --- upstream/linux-sandbox/src/landlock.rs
 +++ upstream/linux-sandbox/src/landlock.rs
-@@ -241,6 +241,31 @@
+@@ -241,6 +241,33 @@
                  libc::AF_UNIX as u64,
              )?])?;
 -            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
 +            // The target may connect only to the host-managed outbound TCP
-+            // bridge. It must never expose an inbound listener.
-+            deny_syscall(&mut rules, libc::SYS_bind);
++            // bridge. Binding is used by some clients for ephemeral source
++            // addresses, but promoting a socket to an inbound listener is
++            // never required and must fail closed.
++            deny_syscall(&mut rules, libc::SYS_listen);
 +            let mut socket_rules = vec![deny_non_ip_socket];
 +            // The managed bridge is TCP-only. Match the base socket type so
 +            // SOCK_CLOEXEC/SOCK_NONBLOCK flags cannot bypass the filter.
@@ -33,7 +35,7 @@
              rules.insert(libc::SYS_socketpair, vec![deny_unix_socketpair]);
          }
      }
-@@ -269,9 +292,12 @@
+@@ -269,9 +296,12 @@
  #[cfg(test)]
  mod tests {
      use super::NetworkSeccompMode;
@@ -46,10 +48,11 @@
      use zerobox_protocol::protocol::NetworkSandboxPolicy;
 
      #[test]
-@@ -320,6 +346,71 @@
+@@ -320,6 +350,75 @@
          );
      }
-
+-
++
 +    #[test]
 +    fn proxy_routed_seccomp_rejects_udp_and_raw_ip_sockets(
 +    ) -> Result<(), Box<dyn std::error::Error>> {
@@ -83,7 +86,7 @@
 +    }
 +
 +    #[test]
-+    fn proxy_routed_seccomp_rejects_inbound_tcp_binding(
++    fn proxy_routed_seccomp_rejects_inbound_tcp_listener(
 +    ) -> Result<(), Box<dyn std::error::Error>> {
 +        set_no_new_privs()?;
 +        install_network_seccomp_filter_on_current_thread(NetworkSeccompMode::ProxyRouted)?;
@@ -99,17 +102,21 @@
 +        let address = libc::sockaddr_in {
 +            sin_family: libc::AF_INET as libc::sa_family_t,
 +            sin_port: 0,
-+            sin_addr: libc::in_addr { s_addr: libc::INADDR_LOOPBACK },
++            sin_addr: libc::in_addr {
++                s_addr: libc::htonl(libc::INADDR_LOOPBACK),
++            },
 +            sin_zero: [0; 8],
 +        };
-+        let result = unsafe {
++        let bind_result = unsafe {
 +            libc::bind(
 +                fd,
 +                std::ptr::from_ref(&address).cast::<libc::sockaddr>(),
 +                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
 +            )
 +        };
-+        assert_eq!(result, -1);
++        assert_eq!(bind_result, 0, "ephemeral client binding must remain available");
++        let listen_result = unsafe { libc::listen(fd, 1) };
++        assert_eq!(listen_result, -1);
 +        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
 +        unsafe { libc::close(fd) };
 +        Ok(())
