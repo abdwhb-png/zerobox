@@ -94,19 +94,30 @@ fn env_sets_explicit_var() {
 #[test]
 fn strict_env_reaches_only_the_final_target_process() {
     const PRELOAD: &str = "/zerobox-target-only-preload.so";
+    let fixture = tempfile::Builder::new()
+        .prefix(".zerobox-env-")
+        .tempdir_in(std::env::current_dir().expect("resolve test cwd"))
+        .expect("create Zerobox home fixture");
+    let zerobox_home = fixture.path().join("zerobox-home");
+    std::fs::create_dir_all(&zerobox_home).expect("create Zerobox home");
     let assignment = format!("LD_PRELOAD={PRELOAD}");
-    let out = run(&[
-        "--strict-sandbox",
-        "--env",
-        &assignment,
-        "--",
-        "sh",
-        "-c",
-        "printf %s \"$LD_PRELOAD\"",
-    ]);
+    let deny_home = format!("--deny-read={}", zerobox_home.display());
+    let out = run_with_home(
+        &zerobox_home,
+        &[
+            "--strict-sandbox",
+            &deny_home,
+            "--env",
+            &assignment,
+            "--",
+            "sh",
+            "-c",
+            "printf '%s|%s' \"$LD_PRELOAD\" \"${ZEROBOX_TARGET_ENV_FILE-unset}\"",
+        ],
+    );
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
-    assert_eq!(stdout(&out), PRELOAD);
+    assert_eq!(stdout(&out), format!("{PRELOAD}|unset"));
     assert_eq!(
         stderr(&out)
             .lines()

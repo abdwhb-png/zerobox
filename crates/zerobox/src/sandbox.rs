@@ -530,7 +530,7 @@ impl Sandbox {
         #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
             let file = PrivateTargetEnvironment::create(&child_env)?;
-            allow_read.push(file.path().to_path_buf());
+            allow_read.push(file.read_root().to_path_buf());
             Some(file)
         } else {
             None
@@ -916,17 +916,22 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 /// variables cannot affect Zerobox or bubblewrap before isolation is active.
 #[derive(Debug)]
 struct PrivateTargetEnvironment {
+    root: PathBuf,
     path: PathBuf,
 }
 
 impl PrivateTargetEnvironment {
     #[cfg(target_os = "linux")]
     fn create(environment: &HashMap<String, String>) -> Result<Self> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        Self::create_in(environment, &crate::zerobox_home().join("tmp").join("env"))
+    }
 
-        let root = crate::zerobox_home().join("tmp").join("env");
-        ensure_private_proxy_directory(&root)?;
+    #[cfg(target_os = "linux")]
+    fn create_in(environment: &HashMap<String, String>, root: &Path) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        ensure_private_proxy_directory(root)?;
 
         for _ in 0..128 {
             let mut random = [0u8; 8];
@@ -935,7 +940,22 @@ impl PrivateTargetEnvironment {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            let path = root.join(format!("e-{nonce}.json"));
+            let candidate = root.join(format!("e-{nonce}"));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => ensure_private_proxy_directory(&candidate)?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create target environment directory {}",
+                            candidate.display()
+                        )
+                    });
+                }
+            }
+            let path = candidate.join("environment.json");
             let mut file = match std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -943,8 +963,8 @@ impl PrivateTargetEnvironment {
                 .open(&path)
             {
                 Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
+                    let _ = std::fs::remove_dir_all(&candidate);
                     return Err(error).with_context(|| {
                         format!(
                             "failed to create target environment file {}",
@@ -956,12 +976,15 @@ impl PrivateTargetEnvironment {
             let encoded =
                 serde_json::to_vec(environment).context("failed to encode target environment")?;
             if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_dir_all(&candidate);
                 return Err(error).with_context(|| {
                     format!("failed to persist target environment {}", path.display())
                 });
             }
-            return Ok(Self { path });
+            return Ok(Self {
+                root: candidate,
+                path,
+            });
         }
 
         anyhow::bail!("could not allocate a unique target environment file")
@@ -970,11 +993,17 @@ impl PrivateTargetEnvironment {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn read_root(&self) -> &Path {
+        &self.root
+    }
 }
 
 impl Drop for PrivateTargetEnvironment {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if ensure_private_proxy_directory(&self.root).is_ok() {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 }
 
@@ -1823,6 +1852,48 @@ mod tests {
         for value in child_env.values() {
             assert!(!helper_env.values().any(|helper| helper == value));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_target_environment_uses_a_unique_read_root_and_cleans_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().expect("create target environment root");
+        let environment = HashMap::from([("CUSTOM".to_string(), "target-only".to_string())]);
+        let snapshot = PrivateTargetEnvironment::create_in(&environment, fixture.path())
+            .expect("create target environment snapshot");
+        let read_root = snapshot.read_root().to_path_buf();
+        let path = snapshot.path().to_path_buf();
+
+        assert_eq!(read_root.parent(), Some(fixture.path()));
+        assert_eq!(path, read_root.join("environment.json"));
+        assert_eq!(
+            std::fs::symlink_metadata(&read_root)
+                .expect("inspect snapshot directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .expect("inspect snapshot file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, String>>(
+                &std::fs::read(&path).expect("read snapshot")
+            )
+            .expect("decode snapshot"),
+            environment
+        );
+
+        drop(snapshot);
+        assert!(!read_root.exists());
     }
 
     #[test]

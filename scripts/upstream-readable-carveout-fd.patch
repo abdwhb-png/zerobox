@@ -1,0 +1,129 @@
+--- upstream/linux-sandbox/src/bwrap.rs
++++ upstream/linux-sandbox/src/bwrap.rs
+@@ -373,8 +373,8 @@
+ ///    (including `/dev/urandom`) even under a read-only root.
+ /// 3. Unreadable ancestors of explicitly reopened roots are masked before
+ ///    their child mounts are rebound so nested carveouts can be reopened safely.
+-/// 4. Explicit readable carveouts under those masks are rebound read-only and
+-///    any narrower unreadable paths are masked again.
++/// 4. Explicit readable carveouts under those masks are rebound from preserved
++///    source descriptors and any narrower unreadable paths are masked again.
+ /// 5. `--bind <root> <root>` re-enables writes for allowed roots, including
+ ///    writable subpaths under `/dev` (for example, `/dev/shm`).
+ /// 6. `--ro-bind <subpath> <subpath>` re-applies read-only protections under
+@@ -619,8 +619,11 @@
+         {
+             append_mount_target_parent_dir_args(&mut bwrap_args.args, readable_root, masking_root);
+         }
+-        bwrap_args.args.push("--ro-bind".to_string());
+-        bwrap_args.args.push(path_to_string(readable_root));
++        let source = File::open(readable_root)?;
++        let source_fd = source.as_raw_fd().to_string();
++        bwrap_args.preserved_files.push(source);
++        bwrap_args.args.push("--ro-bind-fd".to_string());
++        bwrap_args.args.push(source_fd);
+         bwrap_args.args.push(path_to_string(readable_root));
+ 
+         let mut nested_unreadable_roots: Vec<PathBuf> = unreadable_roots
+@@ -2499,10 +2502,9 @@
+         let readable_bind_index = args
+             .args
+             .windows(3)
+-            .position(|window| {
+-                window == ["--ro-bind", readable_str.as_str(), readable_str.as_str()]
+-            })
++            .position(|window| window[0] == "--ro-bind-fd" && window[2] == readable_str)
+             .expect("readable carveout should be rebound read-only");
++        assert_eq!(args.preserved_files.len(), 1);
+ 
+         assert!(
+             blocked_none_index < readable_dir_index && readable_dir_index < readable_bind_index,
+@@ -2553,10 +2555,9 @@
+         let readable_bind_index = args
+             .args
+             .windows(3)
+-            .position(|window| {
+-                window == ["--ro-bind", readable_str.as_str(), readable_str.as_str()]
+-            })
++            .position(|window| window[0] == "--ro-bind-fd" && window[2] == readable_str)
+             .expect("readable carveout should be rebound read-only");
++        assert_eq!(args.preserved_files.len(), 1);
+         let secret_mask_index = args
+             .args
+             .windows(4)
+--- upstream/linux-sandbox/src/launcher.rs
++++ upstream/linux-sandbox/src/launcher.rs
+@@ -32,6 +32,7 @@
+     supports_argv0: bool,
+     supports_perms: bool,
+     supports_disable_userns: bool,
++    supports_ro_bind_fd: bool,
+ }
+ 
+ pub(crate) fn exec_bwrap(argv: Vec<String>, preserved_files: Vec<File>) -> ! {
+@@ -83,6 +84,7 @@
+         supports_argv0,
+         supports_perms: true,
+         supports_disable_userns: true,
++        supports_ro_bind_fd: true,
+     }) = system_bwrap_capabilities(system_bwrap_path)
+     else {
+         return None;
+@@ -124,6 +126,8 @@
+         supports_perms: stdout.contains("--perms") || stderr.contains("--perms"),
+         supports_disable_userns: stdout.contains("--disable-userns")
+             || stderr.contains("--disable-userns"),
++        supports_ro_bind_fd: stdout.contains("--ro-bind-fd")
++            || stderr.contains("--ro-bind-fd"),
+     })
+ }
+ 
+@@ -173,6 +177,7 @@
+                     supports_argv0: true,
+                     supports_perms: true,
+                     supports_disable_userns: true,
++                    supports_ro_bind_fd: true,
+                 })
+             }),
+             Some(SystemBwrapLauncher {
+@@ -193,6 +198,7 @@
+                     supports_argv0: false,
+                     supports_perms: true,
+                     supports_disable_userns: true,
++                    supports_ro_bind_fd: true,
+                 })
+             }),
+             Some(SystemBwrapLauncher {
+@@ -212,6 +218,7 @@
+                     supports_argv0: false,
+                     supports_perms: false,
+                     supports_disable_userns: true,
++                    supports_ro_bind_fd: true,
+                 })
+             }),
+             None
+@@ -228,6 +235,24 @@
+                     supports_argv0: true,
+                     supports_perms: true,
+                     supports_disable_userns: false,
++                    supports_ro_bind_fd: true,
++                })
++            }),
++            None
++        );
++    }
++
++    #[test]
++    fn ignores_system_bwrap_when_system_bwrap_lacks_ro_bind_fd() {
++        let fake_bwrap = NamedTempFile::new().expect("temp file");
++
++        assert_eq!(
++            system_bwrap_launcher_for_path_with_probe(fake_bwrap.path(), |_| {
++                Some(SystemBwrapCapabilities {
++                    supports_argv0: true,
++                    supports_perms: true,
++                    supports_disable_userns: true,
++                    supports_ro_bind_fd: false,
+                 })
+             }),
+             None

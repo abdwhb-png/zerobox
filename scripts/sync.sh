@@ -401,6 +401,12 @@ if [ -f "$TARGET_ENV_ISOLATION_PATCH" ]; then
     patch --fuzz=0 -p0 < "$TARGET_ENV_ISOLATION_PATCH"
 fi
 
+READABLE_CARVEOUT_FD_PATCH="$SCRIPT_DIR/upstream-readable-carveout-fd.patch"
+if [ -f "$READABLE_CARVEOUT_FD_PATCH" ]; then
+    echo "    readable-carveout-fd"
+    patch --fuzz=0 -p0 < "$READABLE_CARVEOUT_FD_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \
