@@ -1,0 +1,123 @@
+--- upstream/linux-sandbox/src/landlock.rs
++++ upstream/linux-sandbox/src/landlock.rs
+@@ -241,6 +241,34 @@
+                 libc::AF_UNIX as u64,
+             )?])?;
+-            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
++            // The target may connect only to the host-managed outbound TCP
++            // bridge. It must never expose an inbound listener.
++            deny_syscall(&mut rules, libc::SYS_bind);
++            deny_syscall(&mut rules, libc::SYS_listen);
++            deny_syscall(&mut rules, libc::SYS_accept);
++            deny_syscall(&mut rules, libc::SYS_accept4);
++            let mut socket_rules = vec![deny_non_ip_socket];
++            // The managed bridge is TCP-only. Match the base socket type so
++            // SOCK_CLOEXEC/SOCK_NONBLOCK flags cannot bypass the filter.
++            const SOCK_TYPE_MASK: u64 = 0xf;
++            for domain in [libc::AF_INET, libc::AF_INET6] {
++                for socket_type in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
++                    socket_rules.push(SeccompRule::new(vec![
++                        SeccompCondition::new(
++                            0,
++                            SeccompCmpArgLen::Dword,
++                            SeccompCmpOp::Eq,
++                            domain as u64,
++                        )?,
++                        SeccompCondition::new(
++                            1,
++                            SeccompCmpArgLen::Dword,
++                            SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
++                            socket_type as u64,
++                        )?,
++                    ])?);
++                }
++            }
++            rules.insert(libc::SYS_socket, socket_rules);
+             rules.insert(libc::SYS_socketpair, vec![deny_unix_socketpair]);
+         }
+     }
+@@ -269,9 +292,12 @@
+ #[cfg(test)]
+ mod tests {
+     use super::NetworkSeccompMode;
++    use super::install_network_seccomp_filter_on_current_thread;
+     use super::network_seccomp_mode;
++    use super::set_no_new_privs;
+     use super::should_install_network_seccomp;
+     use pretty_assertions::assert_eq;
++    use std::io;
+     use zerobox_protocol::protocol::NetworkSandboxPolicy;
+
+     #[test]
+@@ -320,6 +346,71 @@
+         );
+     }
+
++    #[test]
++    fn proxy_routed_seccomp_rejects_udp_and_raw_ip_sockets(
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        set_no_new_privs()?;
++        install_network_seccomp_filter_on_current_thread(NetworkSeccompMode::ProxyRouted)?;
++
++        for domain in [libc::AF_INET, libc::AF_INET6] {
++            for socket_type in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
++                let fd = unsafe {
++                    libc::socket(
++                        domain,
++                        socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
++                        0,
++                    )
++                };
++                assert_eq!(fd, -1);
++                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
++            }
++        }
++
++        let tcp_fd = unsafe {
++            libc::socket(
++                libc::AF_INET,
++                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
++                0,
++            )
++        };
++        assert!(tcp_fd >= 0, "TCP bridge sockets must remain available");
++        unsafe { libc::close(tcp_fd) };
++        Ok(())
++    }
++
++    #[test]
++    fn proxy_routed_seccomp_rejects_inbound_tcp_binding(
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        set_no_new_privs()?;
++        install_network_seccomp_filter_on_current_thread(NetworkSeccompMode::ProxyRouted)?;
++
++        let fd = unsafe {
++            libc::socket(
++                libc::AF_INET,
++                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
++                0,
++            )
++        };
++        assert!(fd >= 0, "outbound TCP sockets must remain available");
++        let address = libc::sockaddr_in {
++            sin_family: libc::AF_INET as libc::sa_family_t,
++            sin_port: 0,
++            sin_addr: libc::in_addr { s_addr: libc::INADDR_LOOPBACK },
++            sin_zero: [0; 8],
++        };
++        let result = unsafe {
++            libc::bind(
++                fd,
++                std::ptr::from_ref(&address).cast::<libc::sockaddr>(),
++                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
++            )
++        };
++        assert_eq!(result, -1);
++        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
++        unsafe { libc::close(fd) };
++        Ok(())
++    }
++
+     #[test]
+     fn restricted_network_without_proxy_routing_uses_restricted_mode() {
+         assert_eq!(

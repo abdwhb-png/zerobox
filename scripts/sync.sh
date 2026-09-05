@@ -383,10 +383,17 @@ if [ -f "$SETUP_SIGNAL_WINDOW_PATCH" ]; then
     patch --fuzz=0 -p0 < "$SETUP_SIGNAL_WINDOW_PATCH"
 fi
 
+PROXY_ROUTED_SOCKET_FILTER_PATCH="$SCRIPT_DIR/upstream-proxy-routed-socket-filter.patch"
+if [ -f "$PROXY_ROUTED_SOCKET_FILTER_PATCH" ]; then
+    echo "    proxy-routed-socket-filter"
+    patch --fuzz=0 -p0 < "$PROXY_ROUTED_SOCKET_FILTER_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \
         upstream/linux-sandbox/src/linux_run_main.rs \
+        upstream/linux-sandbox/src/landlock.rs \
         upstream/linux-sandbox/src/proxy_routing.rs \
         upstream/network-proxy/src/config.rs
 fi
