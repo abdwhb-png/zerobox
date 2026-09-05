@@ -90,6 +90,33 @@ fn env_sets_explicit_var() {
     assert_eq!(stdout(&out).trim(), "bar");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_env_reaches_only_the_final_target_process() {
+    const PRELOAD: &str = "/zerobox-target-only-preload.so";
+    let assignment = format!("LD_PRELOAD={PRELOAD}");
+    let out = run(&[
+        "--strict-sandbox",
+        "--env",
+        &assignment,
+        "--",
+        "sh",
+        "-c",
+        "printf %s \"$LD_PRELOAD\"",
+    ]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), PRELOAD);
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|line| line.contains(PRELOAD))
+            .count(),
+        1,
+        "the loader variable must not affect Zerobox, its helper, or bubblewrap"
+    );
+}
+
 #[test]
 fn env_multiple_vars() {
     let out = run(&[

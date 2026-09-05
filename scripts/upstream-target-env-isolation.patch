@@ -1,0 +1,149 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -1,4 +1,5 @@
+ use clap::Parser;
++use std::collections::HashMap;
+ use std::ffi::CString;
+ use std::fmt;
+ use std::fs;
+@@ -38,6 +39,7 @@
+     &[libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+ const SYNTHETIC_MOUNT_MARKER_SYNTHETIC: &[u8] = b"synthetic\n";
+ const SYNTHETIC_MOUNT_MARKER_EXISTING: &[u8] = b"existing\n";
++const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
+ const PROTECTED_CREATE_MARKER: &[u8] = b"protected-create\n";
+ 
+ #[derive(Debug)]
+@@ -169,6 +171,7 @@
+     if command.is_empty() {
+         panic!("No command specified to execute.");
+     }
++    let target_environment = load_target_environment();
+     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
+     let EffectivePermissions {
+         permission_profile,
+@@ -203,7 +206,8 @@
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+-        exec_or_panic(command, setup_status_fd);
++        let target_environment = merge_internal_target_environment(target_environment);
++        exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+     }
+ 
+     if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
+@@ -216,7 +220,8 @@
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+-        exec_or_panic(command, setup_status_fd);
++        let target_environment = merge_internal_target_environment(target_environment);
++        exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+     }
+ 
+     if !use_legacy_landlock {
+@@ -265,7 +270,36 @@
+     ) {
+         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
+     }
+-    exec_or_panic(command, setup_status_fd);
++    let target_environment = merge_internal_target_environment(target_environment);
++    exec_or_panic(command, setup_status_fd, target_environment.as_ref());
++}
++
++fn load_target_environment() -> Option<HashMap<String, String>> {
++    let path = std::env::var_os(TARGET_ENV_FILE_ENV)?;
++    let bytes = fs::read(&path).unwrap_or_else(|error| {
++        panic!(
++            "failed to read private target environment {}: {error}",
++            Path::new(&path).display()
++        )
++    });
++    Some(serde_json::from_slice(&bytes).unwrap_or_else(|error| {
++        panic!(
++            "failed to decode private target environment {}: {error}",
++            Path::new(&path).display()
++        )
++    }))
++}
++
++fn merge_internal_target_environment(
++    target: Option<HashMap<String, String>>,
++) -> Option<HashMap<String, String>> {
++    let mut target = target?;
++    for (name, value) in std::env::vars() {
++        if name != TARGET_ENV_FILE_ENV && name != "PATH" {
++            target.insert(name, value);
++        }
++    }
++    Some(target)
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -1491,7 +1525,11 @@
+ }
+ 
+ /// Exec the provided argv, panicking with context if it fails.
+-fn exec_or_panic(command: Vec<String>, setup_status_fd: Option<i32>) -> ! {
++fn exec_or_panic(
++    command: Vec<String>,
++    setup_status_fd: Option<i32>,
++    target_environment: Option<&HashMap<String, String>>,
++) -> ! {
+     #[expect(clippy::expect_used)]
+     let c_command =
+         CString::new(command[0].as_str()).expect("Failed to convert command to CString");
+@@ -1504,8 +1542,43 @@
+     let mut c_args_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+     c_args_ptrs.push(std::ptr::null());
+ 
++    let c_environment = target_environment.map(|environment| {
++        let mut entries = environment
++            .iter()
++            .map(|(name, value)| format!("{name}={value}"))
++            .collect::<Vec<_>>();
++        entries.sort_unstable();
++        entries
++            .into_iter()
++            .map(|entry| match CString::new(entry) {
++                Ok(entry) => entry,
++                Err(_) => panic!("Failed to convert environment to CString"),
++            })
++            .collect::<Vec<_>>()
++    });
++    let c_environment_ptrs = c_environment.as_ref().map(|environment| {
++        let mut pointers = environment
++            .iter()
++            .map(|entry| entry.as_ptr())
++            .collect::<Vec<_>>();
++        pointers.push(std::ptr::null());
++        pointers
++    });
++
++    let exec = || unsafe {
++        if let Some(environment) = c_environment_ptrs.as_ref() {
++            libc::execvpe(
++                c_command.as_ptr(),
++                c_args_ptrs.as_ptr(),
++                environment.as_ptr(),
++            )
++        } else {
++            libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr())
++        }
++    };
++
+     let Some(status_fd) = setup_status_fd else {
+-        unsafe { libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr()); }
++        exec();
+         let err = std::io::Error::last_os_error();
+         panic!("Failed to execvp {}: {err}", command[0].as_str());
+     };
+@@ -1582,7 +1614,7 @@
+             unsafe { libc::_exit(127); }
+         }
+         unsafe { libc::close(status_fd); }
+-        unsafe { libc::execvp(c_command.as_ptr(), c_args_ptrs.as_ptr()); }
++        exec();
+         let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
+         let _ = write_exec_error(exec_error_pipe[1], error);
+         unsafe { libc::_exit(127); }

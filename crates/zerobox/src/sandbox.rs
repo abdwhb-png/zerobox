@@ -24,6 +24,7 @@ use crate::secret;
 
 pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
 const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
 const RESERVED_CHILD_ENV_KEYS: &[&str] = &["ZEROBOX_HOME", "CODEX_HOME"];
 
 pub struct SandboxOutput {
@@ -74,6 +75,7 @@ pub struct SandboxChild {
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
     _proxy_root: Option<PrivateProxyRoot>,
     _setup_channel: Option<PrivateSetupChannel>,
+    _target_env_file: Option<PrivateTargetEnvironment>,
 }
 
 impl SandboxChild {
@@ -345,6 +347,7 @@ impl Sandbox {
             _proxy: prepared._proxy,
             _proxy_root: prepared._proxy_root,
             _setup_channel: prepared._setup_channel,
+            _target_env_file: prepared._target_env_file,
         })
     }
 
@@ -362,6 +365,7 @@ impl Sandbox {
             _proxy: prepared._proxy,
             _proxy_root: prepared._proxy_root,
             _setup_channel: prepared._setup_channel,
+            _target_env_file: prepared._target_env_file,
         })
     }
 
@@ -378,6 +382,7 @@ impl Sandbox {
             _proxy: prepared._proxy,
             _proxy_root: prepared._proxy_root,
             _setup_channel: prepared._setup_channel,
+            _target_env_file: prepared._target_env_file,
         })
     }
 
@@ -522,6 +527,22 @@ impl Sandbox {
             select_sandbox_type(effective_strict)?
         };
 
+        #[cfg(target_os = "linux")]
+        let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
+            let file = PrivateTargetEnvironment::create(&child_env)?;
+            allow_read.push(file.path().to_path_buf());
+            Some(file)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let target_env_file: Option<PrivateTargetEnvironment> = None;
+
+        let command_env = target_env_file
+            .as_ref()
+            .map(|file| linux_helper_environment(file.path()))
+            .unwrap_or(child_env);
+
         let linux_sandbox_exe: Option<PathBuf> = if cfg!(target_os = "linux") {
             linux_sandbox_exe.or_else(|| std::env::current_exe().ok())
         } else {
@@ -585,7 +606,7 @@ impl Sandbox {
                     program: program.into(),
                     args,
                     cwd: cwd_abs,
-                    env: child_env,
+                    env: command_env,
                     additional_permissions: None,
                 },
                 permissions: &permissions,
@@ -655,6 +676,7 @@ impl Sandbox {
             _proxy: proxy,
             _proxy_root: proxy_root,
             _setup_channel: setup_channel,
+            _target_env_file: target_env_file,
         })
     }
 }
@@ -665,6 +687,7 @@ pub struct PreparedCommand {
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
     _proxy_root: Option<PrivateProxyRoot>,
     _setup_channel: Option<PrivateSetupChannel>,
+    _target_env_file: Option<PrivateTargetEnvironment>,
 }
 
 /// A prepared command cannot be detached while it owns resources that must
@@ -693,6 +716,7 @@ impl PreparedCommand {
             || self._proxy.is_some()
             || self._proxy_root.is_some()
             || self._setup_channel.is_some()
+            || self._target_env_file.is_some()
         {
             return Err(PreparedCommandIntoCommandError);
         }
@@ -719,6 +743,7 @@ impl PreparedCommand {
             _proxy: self._proxy,
             _proxy_root: self._proxy_root,
             _setup_channel: self._setup_channel,
+            _target_env_file: self._target_env_file,
         })
     }
 
@@ -884,6 +909,83 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Owner-only snapshot of the final target environment. Linux helper stages
+/// receive only this path plus a fixed search path, so target-controlled
+/// variables cannot affect Zerobox or bubblewrap before isolation is active.
+#[derive(Debug)]
+struct PrivateTargetEnvironment {
+    path: PathBuf,
+}
+
+impl PrivateTargetEnvironment {
+    #[cfg(target_os = "linux")]
+    fn create(environment: &HashMap<String, String>) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = crate::zerobox_home().join("tmp").join("env");
+        ensure_private_proxy_directory(&root)?;
+
+        for _ in 0..128 {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).context("failed to generate target env nonce")?;
+            let nonce = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let path = root.join(format!("e-{nonce}.json"));
+            let mut file = match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create target environment file {}",
+                            path.display()
+                        )
+                    });
+                }
+            };
+            let encoded =
+                serde_json::to_vec(environment).context("failed to encode target environment")?;
+            if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
+                let _ = std::fs::remove_file(&path);
+                return Err(error).with_context(|| {
+                    format!("failed to persist target environment {}", path.display())
+                });
+            }
+            return Ok(Self { path });
+        }
+
+        anyhow::bail!("could not allocate a unique target environment file")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTargetEnvironment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn linux_helper_environment(target_env_file: &Path) -> HashMap<String, String> {
+    HashMap::from([
+        ("PATH".to_string(), STRICT_PATH.to_string()),
+        (
+            TARGET_ENV_FILE_ENV.to_string(),
+            target_env_file.display().to_string(),
+        ),
+    ])
 }
 
 /// A per-execution owner-only directory used by the Linux helper's host-side
@@ -1696,6 +1798,33 @@ mod tests {
         build_fs_policy(&ar, &dr, &aw, &dw, fw, fa, net, Path::new("/work"))
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_helper_environment_does_not_expose_child_values() {
+        let child_env = HashMap::from([
+            ("PATH".to_string(), "/target/bin".to_string()),
+            ("LD_PRELOAD".to_string(), "/target/inject.so".to_string()),
+            ("CUSTOM".to_string(), "target-only".to_string()),
+        ]);
+        let env_file = Path::new("/private/child-env.json");
+
+        let helper_env = linux_helper_environment(env_file);
+
+        assert_eq!(
+            helper_env,
+            HashMap::from([
+                ("PATH".to_string(), STRICT_PATH.to_string()),
+                (
+                    TARGET_ENV_FILE_ENV.to_string(),
+                    env_file.display().to_string(),
+                ),
+            ])
+        );
+        for value in child_env.values() {
+            assert!(!helper_env.values().any(|helper| helper == value));
+        }
+    }
+
     #[test]
     fn profile_strictness_is_effective_without_explicit_strict_flag() {
         let strict_profile = crate::profile_core::Profile {
@@ -2283,6 +2412,7 @@ mod tests {
             _proxy: None,
             _proxy_root: None,
             _setup_channel: None,
+            _target_env_file: None,
         };
         let command = prepared.into_command().expect("unmanaged raw command");
         assert!(format!("{command:?}").contains("echo"));
@@ -2299,6 +2429,7 @@ mod tests {
             _proxy: None,
             _proxy_root: Some(proxy_root),
             _setup_channel: None,
+            _target_env_file: None,
         };
 
         let conversion =
@@ -2322,6 +2453,7 @@ mod tests {
             _proxy: None,
             _proxy_root: Some(proxy_root),
             _setup_channel: None,
+            _target_env_file: None,
         };
 
         let child = prepared.spawn().await.expect("spawn prepared command");
