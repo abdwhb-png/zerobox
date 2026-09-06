@@ -25,6 +25,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod arg0;
+#[cfg(target_os = "linux")]
+mod dynamic_fs;
+#[cfg(unix)]
+mod process_owner;
 pub mod profile_core;
 pub mod proxy;
 mod sandbox;

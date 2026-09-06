@@ -135,8 +135,10 @@ pub struct Profile {
     pub platform: Option<String>,
     pub allow_read: Option<Vec<String>>,
     pub deny_read: Option<Vec<String>>,
+    pub deny_read_globs: Option<Vec<String>>,
     pub allow_write: Option<Vec<String>>,
     pub deny_write: Option<Vec<String>>,
+    pub deny_write_globs: Option<Vec<String>>,
     pub allow_net: Option<Vec<String>>,
     pub deny_net: Option<Vec<String>>,
     pub set_env: Option<HashMap<String, String>>,
@@ -194,8 +196,10 @@ fn expand_vec(v: &mut Option<Vec<String>>, home: &Path, cwd: &Path, tmpdir: &Pat
 pub fn expand_profile(p: &mut Profile, home: &Path, cwd: &Path, tmpdir: &Path) {
     expand_vec(&mut p.allow_read, home, cwd, tmpdir);
     expand_vec(&mut p.deny_read, home, cwd, tmpdir);
+    expand_vec(&mut p.deny_read_globs, home, cwd, tmpdir);
     expand_vec(&mut p.allow_write, home, cwd, tmpdir);
     expand_vec(&mut p.deny_write, home, cwd, tmpdir);
+    expand_vec(&mut p.deny_write_globs, home, cwd, tmpdir);
     expand_vec(&mut p.snapshot_paths, home, cwd, tmpdir);
     expand_vec(&mut p.snapshot_exclude, home, cwd, tmpdir);
     if let Some(ref mut env) = p.set_env {
@@ -272,8 +276,10 @@ pub fn merge_profiles(base: &Profile, child: &Profile) -> Profile {
         platform: None,
         allow_read: dedup_append(&base.allow_read, &child.allow_read),
         deny_read: dedup_append(&base.deny_read, &child.deny_read),
+        deny_read_globs: dedup_append(&base.deny_read_globs, &child.deny_read_globs),
         allow_write: dedup_append(&base.allow_write, &child.allow_write),
         deny_write: dedup_append(&base.deny_write, &child.deny_write),
+        deny_write_globs: dedup_append(&base.deny_write_globs, &child.deny_write_globs),
         allow_net: dedup_append(&base.allow_net, &child.allow_net),
         deny_net: dedup_append(&base.deny_net, &child.deny_net),
         set_env: merge_maps(&base.set_env, &child.set_env),
@@ -505,5 +511,33 @@ mod tests {
             .expect_err("merged deny paths with glob syntax must be rejected");
         assert!(error.to_string().contains("deny_read"));
         assert!(error.to_string().contains("*"));
+    }
+
+    #[test]
+    fn explicit_glob_fields_expand_and_merge_independently() {
+        let base = super::Profile {
+            deny_read_globs: Some(vec!["$CWD/**/*.pem".to_string()]),
+            ..Default::default()
+        };
+        let child = super::Profile {
+            deny_write_globs: Some(vec!["$HOME/cache/**".to_string()]),
+            ..Default::default()
+        };
+        let mut profile = super::merge_profiles(&base, &child);
+        super::expand_profile(
+            &mut profile,
+            Path::new("/home/tester"),
+            Path::new("/work"),
+            Path::new("/safe-temp"),
+        );
+
+        assert_eq!(
+            profile.deny_read_globs,
+            Some(vec!["/work/**/*.pem".to_string()])
+        );
+        assert_eq!(
+            profile.deny_write_globs,
+            Some(vec!["/home/tester/cache/**".to_string()])
+        );
     }
 }

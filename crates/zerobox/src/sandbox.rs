@@ -19,13 +19,16 @@ use zerobox_sandboxing::{
 };
 use zerobox_utils_absolute_path::AbsolutePathBuf;
 
+#[cfg(target_os = "linux")]
+use crate::dynamic_fs::DynamicDenyMounts;
 use crate::proxy;
 use crate::secret;
 
 pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
 const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
-const RESERVED_CHILD_ENV_KEYS: &[&str] = &["ZEROBOX_HOME", "CODEX_HOME"];
+const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
+const RESERVED_CHILD_ENV_KEYS: &[&str] = &["ZEROBOX_HOME", "CODEX_HOME", PRIVATE_BIND_MOUNTS_ENV];
 
 pub struct SandboxOutput {
     pub status: ExitStatus,
@@ -71,11 +74,7 @@ impl From<anyhow::Error> for SandboxSetupError {
 pub struct SandboxChild {
     inner: Child,
     started_pid: u32,
-    _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
-    _proxy: Option<zerobox_network_proxy::NetworkProxy>,
-    _proxy_root: Option<PrivateProxyRoot>,
-    _setup_channel: Option<PrivateSetupChannel>,
-    _target_env_file: Option<PrivateTargetEnvironment>,
+    _resources: ManagedExecutionResources,
 }
 
 impl SandboxChild {
@@ -115,8 +114,10 @@ pub struct Sandbox {
     deny_env: Vec<String>,
     allow_read: Vec<PathBuf>,
     deny_read: Vec<PathBuf>,
+    deny_read_globs: Vec<String>,
     allow_write: Vec<PathBuf>,
     deny_write: Vec<PathBuf>,
+    deny_write_globs: Vec<String>,
     full_write: bool,
     allow_net: Option<Vec<String>>,
     deny_net: Vec<String>,
@@ -143,8 +144,10 @@ impl Sandbox {
             deny_env: Vec::new(),
             allow_read: Vec::new(),
             deny_read: Vec::new(),
+            deny_read_globs: Vec::new(),
             allow_write: Vec::new(),
             deny_write: Vec::new(),
+            deny_write_globs: Vec::new(),
             full_write: false,
             allow_net: None,
             deny_net: Vec::new(),
@@ -218,6 +221,12 @@ impl Sandbox {
         self
     }
 
+    /// Deny reads and mutations for paths matching a dynamic glob pattern.
+    pub fn deny_read_glob(mut self, pattern: impl Into<String>) -> Self {
+        self.deny_read_globs.push(pattern.into());
+        self
+    }
+
     pub fn allow_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.allow_write.push(path.into());
         self
@@ -225,6 +234,12 @@ impl Sandbox {
 
     pub fn deny_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.deny_write.push(path.into());
+        self
+    }
+
+    /// Deny mutations while preserving reads for paths matching a dynamic glob pattern.
+    pub fn deny_write_glob(mut self, pattern: impl Into<String>) -> Self {
+        self.deny_write_globs.push(pattern.into());
         self
     }
 
@@ -343,11 +358,7 @@ impl Sandbox {
         Ok(SandboxChild {
             inner: child,
             started_pid,
-            _proxy_handle: prepared._proxy_handle,
-            _proxy: prepared._proxy,
-            _proxy_root: prepared._proxy_root,
-            _setup_channel: prepared._setup_channel,
-            _target_env_file: prepared._target_env_file,
+            _resources: prepared.resources,
         })
     }
 
@@ -361,11 +372,7 @@ impl Sandbox {
         Ok(SandboxChild {
             inner: child,
             started_pid,
-            _proxy_handle: prepared._proxy_handle,
-            _proxy: prepared._proxy,
-            _proxy_root: prepared._proxy_root,
-            _setup_channel: prepared._setup_channel,
-            _target_env_file: prepared._target_env_file,
+            _resources: prepared.resources,
         })
     }
 
@@ -378,11 +385,7 @@ impl Sandbox {
         Ok(SandboxChild {
             inner: child,
             started_pid,
-            _proxy_handle: prepared._proxy_handle,
-            _proxy: prepared._proxy,
-            _proxy_root: prepared._proxy_root,
-            _setup_channel: prepared._setup_channel,
-            _target_env_file: prepared._target_env_file,
+            _resources: prepared.resources,
         })
     }
 
@@ -434,8 +437,10 @@ impl Sandbox {
             mut deny_env,
             mut allow_read,
             mut deny_read,
+            mut deny_read_globs,
             mut allow_write,
             mut deny_write,
+            mut deny_write_globs,
             mut full_write,
             mut allow_net,
             mut deny_net,
@@ -469,8 +474,10 @@ impl Sandbox {
                     &profile,
                     &mut allow_read,
                     &mut deny_read,
+                    &mut deny_read_globs,
                     &mut allow_write,
                     &mut deny_write,
+                    &mut deny_write_globs,
                     &mut full_write,
                     &mut allow_net,
                     &mut deny_net,
@@ -521,11 +528,13 @@ impl Sandbox {
         );
 
         let net_enabled = allow_net.is_some() || !secret_store.is_empty();
-        let (sandbox_type, use_legacy_landlock) = if disabled || full_access {
-            (SandboxType::None, false)
-        } else {
-            select_sandbox_type(effective_strict)?
-        };
+        let has_dynamic_denies = !deny_read_globs.is_empty() || !deny_write_globs.is_empty();
+        let (sandbox_type, use_legacy_landlock) =
+            if disabled || (full_access && !has_dynamic_denies) {
+                (SandboxType::None, false)
+            } else {
+                select_sandbox_type(effective_strict)?
+            };
 
         #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
@@ -561,14 +570,33 @@ impl Sandbox {
         let fs_policy = build_fs_policy(
             &allow_read,
             &deny_read,
+            &deny_read_globs,
             &allow_write,
             &deny_write,
+            &deny_write_globs,
             full_write,
             full_access,
             net_enabled,
             &cwd,
         );
         let fs_policy = with_linux_helper_read_root(fs_policy, linux_sandbox_exe.as_deref(), &cwd);
+
+        #[cfg(target_os = "linux")]
+        let dynamic_fs = if sandbox_type == SandboxType::LinuxSeccomp {
+            DynamicDenyMounts::prepare(&cwd, &deny_read_globs, &deny_write_globs, &fs_policy)?
+        } else if disabled || (deny_read_globs.is_empty() && deny_write_globs.is_empty()) {
+            None
+        } else {
+            return Err(
+                anyhow::anyhow!("dynamic deny globs require the Linux bubblewrap sandbox").into(),
+            );
+        };
+        #[cfg(not(target_os = "linux"))]
+        let dynamic_fs: Option<()> = if deny_read_globs.is_empty() && deny_write_globs.is_empty() {
+            None
+        } else {
+            anyhow::bail!("dynamic deny globs are supported only on Linux");
+        };
 
         let net_policy = if net_enabled {
             NetworkSandboxPolicy::Enabled
@@ -670,24 +698,53 @@ impl Sandbox {
         remove_reserved_child_env(&mut final_env);
         cmd.envs(&final_env);
 
+        #[cfg(target_os = "linux")]
+        if let Some(dynamic_fs) = dynamic_fs.as_ref() {
+            let serialized = serde_json::to_string(dynamic_fs.binds())
+                .context("failed to serialize private FUSE bind mounts")?;
+            cmd.env(PRIVATE_BIND_MOUNTS_ENV, serialized);
+        }
+
         Ok(PreparedCommand {
             cmd,
-            _proxy_handle,
-            _proxy: proxy,
-            _proxy_root: proxy_root,
-            _setup_channel: setup_channel,
-            _target_env_file: target_env_file,
+            resources: ManagedExecutionResources {
+                _proxy_handle,
+                _proxy: proxy,
+                _proxy_root: proxy_root,
+                setup_channel,
+                _target_env_file: target_env_file,
+                _dynamic_fs: dynamic_fs,
+            },
         })
+    }
+}
+
+struct ManagedExecutionResources {
+    _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
+    _proxy: Option<zerobox_network_proxy::NetworkProxy>,
+    _proxy_root: Option<PrivateProxyRoot>,
+    setup_channel: Option<PrivateSetupChannel>,
+    _target_env_file: Option<PrivateTargetEnvironment>,
+    #[cfg(target_os = "linux")]
+    _dynamic_fs: Option<DynamicDenyMounts>,
+    #[cfg(not(target_os = "linux"))]
+    _dynamic_fs: Option<()>,
+}
+
+impl ManagedExecutionResources {
+    fn is_empty(&self) -> bool {
+        self._proxy_handle.is_none()
+            && self._proxy.is_none()
+            && self._proxy_root.is_none()
+            && self.setup_channel.is_none()
+            && self._target_env_file.is_none()
+            && self._dynamic_fs.is_none()
     }
 }
 
 pub struct PreparedCommand {
     cmd: tokio::process::Command,
-    _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
-    _proxy: Option<zerobox_network_proxy::NetworkProxy>,
-    _proxy_root: Option<PrivateProxyRoot>,
-    _setup_channel: Option<PrivateSetupChannel>,
-    _target_env_file: Option<PrivateTargetEnvironment>,
+    resources: ManagedExecutionResources,
 }
 
 /// A prepared command cannot be detached while it owns resources that must
@@ -712,12 +769,7 @@ impl PreparedCommand {
     pub fn into_command(
         self,
     ) -> std::result::Result<tokio::process::Command, PreparedCommandIntoCommandError> {
-        if self._proxy_handle.is_some()
-            || self._proxy.is_some()
-            || self._proxy_root.is_some()
-            || self._setup_channel.is_some()
-            || self._target_env_file.is_some()
-        {
+        if !self.resources.is_empty() {
             return Err(PreparedCommandIntoCommandError);
         }
         Ok(self.cmd)
@@ -739,17 +791,13 @@ impl PreparedCommand {
         Ok(SandboxChild {
             inner,
             started_pid,
-            _proxy_handle: self._proxy_handle,
-            _proxy: self._proxy,
-            _proxy_root: self._proxy_root,
-            _setup_channel: self._setup_channel,
-            _target_env_file: self._target_env_file,
+            _resources: self.resources,
         })
     }
 
     async fn spawn_checked(&mut self) -> std::result::Result<(Child, u32), SandboxSetupError> {
         #[cfg(target_os = "linux")]
-        if let Some(channel) = self._setup_channel.as_ref() {
+        if let Some(channel) = self.resources.setup_channel.as_ref() {
             let fd = channel.write_fd();
             unsafe {
                 self.cmd.pre_exec(move || clear_cloexec(fd));
@@ -761,10 +809,10 @@ impl PreparedCommand {
             .context("failed to spawn command")
             .map_err(SandboxSetupError::Spawn)?;
         let host_pid = child.id();
-        if let Some(channel) = self._setup_channel.as_mut() {
+        if let Some(channel) = self.resources.setup_channel.as_mut() {
             channel.close_parent_write();
         }
-        let started_pid = if let Some(channel) = self._setup_channel.as_ref() {
+        let started_pid = if let Some(channel) = self.resources.setup_channel.as_ref() {
             let _inner_pid = channel.wait_for_started(&mut child).await?;
             host_pid.ok_or_else(|| {
                 SandboxSetupError::HelperProtocol(
@@ -1178,20 +1226,34 @@ fn ensure_private_proxy_directory(path: &Path) -> Result<()> {
 fn build_fs_policy(
     allow_read: &[PathBuf],
     deny_read: &[PathBuf],
+    deny_read_globs: &[String],
     allow_write: &[PathBuf],
     deny_write: &[PathBuf],
+    deny_write_globs: &[String],
     full_write: bool,
     full_access: bool,
     net_enabled: bool,
     cwd: &Path,
 ) -> FileSystemSandboxPolicy {
-    if full_access {
+    if full_access && deny_read_globs.is_empty() && deny_write_globs.is_empty() {
         return FileSystemSandboxPolicy::unrestricted();
     }
 
     let mut entries: Vec<FileSystemSandboxEntry> = Vec::new();
 
-    if allow_read.is_empty() {
+    if full_access {
+        entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Write,
+        });
+    }
+
+    if full_access {
+        // The root write grant above supplies the allow side. Dynamic deny
+        // globs are appended below and always win inside the FUSE view.
+    } else if allow_read.is_empty() {
         entries.push(FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
@@ -1248,7 +1310,18 @@ fn build_fs_policy(
         }
     }
 
-    if full_write {
+    for pattern in deny_read_globs {
+        entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: pattern.clone(),
+            },
+            access: FileSystemAccessMode::None,
+        });
+    }
+
+    if full_access {
+        // Already represented by the root write entry.
+    } else if full_write {
         entries.push(FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
@@ -1273,6 +1346,15 @@ fn build_fs_policy(
                 access: FileSystemAccessMode::Read,
             });
         }
+    }
+
+    for pattern in deny_write_globs {
+        entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: pattern.clone(),
+            },
+            access: FileSystemAccessMode::Read,
+        });
     }
 
     FileSystemSandboxPolicy::restricted(entries)
@@ -1359,8 +1441,10 @@ fn apply_profile(
     profile: &crate::profile_core::Profile,
     allow_read: &mut Vec<PathBuf>,
     deny_read: &mut Vec<PathBuf>,
+    deny_read_globs: &mut Vec<String>,
     allow_write: &mut Vec<PathBuf>,
     deny_write: &mut Vec<PathBuf>,
+    deny_write_globs: &mut Vec<String>,
     full_write: &mut bool,
     allow_net: &mut Option<Vec<String>>,
     deny_net: &mut Vec<String>,
@@ -1406,8 +1490,10 @@ fn apply_profile(
 
     merge_paths(allow_read, &profile.allow_read);
     merge_paths(deny_read, &profile.deny_read);
+    merge_strings(deny_read_globs, &profile.deny_read_globs);
     merge_paths(allow_write, &profile.allow_write);
     merge_paths(deny_write, &profile.deny_write);
+    merge_strings(deny_write_globs, &profile.deny_write_globs);
     merge_strings(deny_net, &profile.deny_net);
     merge_strings(deny_env, &profile.deny_env);
     merge_optional_strings(allow_net, &profile.allow_net);
@@ -1824,7 +1910,18 @@ mod tests {
         let dr: Vec<_> = dr.iter().map(|s| p(s)).collect();
         let aw: Vec<_> = aw.iter().map(|s| p(s)).collect();
         let dw: Vec<_> = dw.iter().map(|s| p(s)).collect();
-        build_fs_policy(&ar, &dr, &aw, &dw, fw, fa, net, Path::new("/work"))
+        build_fs_policy(
+            &ar,
+            &dr,
+            &[],
+            &aw,
+            &dw,
+            &[],
+            fw,
+            fa,
+            net,
+            Path::new("/work"),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -1921,8 +2018,10 @@ mod tests {
         };
         let mut allow_read = Vec::new();
         let mut deny_read = Vec::new();
+        let mut deny_read_globs = Vec::new();
         let mut allow_write = Vec::new();
         let mut deny_write = Vec::new();
+        let mut deny_write_globs = Vec::new();
         let mut full_write = false;
         let mut allow_net = None;
         let mut deny_net = Vec::new();
@@ -1938,8 +2037,10 @@ mod tests {
             &profile,
             &mut allow_read,
             &mut deny_read,
+            &mut deny_read_globs,
             &mut allow_write,
             &mut deny_write,
+            &mut deny_write_globs,
             &mut full_write,
             &mut allow_net,
             &mut deny_net,
@@ -2114,6 +2215,49 @@ mod tests {
     }
 
     #[test]
+    fn explicit_glob_apis_preserve_deny_access_modes() {
+        let policy = build_fs_policy(
+            &[],
+            &[],
+            &["**/*.pem".to_string()],
+            &[],
+            &[],
+            &["build/**".to_string()],
+            false,
+            false,
+            false,
+            Path::new("/work"),
+        );
+
+        assert!(policy.entries.contains(&FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: "**/*.pem".to_string(),
+            },
+            access: FileSystemAccessMode::None,
+        }));
+        assert!(policy.entries.contains(&FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: "build/**".to_string(),
+            },
+            access: FileSystemAccessMode::Read,
+        }));
+    }
+
+    #[test]
+    fn public_glob_methods_do_not_reinterpret_exact_paths() {
+        let sandbox = Sandbox::command("/bin/true")
+            .deny_read("literal*.pem")
+            .deny_read_glob("*.pem")
+            .deny_write("literal?.log")
+            .deny_write_glob("logs/**");
+
+        assert_eq!(sandbox.deny_read, vec![p("literal*.pem")]);
+        assert_eq!(sandbox.deny_read_globs, vec!["*.pem"]);
+        assert_eq!(sandbox.deny_write, vec![p("literal?.log")]);
+        assert_eq!(sandbox.deny_write_globs, vec!["logs/**"]);
+    }
+
+    #[test]
     fn deny_paths_reject_glob_metacharacters() {
         for path in ["/safe/deny*", "/safe/deny?", "/safe/[deny]", "/safe/{deny}"] {
             let error = validate_paths(&[], &[p(path)], &[], &[], Path::new("/work"))
@@ -2146,6 +2290,36 @@ mod tests {
     }
 
     #[test]
+    fn fs_full_access_keeps_dynamic_denies() {
+        let policy = build_fs_policy(
+            &[],
+            &[],
+            &["*.pem".to_string()],
+            &[],
+            &[],
+            &["generated/**".to_string()],
+            false,
+            true,
+            false,
+            Path::new("/work"),
+        );
+
+        assert!(!policy.has_full_disk_write_access());
+        assert_eq!(
+            policy
+                .get_unreadable_globs_with_cwd(Path::new("/work"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            policy
+                .get_read_only_globs_with_cwd(Path::new("/work"))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn fs_allow_read_restricts() {
         let pol = fs(&["/src"], &[], &[], &[], false, false, false);
         assert!(!pol.has_full_disk_read_access());
@@ -2173,7 +2347,7 @@ mod tests {
         let cwd = Path::new("/project");
         let ar: Vec<PathBuf> = vec![];
         let aw = vec![p("/project/dist")];
-        let pol = build_fs_policy(&ar, &[], &aw, &[], false, false, false, cwd);
+        let pol = build_fs_policy(&ar, &[], &[], &aw, &[], &[], false, false, false, cwd);
         assert!(pol.can_write_path_with_cwd(Path::new("/project/dist/out.js"), cwd));
         assert!(!pol.can_write_path_with_cwd(Path::new("/project/src/main.rs"), cwd));
     }
@@ -2189,7 +2363,7 @@ mod tests {
         let cwd = Path::new("/project");
         let aw = vec![p("/project")];
         let dw = vec![p("/project/.git")];
-        let pol = build_fs_policy(&[], &[], &aw, &dw, false, false, false, cwd);
+        let pol = build_fs_policy(&[], &[], &[], &aw, &dw, &[], false, false, false, cwd);
         assert!(pol.can_write_path_with_cwd(Path::new("/project/src/x"), cwd));
         assert!(!pol.can_write_path_with_cwd(Path::new("/project/.git/config"), cwd));
     }
@@ -2197,7 +2371,18 @@ mod tests {
     #[test]
     fn fs_deny_write_without_allow_is_noop() {
         let cwd = Path::new("/work");
-        let pol = build_fs_policy(&[], &[], &[], &[p("/x")], false, false, false, cwd);
+        let pol = build_fs_policy(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[p("/x")],
+            &[],
+            false,
+            false,
+            false,
+            cwd,
+        );
         assert!(!pol.can_write_path_with_cwd(Path::new("/x"), cwd));
         assert!(!pol.can_write_path_with_cwd(Path::new("/anywhere"), cwd));
     }
@@ -2208,8 +2393,10 @@ mod tests {
         let pol = build_fs_policy(
             &[],
             &[p("/secret")],
+            &[],
             &[p("/out")],
             &[p("/out/.git")],
+            &[],
             false,
             false,
             false,
@@ -2479,11 +2666,14 @@ mod tests {
     fn prepared_command_into_command_remains_available_without_managed_resources() {
         let prepared = PreparedCommand {
             cmd: tokio::process::Command::new("echo"),
-            _proxy_handle: None,
-            _proxy: None,
-            _proxy_root: None,
-            _setup_channel: None,
-            _target_env_file: None,
+            resources: ManagedExecutionResources {
+                _proxy_handle: None,
+                _proxy: None,
+                _proxy_root: None,
+                setup_channel: None,
+                _target_env_file: None,
+                _dynamic_fs: None,
+            },
         };
         let command = prepared.into_command().expect("unmanaged raw command");
         assert!(format!("{command:?}").contains("echo"));
@@ -2496,11 +2686,14 @@ mod tests {
         let proxy_root = PrivateProxyRoot::create_in(runs.path()).expect("private proxy root");
         let prepared = PreparedCommand {
             cmd: tokio::process::Command::new("true"),
-            _proxy_handle: None,
-            _proxy: None,
-            _proxy_root: Some(proxy_root),
-            _setup_channel: None,
-            _target_env_file: None,
+            resources: ManagedExecutionResources {
+                _proxy_handle: None,
+                _proxy: None,
+                _proxy_root: Some(proxy_root),
+                setup_channel: None,
+                _target_env_file: None,
+                _dynamic_fs: None,
+            },
         };
 
         let conversion =
@@ -2520,11 +2713,14 @@ mod tests {
             .env("MANAGED_ROOT", &proxy_root_path);
         let prepared = PreparedCommand {
             cmd,
-            _proxy_handle: None,
-            _proxy: None,
-            _proxy_root: Some(proxy_root),
-            _setup_channel: None,
-            _target_env_file: None,
+            resources: ManagedExecutionResources {
+                _proxy_handle: None,
+                _proxy: None,
+                _proxy_root: Some(proxy_root),
+                setup_channel: None,
+                _target_env_file: None,
+                _dynamic_fs: None,
+            },
         };
 
         let child = prepared.spawn().await.expect("spawn prepared command");
@@ -2605,8 +2801,10 @@ mod tests {
         let profile = crate::profile_core::load_profile("default", &cwd).unwrap();
         let mut ar = Vec::new();
         let mut dr = Vec::new();
+        let mut drg = Vec::new();
         let mut aw = Vec::new();
         let mut dw = Vec::new();
+        let mut dwg = Vec::new();
         let mut fw = false;
         let mut an = None;
         let mut dn = Vec::new();
@@ -2618,8 +2816,8 @@ mod tests {
         let mut dis = false;
         let mut fa = false;
         apply_profile(
-            &profile, &mut ar, &mut dr, &mut aw, &mut dw, &mut fw, &mut an, &mut dn, &mut env,
-            &mut ae, &mut de, &mut sec, &mut sh, &mut dis, &mut fa,
+            &profile, &mut ar, &mut dr, &mut drg, &mut aw, &mut dw, &mut dwg, &mut fw, &mut an,
+            &mut dn, &mut env, &mut ae, &mut de, &mut sec, &mut sh, &mut dis, &mut fa,
         );
         (ar, dr)
     }
@@ -2639,8 +2837,10 @@ mod tests {
         let profile = crate::profile_core::load_profile("default", &cwd).unwrap();
         let mut allow_read = vec![p("/my/custom/path")];
         let mut deny_read = vec![p("/my/custom/deny")];
+        let mut deny_read_globs = Vec::new();
         let mut aw = Vec::new();
         let mut dw = Vec::new();
+        let mut deny_write_globs = Vec::new();
         let mut fw = false;
         let mut an = None;
         let mut dn = Vec::new();
@@ -2655,8 +2855,10 @@ mod tests {
             &profile,
             &mut allow_read,
             &mut deny_read,
+            &mut deny_read_globs,
             &mut aw,
             &mut dw,
+            &mut deny_write_globs,
             &mut fw,
             &mut an,
             &mut dn,

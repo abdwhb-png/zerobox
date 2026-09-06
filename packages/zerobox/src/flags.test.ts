@@ -51,6 +51,12 @@ describe("buildFlags", () => {
     expect(flags).toContain("--deny-read=/secret");
   });
 
+  it("builds one --deny-read-glob flag per pattern without splitting braces", () => {
+    const flags = buildFlags({ denyReadGlobs: ["*.pem", "**/*.{key,crt}"] });
+    expect(flags).toContain("--deny-read-glob=*.pem");
+    expect(flags).toContain("--deny-read-glob=**/*.{key,crt}");
+  });
+
   it("builds --allow-write with paths", () => {
     const flags = buildFlags({ allowWrite: ["/tmp"] });
     expect(flags).toContain("--allow-write=/tmp");
@@ -59,6 +65,12 @@ describe("buildFlags", () => {
   it("builds --deny-write", () => {
     const flags = buildFlags({ denyWrite: [".git"] });
     expect(flags).toContain("--deny-write=.git");
+  });
+
+  it("builds one --deny-write-glob flag per pattern", () => {
+    const flags = buildFlags({ denyWriteGlobs: ["generated/**", "*.log"] });
+    expect(flags).toContain("--deny-write-glob=generated/**");
+    expect(flags).toContain("--deny-write-glob=*.log");
   });
 
   it("builds --allow-net as boolean", () => {

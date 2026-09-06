@@ -1,0 +1,158 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -211,7 +213,11 @@
+         exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+     }
+ 
+-    if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
++    let private_bind_mounts = load_private_bind_mounts();
++    if file_system_sandbox_policy.has_full_disk_write_access()
++        && !allow_network_for_proxy
++        && private_bind_mounts.is_empty()
++    {
+         if let Err(e) = apply_permission_profile_to_current_thread(
+             &permission_profile,
+             &sandbox_policy_cwd,
+@@ -257,6 +262,7 @@
+             inner,
+             !no_proc,
+             allow_network_for_proxy,
++            &private_bind_mounts,
+         );
+     }
+ 
+@@ -298,6 +304,9 @@
+     let mut target = target?;
+     for (name, value) in std::env::vars() {
+-        if name != TARGET_ENV_FILE_ENV && name != "PATH" {
++        if name != TARGET_ENV_FILE_ENV
++            && name != "PATH"
++            && name != PRIVATE_BIND_MOUNTS_ENV
++        {
+             target.insert(name, value);
+         }
+     }
+@@ -367,6 +373,7 @@
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn run_bwrap_with_proc_fallback(
+     sandbox_policy_cwd: &Path,
+     command_cwd: Option<&Path>,
+@@ -371,6 +378,7 @@
+     inner: Vec<String>,
+     mount_proc: bool,
+     allow_network_for_proxy: bool,
++    private_bind_mounts: &[PrivateBindMount],
+ ) -> ! {
+     let network_mode = bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy);
+     let mut mount_proc = mount_proc;
+@@ -403,6 +410,8 @@
+         options,
+     )
+     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
++    inject_private_bind_mounts(&mut bwrap_args.args, private_bind_mounts)
++        .unwrap_or_else(|err| panic!("invalid private bind mount: {err}"));
+     apply_inner_command_argv0(&mut bwrap_args.args);
+     run_or_exec_bwrap(bwrap_args);
+ }
+@@ -449,6 +458,62 @@
+     })
+ }
+ 
++const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
++
++#[derive(Debug, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct PrivateBindMount {
++    source: PathBuf,
++    destination: PathBuf,
++}
++
++fn load_private_bind_mounts() -> Vec<PrivateBindMount> {
++    let Some(serialized) = std::env::var_os(PRIVATE_BIND_MOUNTS_ENV) else {
++        return Vec::new();
++    };
++    let serialized = serialized
++        .into_string()
++        .unwrap_or_else(|_| panic!("{PRIVATE_BIND_MOUNTS_ENV} must be valid UTF-8"));
++    serde_json::from_str(&serialized)
++        .unwrap_or_else(|error| panic!("invalid {PRIVATE_BIND_MOUNTS_ENV}: {error}"))
++}
++
++fn inject_private_bind_mounts(
++    args: &mut Vec<String>,
++    mounts: &[PrivateBindMount],
++) -> std::io::Result<()> {
++    if mounts.is_empty() {
++        return Ok(());
++    }
++    let separator = args
++        .iter()
++        .position(|argument| argument == "--")
++        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing command separator"))?;
++    let mut bind_args = Vec::with_capacity(mounts.len() * 3);
++    for mount in mounts {
++        if !mount.source.is_absolute() || !mount.destination.is_absolute() {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "private bind paths must be absolute",
++            ));
++        }
++        let metadata = fs::symlink_metadata(&mount.source)?;
++        if metadata.file_type().is_symlink() || !metadata.is_dir() {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "private bind source must be a non-symlink directory",
++            ));
++        }
++        bind_args.extend([
++            "--bind".to_string(),
++            mount.source.to_string_lossy().into_owned(),
++            mount.destination.to_string_lossy().into_owned(),
++        ]);
++    }
++    args.splice(separator..separator, bind_args);
++    Ok(())
++}
++
+ fn exit_with_bwrap_build_error(err: crate::error::CodexErr) -> ! {
+     eprintln!("error building bubblewrap command: {err}");
+     std::process::exit(1);
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -604,3 +604,33 @@
+         /*apply_seccomp_then_exec*/ true, /*use_legacy_landlock*/ false,
+     );
+ }
++
++#[test]
++fn private_bind_mounts_are_inserted_before_the_target_command() {
++    let root = tempfile::tempdir().expect("private bind root");
++    let source = root.path().join("view");
++    std::fs::create_dir(&source).expect("private bind source");
++    let mut args = vec![
++        "bwrap".to_string(),
++        "--new-session".to_string(),
++        "--".to_string(),
++        "/bin/true".to_string(),
++    ];
++
++    inject_private_bind_mounts(
++        &mut args,
++        &[PrivateBindMount {
++            source: source.clone(),
++            destination: PathBuf::from("/work"),
++        }],
++    )
++    .expect("inject private bind");
++
++    assert_eq!(
++        args,
++        vec![
++            "bwrap", "--new-session", "--bind", source.to_str().unwrap(), "/work", "--",
++            "/bin/true",
++        ]
++    );
++}

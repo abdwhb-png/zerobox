@@ -407,6 +407,12 @@ if [ -f "$READABLE_CARVEOUT_FD_PATCH" ]; then
     patch --fuzz=0 -p0 < "$READABLE_CARVEOUT_FD_PATCH"
 fi
 
+PRIVATE_BIND_MOUNTS_PATCH="$SCRIPT_DIR/upstream-private-bind-mounts.patch"
+if [ -f "$PRIVATE_BIND_MOUNTS_PATCH" ]; then
+    echo "    private-bind-mounts"
+    patch --fuzz=0 -p0 < "$PRIVATE_BIND_MOUNTS_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \

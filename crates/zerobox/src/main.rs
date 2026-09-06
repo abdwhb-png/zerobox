@@ -30,11 +30,17 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub deny_read: Option<Vec<PathBuf>>,
 
+    #[arg(long = "deny-read-glob", action = clap::ArgAction::Append)]
+    pub deny_read_glob: Vec<String>,
+
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     pub allow_write: Option<Vec<PathBuf>>,
 
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub deny_write: Option<Vec<PathBuf>>,
+
+    #[arg(long = "deny-write-glob", action = clap::ArgAction::Append)]
+    pub deny_write_glob: Vec<String>,
 
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     pub allow_net: Option<Vec<String>>,
@@ -313,6 +319,9 @@ async fn tokio_main(
             sandbox = sandbox.deny_read(p);
         }
     }
+    for pattern in &cli.deny_read_glob {
+        sandbox = sandbox.deny_read_glob(pattern);
+    }
     if let Some(ref paths) = cli.allow_write {
         if paths.is_empty() {
             sandbox = sandbox.allow_write_all();
@@ -326,6 +335,9 @@ async fn tokio_main(
         for p in paths {
             sandbox = sandbox.deny_write(p);
         }
+    }
+    for pattern in &cli.deny_write_glob {
+        sandbox = sandbox.deny_write_glob(pattern);
     }
 
     if let Some(ref domains) = cli.allow_net {
@@ -829,5 +841,22 @@ mod tests {
         );
         line.clear();
         assert_eq!(reader.read_line(&mut line).expect("read EOF"), 0);
+    }
+
+    #[test]
+    fn glob_cli_arguments_preserve_brace_alternation() {
+        let cli = Cli::try_parse_from([
+            "zerobox",
+            "--deny-read-glob",
+            "**/*.{pem,key}",
+            "--deny-write-glob",
+            "build/{debug,release}/**",
+            "--",
+            "/bin/true",
+        ])
+        .expect("parse glob arguments");
+
+        assert_eq!(cli.deny_read_glob, vec!["**/*.{pem,key}"]);
+        assert_eq!(cli.deny_write_glob, vec!["build/{debug,release}/**"]);
     }
 }

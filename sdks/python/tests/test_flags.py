@@ -60,12 +60,24 @@ def test_deny_read():
     assert "--deny-read=/secret" in build_flags({"deny_read": ["/secret"]})
 
 
+def test_deny_read_globs_are_repeated_without_splitting_braces():
+    flags = build_flags({"deny_read_globs": ["*.pem", "**/*.{key,crt}"]})
+    assert "--deny-read-glob=*.pem" in flags
+    assert "--deny-read-glob=**/*.{key,crt}" in flags
+
+
 def test_allow_write():
     assert "--allow-write=/tmp" in build_flags({"allow_write": ["/tmp"]})
 
 
 def test_deny_write():
     assert "--deny-write=.git" in build_flags({"deny_write": [".git"]})
+
+
+def test_deny_write_globs_are_repeated():
+    flags = build_flags({"deny_write_globs": ["generated/**", "*.log"]})
+    assert "--deny-write-glob=generated/**" in flags
+    assert "--deny-write-glob=*.log" in flags
 
 
 def test_allow_net_true():

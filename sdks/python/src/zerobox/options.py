@@ -22,8 +22,10 @@ class SandboxOptions:
     profile: Union[str, list[str], None] = None
     allow_read: Union[list[str], None] = None
     deny_read: Union[list[str], None] = None
+    deny_read_globs: Union[list[str], None] = None
     allow_write: Union[list[str], None] = None
     deny_write: Union[list[str], None] = None
+    deny_write_globs: Union[list[str], None] = None
     allow_net: Union[bool, list[str], None] = None
     deny_net: Union[list[str], None] = None
     allow_all: bool = False

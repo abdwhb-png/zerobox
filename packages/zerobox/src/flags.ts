@@ -44,11 +44,17 @@ export function buildFlags(options: SandboxOptions): string[] {
     if (options.denyRead?.length) {
       flags.push(`--deny-read=${options.denyRead.join(",")}`);
     }
+    for (const pattern of options.denyReadGlobs ?? []) {
+      flags.push(`--deny-read-glob=${pattern}`);
+    }
     if (options.allowWrite?.length) {
       flags.push(`--allow-write=${options.allowWrite.join(",")}`);
     }
     if (options.denyWrite?.length) {
       flags.push(`--deny-write=${options.denyWrite.join(",")}`);
+    }
+    for (const pattern of options.denyWriteGlobs ?? []) {
+      flags.push(`--deny-write-glob=${pattern}`);
     }
 
     // Merge secret hosts into allowNet (secrets auto-enable network for their hosts).

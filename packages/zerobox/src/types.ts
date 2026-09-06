@@ -10,10 +10,14 @@ export interface SandboxOptions {
   allowRead?: string[];
   /** Block reading from these paths. Takes precedence over allowRead. */
   denyRead?: string[];
+  /** Dynamically block reads matching these globset patterns. */
+  denyReadGlobs?: string[];
   /** Allow writing to these paths. Empty array = allow all writes. */
   allowWrite?: string[];
   /** Block writing to these paths. Takes precedence over allowWrite. */
   denyWrite?: string[];
+  /** Dynamically block mutations matching these globset patterns. */
+  denyWriteGlobs?: string[];
   /** Allow network. true = all, string[] = specific domains. */
   allowNet?: boolean | string[];
   /** Block network to these domains. Takes precedence over allowNet. */

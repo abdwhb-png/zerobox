@@ -216,6 +216,7 @@ struct FileSystemSemanticSignature {
     writable_roots: Vec<WritableRoot>,
     unreadable_roots: Vec<AbsolutePathBuf>,
     unreadable_globs: Vec<String>,
+    read_only_globs: Vec<String>,
 }
 
 /// Runtime matcher for read-deny entries in a filesystem sandbox policy.
@@ -334,8 +335,8 @@ pub enum FileSystemPath {
     Path {
         path: AbsolutePathBuf,
     },
-    /// A git-style glob pattern. Pattern entries currently support
-    /// FileSystemAccessMode::None only.
+    /// A git-style glob pattern. Pattern entries support read-deny (`none`)
+    /// and write-deny (`read`) access modes.
     GlobPattern {
         pattern: String,
     },
@@ -1021,6 +1022,29 @@ impl FileSystemSandboxPolicy {
         patterns
     }
 
+    /// Returns read-only glob patterns resolved against the provided cwd.
+    pub fn get_read_only_globs_with_cwd(&self, cwd: &Path) -> Vec<String> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+
+        let mut patterns = self
+            .entries
+            .iter()
+            .filter(|entry| entry.access == FileSystemAccessMode::Read)
+            .filter_map(|entry| match &entry.path {
+                FileSystemPath::GlobPattern { pattern } => {
+                    Some(AbsolutePathBuf::resolve_path_against_base(pattern, cwd))
+                }
+                FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => None,
+            })
+            .map(|pattern| pattern.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
+
     pub fn to_legacy_sandbox_policy(
         &self,
         network_policy: NetworkSandboxPolicy,
@@ -1160,6 +1184,7 @@ impl FileSystemSandboxPolicy {
             writable_roots: sorted_writable_roots(self.get_writable_roots_with_cwd(cwd)),
             unreadable_roots: sorted_absolute_paths(self.get_unreadable_roots_with_cwd(cwd)),
             unreadable_globs: self.get_unreadable_globs_with_cwd(cwd),
+            read_only_globs: self.get_read_only_globs_with_cwd(cwd),
         }
     }
 }
@@ -2879,6 +2904,21 @@ mod tests {
             path: FileSystemPath::GlobPattern { pattern },
             access: FileSystemAccessMode::None,
         }
+    }
+
+    #[test]
+    fn read_access_glob_is_a_dynamic_write_deny() {
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: "/work/build/**".to_string(),
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+
+        assert_eq!(
+            policy.get_read_only_globs_with_cwd(Path::new("/work")),
+            vec!["/work/build/**".to_string()]
+        );
     }
 
     fn default_policy_with_unreadable_glob(pattern: String) -> FileSystemSandboxPolicy {

@@ -53,8 +53,12 @@ def build_flags(options: Union[SandboxOptions, dict[str, Any], None]) -> list[st
 
         _add_csv(flags, "allow-read", o.allow_read)
         _add_csv(flags, "deny-read", o.deny_read)
+        for pattern in o.deny_read_globs or []:
+            flags.append(f"--deny-read-glob={pattern}")
         _add_csv(flags, "allow-write", o.allow_write)
         _add_csv(flags, "deny-write", o.deny_write)
+        for pattern in o.deny_write_globs or []:
+            flags.append(f"--deny-write-glob={pattern}")
 
         # Secret hosts implicitly allow network for their domains. When
         # allow_net is already a list, append the hosts. When True, leave
