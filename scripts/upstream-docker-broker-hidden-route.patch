@@ -1,0 +1,556 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -13,6 +13,7 @@
+ use std::net::SocketAddr;
+ use std::net::TcpListener;
+ use std::net::TcpStream;
++use std::os::fd::AsRawFd;
+ use std::os::fd::FromRawFd;
+ use std::os::unix::fs::DirBuilderExt;
+ use std::os::unix::fs::FileTypeExt;
+@@ -47,6 +48,10 @@
+ const LOOPBACK_INTERFACE_NAME: &[u8] = b"lo";
+ const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
+ const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
++const BROKER_OPEN_REQUEST: u8 = 1;
++const BROKER_OPEN_OK: u8 = 1;
++const BROKER_OPEN_ERROR: u8 = 0;
++pub(crate) const PRIVATE_PROXY_MOUNT_ROOT: &str = "/dev/.zerobox-proxy";
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub(crate) struct ProxyRouteSpec {
+@@ -57,6 +62,14 @@
+ struct ProxyRouteEntry {
+     env_key: String,
+     uds_path: PathBuf,
++    #[serde(default, skip_serializing_if = "is_false")]
++    broker_control: bool,
++}
++
++// Serde's `skip_serializing_if` callback receives the field by reference.
++#[allow(clippy::trivially_copy_pass_by_ref)]
++fn is_false(value: &bool) -> bool {
++    !value
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -71,7 +82,10 @@
+     has_proxy_config: bool,
+ }
+ 
+-pub(crate) fn prepare_host_proxy_route_spec(proxy_root: &Path) -> io::Result<String> {
++pub(crate) fn prepare_host_proxy_route_spec(
++    proxy_root: &Path,
++    namespace_root: Option<&Path>,
++) -> io::Result<String> {
+     let env: HashMap<String, String> = std::env::vars().collect();
+     let plan = plan_proxy_routes(&env);
+     let docker_route = private_docker_route(&env)?;
+@@ -99,14 +113,22 @@
+         next_index += 1;
+         socket_by_endpoint.insert(route.endpoint, socket_path);
+     }
++    let docker_route_socket = docker_route
++        .as_ref()
++        .map(|_| socket_dir.join(format!("r-{next_index}.sock")));
+ 
+-    let mut host_bridge_pids = Vec::with_capacity(socket_by_endpoint.len());
++    let mut host_bridge_pids =
++        Vec::with_capacity(socket_by_endpoint.len() + usize::from(docker_route.is_some()));
+     for (endpoint, socket_path) in &socket_by_endpoint {
+         host_bridge_pids.push(spawn_host_bridge(*endpoint, socket_path)?);
+     }
++    if let (Some(route), Some(socket_path)) = (&docker_route, &docker_route_socket) {
++        host_bridge_pids.push(spawn_host_broker_bridge(&route.uds_path, socket_path)?);
++    }
+     spawn_proxy_socket_dir_cleanup_worker(socket_dir, host_bridge_pids)?;
+ 
+-    let mut routes = Vec::with_capacity(plan.routes.len() + usize::from(docker_route.is_some()));
++    let mut routes =
++        Vec::with_capacity(plan.routes.len() + usize::from(docker_route_socket.is_some()));
+     for route in plan.routes {
+         let Some(uds_path) = socket_by_endpoint.get(&route.endpoint) else {
+             return Err(io::Error::other(format!(
+@@ -116,16 +138,35 @@
+         };
+         routes.push(ProxyRouteEntry {
+             env_key: route.env_key,
+-            uds_path: uds_path.clone(),
++            uds_path: namespace_proxy_path(proxy_root, uds_path, namespace_root)?,
++            broker_control: false,
+         });
+     }
+-    if let Some(docker_route) = docker_route {
+-        routes.push(docker_route);
++    if let Some(uds_path) = docker_route_socket {
++        routes.push(ProxyRouteEntry {
++            env_key: DOCKER_HOST_ENV.to_string(),
++            uds_path: namespace_proxy_path(proxy_root, &uds_path, namespace_root)?,
++            broker_control: true,
++        });
+     }
+ 
+     serde_json::to_string(&ProxyRouteSpec { routes }).map_err(io::Error::other)
+ }
+ 
++fn namespace_proxy_path(
++    proxy_root: &Path,
++    host_path: &Path,
++    namespace_root: Option<&Path>,
++) -> io::Result<PathBuf> {
++    let relative = host_path.strip_prefix(proxy_root).map_err(|_| {
++        io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "private proxy socket must be below its managed root",
++        )
++    })?;
++    Ok(namespace_root.unwrap_or(proxy_root).join(relative))
++}
++
+ fn private_docker_route(env: &HashMap<String, String>) -> io::Result<Option<ProxyRouteEntry>> {
+     let Some(path) = env.get(DOCKER_BROKER_SOCKET_ENV) else {
+         return Ok(None);
+@@ -176,6 +217,7 @@
+     Ok(Some(ProxyRouteEntry {
+         env_key: DOCKER_HOST_ENV.to_string(),
+         uds_path: path,
++        broker_control: true,
+     }))
+ }
+ 
+@@ -189,17 +231,23 @@
+         ));
+     }
+ 
+-    let mut local_port_by_uds_path: BTreeMap<PathBuf, u16> = BTreeMap::new();
++    let mut local_port_by_route: BTreeMap<(PathBuf, bool), u16> = BTreeMap::new();
+     for route in &spec.routes {
+-        if local_port_by_uds_path.contains_key(&route.uds_path) {
++        let route_key = (route.uds_path.clone(), route.broker_control);
++        if local_port_by_route.contains_key(&route_key) {
+             continue;
+         }
+-        let local_port = spawn_local_bridge(route.uds_path.as_path())?;
+-        local_port_by_uds_path.insert(route.uds_path.clone(), local_port);
++        let local_port = if route.broker_control {
++            spawn_local_broker_bridge(route.uds_path.as_path())?
++        } else {
++            spawn_local_bridge(route.uds_path.as_path())?
++        };
++        local_port_by_route.insert(route_key, local_port);
+     }
+ 
+     for route in spec.routes {
+-        let Some(local_port) = local_port_by_uds_path.get(&route.uds_path) else {
++        let route_key = (route.uds_path.clone(), route.broker_control);
++        let Some(local_port) = local_port_by_route.get(&route_key) else {
+             return Err(io::Error::other(format!(
+                 "missing local bridge port for UDS path {}",
+                 route.uds_path.display()
+@@ -555,11 +603,243 @@
+                 Ok(stream) => stream,
+                 Err(_) => return,
+             };
+-            let _ = proxy_bidirectional(tcp_stream, unix_stream);
++            let _ = proxy_tcp_unix(tcp_stream, unix_stream);
+         });
+     }
+ }
+ 
++fn spawn_host_broker_bridge(endpoint: &Path, uds_path: &Path) -> io::Result<libc::pid_t> {
++    let (read_fd, write_fd) = create_ready_pipe()?;
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        let err = io::Error::last_os_error();
++        close_fd(read_fd)?;
++        close_fd(write_fd)?;
++        return Err(err);
++    }
++
++    if pid == 0 {
++        if close_fd(read_fd).is_err() {
++            unsafe { libc::_exit(1) };
++        }
++        let result = run_host_broker_bridge(endpoint, uds_path, write_fd);
++        if result.is_err() {
++            unsafe { libc::_exit(1) };
++        }
++        unsafe { libc::_exit(0) };
++    }
++
++    close_fd(write_fd)?;
++    let mut ready = [0_u8; 1];
++    let mut read_file = unsafe { File::from_raw_fd(read_fd) };
++    read_file.read_exact(&mut ready)?;
++    if ready[0] != HOST_BRIDGE_READY {
++        return Err(io::Error::other(
++            "host Unix bridge did not acknowledge readiness",
++        ));
++    }
++    Ok(pid)
++}
++
++fn run_host_broker_bridge(
++    endpoint: &Path,
++    uds_path: &Path,
++    ready_fd: libc::c_int,
++) -> io::Result<()> {
++    harden_bridge_process()?;
++    if uds_path.exists() {
++        std::fs::remove_file(uds_path)?;
++    }
++    let listener = UnixListener::bind(uds_path)?;
++    std::fs::set_permissions(uds_path, Permissions::from_mode(0o600))?;
++
++    let mut ready_file = unsafe { File::from_raw_fd(ready_fd) };
++    ready_file.write_all(&[HOST_BRIDGE_READY])?;
++    drop(ready_file);
++
++    let (mut control, _) = listener.accept()?;
++    std::fs::remove_file(uds_path)?;
++    drop(listener);
++
++    loop {
++        let mut request = [0_u8; 1];
++        match control.read_exact(&mut request) {
++            Ok(()) => {}
++            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
++            Err(err) => return Err(err),
++        }
++        if request[0] != BROKER_OPEN_REQUEST {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "invalid private Docker broker request",
++            ));
++        }
++
++        match UnixStream::connect(endpoint) {
++            Ok(broker) => send_unix_stream(&control, &broker)?,
++            Err(_) => control.write_all(&[BROKER_OPEN_ERROR])?,
++        }
++    }
++}
++
++fn send_unix_stream(control: &UnixStream, stream: &UnixStream) -> io::Result<()> {
++    let mut status = [BROKER_OPEN_OK];
++    let mut iovec = libc::iovec {
++        iov_base: status.as_mut_ptr().cast(),
++        iov_len: status.len(),
++    };
++    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
++    let mut ancillary = vec![0_u8; control_len];
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut iovec;
++    message.msg_iovlen = 1;
++    message.msg_control = ancillary.as_mut_ptr().cast();
++    message.msg_controllen = ancillary.len();
++
++    let descriptor = stream.as_raw_fd();
++    unsafe {
++        let header = libc::CMSG_FIRSTHDR(&message);
++        if header.is_null() {
++            return Err(io::Error::other(
++                "failed to allocate broker descriptor message",
++            ));
++        }
++        (*header).cmsg_level = libc::SOL_SOCKET;
++        (*header).cmsg_type = libc::SCM_RIGHTS;
++        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize;
++        std::ptr::write(libc::CMSG_DATA(header).cast::<libc::c_int>(), descriptor);
++
++        let written = libc::sendmsg(control.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
++        if written < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        if written != 1 {
++            return Err(io::Error::new(
++                io::ErrorKind::WriteZero,
++                "private Docker broker descriptor response was truncated",
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn spawn_local_broker_bridge(uds_path: &Path) -> io::Result<u16> {
++    let (read_fd, write_fd) = create_ready_pipe()?;
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        let err = io::Error::last_os_error();
++        close_fd(read_fd)?;
++        close_fd(write_fd)?;
++        return Err(err);
++    }
++
++    if pid == 0 {
++        if close_fd(read_fd).is_err() {
++            unsafe { libc::_exit(1) };
++        }
++        let result = run_local_broker_bridge(uds_path, write_fd);
++        if result.is_err() {
++            unsafe { libc::_exit(1) };
++        }
++        unsafe { libc::_exit(0) };
++    }
++
++    close_fd(write_fd)?;
++    let mut port_bytes = [0_u8; 2];
++    let mut read_file = unsafe { File::from_raw_fd(read_fd) };
++    read_file.read_exact(&mut port_bytes)?;
++    Ok(u16::from_be_bytes(port_bytes))
++}
++
++fn run_local_broker_bridge(uds_path: &Path, ready_fd: libc::c_int) -> io::Result<()> {
++    harden_bridge_process()?;
++    let mut control = UnixStream::connect(uds_path)?;
++    let listener = bind_local_loopback_listener()?;
++    let port = listener.local_addr()?.port();
++
++    let mut ready_file = unsafe { File::from_raw_fd(ready_fd) };
++    ready_file.write_all(&port.to_be_bytes())?;
++    drop(ready_file);
++
++    loop {
++        let (tcp_stream, _) = listener.accept()?;
++        control.write_all(&[BROKER_OPEN_REQUEST])?;
++        let Some(broker) = receive_unix_stream(&control)? else {
++            continue;
++        };
++        std::thread::spawn(move || {
++            let _ = proxy_tcp_unix(tcp_stream, broker);
++        });
++    }
++}
++
++fn receive_unix_stream(control: &UnixStream) -> io::Result<Option<UnixStream>> {
++    let mut status = [0_u8; 1];
++    let mut iovec = libc::iovec {
++        iov_base: status.as_mut_ptr().cast(),
++        iov_len: status.len(),
++    };
++    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
++    let mut ancillary = vec![0_u8; control_len];
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut iovec;
++    message.msg_iovlen = 1;
++    message.msg_control = ancillary.as_mut_ptr().cast();
++    message.msg_controllen = ancillary.len();
++
++    let received =
++        unsafe { libc::recvmsg(control.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
++    if received < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if received == 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::UnexpectedEof,
++            "private Docker broker control channel closed",
++        ));
++    }
++    if received != 1 || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "invalid private Docker broker descriptor response",
++        ));
++    }
++    if status[0] == BROKER_OPEN_ERROR {
++        return Ok(None);
++    }
++    if status[0] != BROKER_OPEN_OK {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "unknown private Docker broker descriptor status",
++        ));
++    }
++
++    let descriptor = unsafe {
++        let header = libc::CMSG_FIRSTHDR(&message);
++        if header.is_null()
++            || (*header).cmsg_level != libc::SOL_SOCKET
++            || (*header).cmsg_type != libc::SCM_RIGHTS
++            || (*header).cmsg_len
++                != libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize
++            || !libc::CMSG_NXTHDR(&message, header).is_null()
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "private Docker broker response did not contain one descriptor",
++            ));
++        }
++        std::ptr::read(libc::CMSG_DATA(header).cast::<libc::c_int>())
++    };
++    if descriptor < 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "private Docker broker returned an invalid descriptor",
++        ));
++    }
++
++    Ok(Some(unsafe { UnixStream::from_raw_fd(descriptor) }))
++}
++
+ fn spawn_local_bridge(uds_path: &Path) -> io::Result<u16> {
+     let (read_fd, write_fd) = create_ready_pipe()?;
+     let pid = unsafe { libc::fork() };
+@@ -606,7 +886,7 @@
+                 Ok(stream) => stream,
+                 Err(_) => return,
+             };
+-            let _ = proxy_bidirectional(tcp_stream, unix_stream);
++            let _ = proxy_tcp_unix(tcp_stream, unix_stream);
+         });
+     }
+ }
+@@ -707,16 +987,30 @@
+     zerobox_process_hardening::disable_process_dumping()
+ }
+ 
+-fn proxy_bidirectional(mut tcp_stream: TcpStream, mut unix_stream: UnixStream) -> io::Result<()> {
+-    let mut tcp_reader = tcp_stream.try_clone()?;
+-    let mut unix_writer = unix_stream.try_clone()?;
+-    let tcp_to_unix = std::thread::spawn(move || std::io::copy(&mut tcp_reader, &mut unix_writer));
+-    let unix_to_tcp = std::io::copy(&mut unix_stream, &mut tcp_stream);
+-    let tcp_to_unix = tcp_to_unix
++fn proxy_tcp_unix(tcp_stream: TcpStream, unix_stream: UnixStream) -> io::Result<()> {
++    let tcp_reader = tcp_stream.try_clone()?;
++    let unix_writer = unix_stream.try_clone()?;
++    proxy_bidirectional(tcp_stream, unix_stream, tcp_reader, unix_writer)
++}
++
++fn proxy_bidirectional<Left, Right>(
++    mut left: Left,
++    mut right: Right,
++    mut left_reader: Left,
++    mut right_writer: Right,
++) -> io::Result<()>
++where
++    Left: Read + Write + Send + 'static,
++    Right: Read + Write + Send + 'static,
++{
++    let left_to_right =
++        std::thread::spawn(move || std::io::copy(&mut left_reader, &mut right_writer));
++    let right_to_left = std::io::copy(&mut right, &mut left);
++    let left_to_right = left_to_right
+         .join()
+         .map_err(|_| io::Error::other("bridge thread panicked"))?;
+-    tcp_to_unix?;
+-    unix_to_tcp?;
++    left_to_right?;
++    right_to_left?;
+     Ok(())
+ }
+ 
+@@ -856,6 +1150,7 @@
+             routes: vec![ProxyRouteEntry {
+                 env_key: "HTTP_PROXY".to_string(),
+                 uds_path: PathBuf::from("/tmp/proxy-route-0.sock"),
++                broker_control: false,
+             }],
+         };
+         let serialized = serde_json::to_string(&spec).expect("proxy route spec should serialize");
+@@ -867,7 +1162,7 @@
+     }
+ 
+     #[test]
+-    fn private_docker_route_accepts_only_an_owner_only_socket() {
++    fn private_docker_socket_accepts_only_an_owner_only_socket() {
+         use std::os::unix::fs::PermissionsExt;
+         use std::os::unix::net::UnixListener;
+ 
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -25,6 +25,7 @@
+ use crate::landlock::apply_permission_profile_to_current_thread;
+ use crate::launcher::exec_bwrap;
+ use crate::launcher::preferred_bwrap_supports_argv0;
++use crate::proxy_routing::PRIVATE_PROXY_MOUNT_ROOT;
+ use crate::proxy_routing::activate_proxy_routes_in_netns;
+ use crate::proxy_routing::prepare_host_proxy_route_spec;
+ use zerobox_protocol::models::PermissionProfile;
+@@ -232,14 +233,19 @@
+         // Outer stage: bubblewrap first, then re-enter this binary in the
+         // sandboxed environment to apply seccomp. This path never falls back
+         // to legacy Landlock on failure.
++        let private_proxy_source = proxy_root.as_deref().filter(|root| {
++            !file_system_sandbox_policy.can_read_path_with_cwd(root, &sandbox_policy_cwd)
++        });
+         let proxy_route_spec = if allow_network_for_proxy {
+             let proxy_root = proxy_root
+                 .as_deref()
+                 .unwrap_or_else(|| panic!("managed proxy mode requires an explicit --proxy-root"));
+             Some(
+-                prepare_host_proxy_route_spec(proxy_root).unwrap_or_else(|err| {
+-                    panic!("failed to prepare host proxy routing bridge: {err}")
+-                }),
++                prepare_host_proxy_route_spec(
++                    proxy_root,
++                    private_proxy_source.map(|_| Path::new(PRIVATE_PROXY_MOUNT_ROOT)),
++                )
++                .unwrap_or_else(|err| panic!("failed to prepare host proxy routing bridge: {err}")),
+             )
+         } else {
+             None
+@@ -261,6 +267,7 @@
+             inner,
+             !no_proc,
+             allow_network_for_proxy,
++            private_proxy_source,
+             &private_bind_mounts,
+         );
+     }
+@@ -380,6 +387,7 @@
+     inner: Vec<String>,
+     mount_proc: bool,
+     allow_network_for_proxy: bool,
++    proxy_root: Option<&Path>,
+     private_bind_mounts: &[PrivateBindMount],
+ ) -> ! {
+     let network_mode = bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy);
+@@ -415,6 +423,10 @@
+     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
+     inject_private_bind_mounts(&mut bwrap_args.args, private_bind_mounts)
+         .unwrap_or_else(|err| panic!("invalid private bind mount: {err}"));
++    if let Some(proxy_root) = proxy_root {
++        inject_private_proxy_mount(&mut bwrap_args.args, proxy_root)
++            .unwrap_or_else(|err| panic!("invalid private proxy mount: {err}"));
++    }
+     apply_inner_command_argv0(&mut bwrap_args.args);
+     run_or_exec_bwrap(bwrap_args);
+ }
+@@ -520,6 +532,36 @@
+     Ok(())
+ }
+ 
++fn inject_private_proxy_mount(args: &mut Vec<String>, proxy_root: &Path) -> std::io::Result<()> {
++    let metadata = fs::symlink_metadata(proxy_root)?;
++    if metadata.file_type().is_symlink() || !metadata.is_dir() {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "private proxy root must be a non-symlink directory",
++        ));
++    }
++    let separator = args
++        .iter()
++        .position(|argument| argument == "--")
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "missing command separator",
++            )
++        })?;
++    args.splice(
++        separator..separator,
++        [
++            "--dir".to_string(),
++            PRIVATE_PROXY_MOUNT_ROOT.to_string(),
++            "--ro-bind".to_string(),
++            proxy_root.to_string_lossy().into_owned(),
++            PRIVATE_PROXY_MOUNT_ROOT.to_string(),
++        ],
++    );
++    Ok(())
++}
++
+ fn exit_with_bwrap_build_error(err: crate::error::CodexErr) -> ! {
+     eprintln!("error building bubblewrap command: {err}");
+     std::process::exit(1);

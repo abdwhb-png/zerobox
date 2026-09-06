@@ -64,6 +64,7 @@ async fn sdk_full_docker_access_uses_only_the_private_namespace_bridge() {
     let script = format!(
         concat!(
             "test ! -S '{}' && ",
+            "test -z \"$(find /dev/.zerobox-proxy -type s -print -quit)\" && ",
             "endpoint=${{DOCKER_HOST#tcp://}} && ",
             "host=${{endpoint%:*}} && port=${{endpoint##*:}} && ",
             "exec 3<>/dev/tcp/$host/$port && ",
@@ -80,6 +81,8 @@ async fn sdk_full_docker_access_uses_only_the_private_namespace_bridge() {
         .cwd(root.path())
         .no_profile()
         .allow_read("/")
+        .deny_read(zerobox::zerobox_home())
+        .deny_read_glob("*.pem")
         .docker_access(DockerAccessPolicy::Full {
             endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
         })
@@ -269,6 +272,7 @@ async fn sdk_targeted_docker_cli_and_compose_matrix_is_confined_to_the_granted_s
         .no_profile()
         .allow_read("/")
         .allow_write(root.path())
+        .deny_read_glob("*.pem")
         .docker_access(policy)
         .linux_sandbox_exe(zerobox_exec())
         .run()
