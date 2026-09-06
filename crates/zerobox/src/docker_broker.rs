@@ -52,7 +52,7 @@ impl DockerBroker {
             }
             DockerAccessPolicy::Targeted { endpoint, targets } => {
                 let endpoint = endpoint.as_path().to_path_buf();
-                let snapshot = resolve_target_snapshot(&endpoint, targets).await;
+                let snapshot = resolve_target_snapshot(&endpoint, targets).await?;
                 (endpoint, BrokerMode::Targeted(Arc::new(snapshot)))
             }
         };
@@ -121,15 +121,6 @@ struct HttpRequest {
 }
 
 impl HttpRequest {
-    fn requests_upgrade(&self) -> bool {
-        self.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("connection")
-                && value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-        })
-    }
-
     fn serialize(&self, force_close: bool) -> Vec<u8> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(
@@ -138,7 +129,9 @@ impl HttpRequest {
         for (name, value) in &self.headers {
             if name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("transfer-encoding")
-                || (force_close && name.eq_ignore_ascii_case("connection"))
+                || (force_close
+                    && (name.eq_ignore_ascii_case("connection")
+                        || name.eq_ignore_ascii_case("upgrade")))
             {
                 continue;
             }
@@ -399,7 +392,7 @@ fn authorize_request(
     }
 
     let segments = decode_path_segments(path)?;
-    if segments.len() >= 3 && segments[0] == "containers" {
+    if segments.len() == 3 && segments[0] == "containers" {
         let container_id = snapshot
             .aliases
             .get(&segments[1])
@@ -423,7 +416,7 @@ fn authorize_request(
         return Ok(TargetedAction::Forward);
     }
 
-    if segments.len() >= 3 && segments[0] == "exec" {
+    if segments.len() == 3 && segments[0] == "exec" {
         let container_id = snapshot
             .exec_ids
             .lock()
@@ -580,16 +573,247 @@ async fn relay_authorized(
             return Ok(());
         }
     };
-    let request_upgrade = request.requests_upgrade();
-    engine
-        .write_all(&request.serialize(!request_upgrade && !bidirectional))
-        .await?;
-    if request_upgrade || bidirectional {
-        io::copy_bidirectional(client, &mut engine).await?;
-    } else {
-        io::copy(&mut engine, client).await?;
+    if bidirectional {
+        return relay_exec_stream(client, &mut engine, request).await;
     }
+    engine.write_all(&request.serialize(true)).await?;
+    io::copy(&mut engine, client).await?;
     Ok(())
+}
+
+async fn relay_exec_stream(
+    client: &mut UnixStream,
+    engine: &mut UnixStream,
+    request: &HttpRequest,
+) -> Result<()> {
+    engine.write_all(&request.serialize(false)).await?;
+    let prefix = match read_engine_response_prefix(engine).await {
+        Ok(prefix) => prefix,
+        Err(_) => {
+            write_error(client, 502, "invalid Docker Engine response").await?;
+            return Ok(());
+        }
+    };
+    let upgrade = match inspect_engine_response_head(&prefix) {
+        Ok(head) => head,
+        Err(_) => {
+            write_error(client, 502, "invalid Docker Engine response").await?;
+            return Ok(());
+        }
+    };
+    if upgrade.status == 101 && upgrade.connection_upgrade && upgrade.upgrade_tcp {
+        client.write_all(&prefix).await?;
+        io::copy_bidirectional(client, engine).await?;
+        return Ok(());
+    }
+
+    let response = match collect_engine_response(engine, prefix, &upgrade).await {
+        Ok(response) => response,
+        Err(_) => {
+            write_error(client, 502, "invalid Docker Engine response").await?;
+            return Ok(());
+        }
+    };
+    client.write_all(&response).await?;
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct EngineResponseHead {
+    status: u16,
+    header_end: usize,
+    content_length: Option<usize>,
+    chunked: bool,
+    connection_upgrade: bool,
+    upgrade_tcp: bool,
+}
+
+async fn read_engine_response_prefix(engine: &mut UnixStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(4096);
+    loop {
+        if find_bytes(&bytes, b"\r\n\r\n").is_some() {
+            return Ok(bytes);
+        }
+        if bytes.len() >= MAX_REQUEST_HEADER_BYTES {
+            bail!("Docker Engine response headers are too large");
+        }
+        let mut chunk = [0_u8; 4096];
+        let read = engine.read(&mut chunk).await?;
+        if read == 0 {
+            bail!("Docker Engine response ended before its headers");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn inspect_engine_response_head(raw: &[u8]) -> Result<EngineResponseHead> {
+    let header_end = find_bytes(raw, b"\r\n\r\n")
+        .map(|index| index + 4)
+        .context("missing Docker response headers")?;
+    if header_end > MAX_REQUEST_HEADER_BYTES {
+        bail!("Docker Engine response headers are too large");
+    }
+    let head = std::str::from_utf8(&raw[..header_end - 4])?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().context("missing Docker response status")?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts.next().unwrap_or_default();
+    let status = status_parts
+        .next()
+        .context("missing Docker response status")?
+        .parse::<u16>()?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        bail!("invalid Docker response version");
+    }
+
+    let mut content_length = None;
+    let mut chunked = false;
+    let mut connection_upgrade = false;
+    let mut upgrade_tcp = false;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .context("invalid Docker response header")?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                bail!("duplicate Docker response content length");
+            }
+            content_length = Some(value.parse::<usize>()?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            if chunked {
+                bail!("duplicate Docker response transfer encoding");
+            }
+            chunked = value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+            if !chunked {
+                bail!("unsupported Docker response transfer encoding");
+            }
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_upgrade |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            upgrade_tcp |= value.eq_ignore_ascii_case("tcp");
+        }
+    }
+    if chunked && content_length.is_some() {
+        bail!("ambiguous Docker response framing");
+    }
+    if content_length.unwrap_or(0) > MAX_BUFFERED_ENGINE_RESPONSE_BYTES {
+        bail!("Docker Engine response is too large");
+    }
+    Ok(EngineResponseHead {
+        status,
+        header_end,
+        content_length,
+        chunked,
+        connection_upgrade,
+        upgrade_tcp,
+    })
+}
+
+async fn collect_engine_response(
+    engine: &mut UnixStream,
+    mut bytes: Vec<u8>,
+    head: &EngineResponseHead,
+) -> Result<Vec<u8>> {
+    if let Some(content_length) = head.content_length {
+        let expected = head
+            .header_end
+            .checked_add(content_length)
+            .context("Docker response length overflow")?;
+        if bytes.len() > expected {
+            bail!("pipelined Docker Engine response");
+        }
+        while bytes.len() < expected {
+            read_engine_response_chunk(engine, &mut bytes).await?;
+        }
+        return Ok(bytes);
+    }
+    if head.chunked {
+        loop {
+            if let Some(end) = chunked_message_end(&bytes[head.header_end..])? {
+                let expected = head.header_end + end;
+                if bytes.len() != expected {
+                    bail!("pipelined Docker Engine response");
+                }
+                return Ok(bytes);
+            }
+            read_engine_response_chunk(engine, &mut bytes).await?;
+        }
+    }
+    if (100..200).contains(&head.status) || matches!(head.status, 204 | 304) {
+        if bytes.len() != head.header_end {
+            bail!("unexpected Docker Engine response body");
+        }
+        return Ok(bytes);
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let mut chunk = [0_u8; 8192];
+            let read = engine.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok::<(), anyhow::Error>(());
+            }
+            if bytes.len() + read > MAX_BUFFERED_ENGINE_RESPONSE_BYTES {
+                bail!("Docker Engine response is too large");
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .context("Docker Engine response timed out")??;
+    Ok(bytes)
+}
+
+async fn read_engine_response_chunk(engine: &mut UnixStream, bytes: &mut Vec<u8>) -> Result<()> {
+    let mut chunk = [0_u8; 8192];
+    let read = engine.read(&mut chunk).await?;
+    if read == 0 {
+        bail!("Docker Engine response ended early");
+    }
+    if bytes.len() + read > MAX_BUFFERED_ENGINE_RESPONSE_BYTES {
+        bail!("Docker Engine response is too large");
+    }
+    bytes.extend_from_slice(&chunk[..read]);
+    Ok(())
+}
+
+fn chunked_message_end(encoded: &[u8]) -> Result<Option<usize>> {
+    let mut offset = 0;
+    loop {
+        let Some(relative_line_end) = find_bytes(&encoded[offset..], b"\r\n") else {
+            return Ok(None);
+        };
+        let line_end = offset + relative_line_end;
+        let size_line = std::str::from_utf8(&encoded[offset..line_end])?;
+        let size =
+            usize::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)?;
+        offset = line_end + 2;
+        if size == 0 {
+            if encoded[offset..].starts_with(b"\r\n") {
+                return Ok(Some(offset + 2));
+            }
+            let Some(trailer_end) = find_bytes(&encoded[offset..], b"\r\n\r\n") else {
+                return Ok(None);
+            };
+            return Ok(Some(offset + trailer_end + 4));
+        }
+        let Some(chunk_end) = offset.checked_add(size) else {
+            bail!("Docker response chunk overflow");
+        };
+        if chunk_end + 2 > encoded.len() {
+            return Ok(None);
+        }
+        if &encoded[chunk_end..chunk_end + 2] != b"\r\n" {
+            bail!("invalid Docker response chunk");
+        }
+        offset = chunk_end + 2;
+    }
 }
 
 async fn engine_request_collect(endpoint: &Path, request: &HttpRequest) -> Result<Vec<u8>> {
@@ -729,25 +953,28 @@ async fn write_json(stream: &mut UnixStream, status: u16, body: &[u8]) -> Result
     Ok(())
 }
 
-async fn resolve_target_snapshot(endpoint: &Path, grants: &[DockerTargetGrant]) -> TargetSnapshot {
+async fn resolve_target_snapshot(
+    endpoint: &Path,
+    grants: &[DockerTargetGrant],
+) -> Result<TargetSnapshot> {
     let request = synthetic_get("/containers/json?all=1");
-    let Ok(Ok(raw)) = tokio::time::timeout(
+    let raw = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         engine_request_collect(endpoint, &request),
     )
     .await
-    else {
-        return TargetSnapshot::default();
-    };
-    let Ok(response) = parse_engine_response(&raw) else {
-        return TargetSnapshot::default();
-    };
+    .context("Docker target snapshot timed out")?
+    .context("Docker target snapshot request failed")?;
+    let response =
+        parse_engine_response(&raw).context("invalid Docker target snapshot response")?;
     if !(200..300).contains(&response.status) {
-        return TargetSnapshot::default();
+        bail!(
+            "Docker target snapshot failed with Engine status {}",
+            response.status
+        );
     }
-    let Ok(summaries) = serde_json::from_slice::<Vec<Value>>(&response.body) else {
-        return TargetSnapshot::default();
-    };
+    let summaries = serde_json::from_slice::<Vec<Value>>(&response.body)
+        .context("invalid Docker target snapshot payload")?;
 
     let mut snapshot = TargetSnapshot::default();
     for summary in summaries {
@@ -806,7 +1033,7 @@ async fn resolve_target_snapshot(endpoint: &Path, grants: &[DockerTargetGrant]) 
             }
         }
     }
-    snapshot
+    Ok(snapshot)
 }
 
 fn synthetic_get(target: &str) -> HttpRequest {
@@ -1023,6 +1250,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1196,6 +1425,237 @@ mod tests {
         String::from_utf8(response).unwrap()
     }
 
+    #[tokio::test]
+    async fn targeted_non_streaming_routes_cannot_be_promoted_to_a_tunnel() {
+        let root = TempDir::new().unwrap();
+        let engine_path = root.path().join("engine.sock");
+        let engine = UnixListener::bind(&engine_path).unwrap();
+        let engine_task = tokio::spawn(async move {
+            let (mut stream, _) = engine.accept().await.unwrap();
+            let mut first = vec![0_u8; 4096];
+            let first_len = stream.read(&mut first).await.unwrap();
+            first.truncate(first_len);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK",
+                )
+                .await
+                .unwrap();
+            let mut second = vec![0_u8; 4096];
+            let second_len =
+                tokio::time::timeout(Duration::from_millis(300), stream.read(&mut second))
+                    .await
+                    .ok()
+                    .transpose()
+                    .unwrap()
+                    .unwrap_or(0);
+            second.truncate(second_len);
+            (first, second)
+        });
+
+        let (mut client, mut broker_side) = UnixStream::pair().unwrap();
+        let snapshot = Arc::new(super::TargetSnapshot::default());
+        let handler = tokio::spawn({
+            let endpoint = engine_path.clone();
+            let snapshot = Arc::clone(&snapshot);
+            async move {
+                super::handle_targeted_connection(&mut broker_side, &endpoint, &snapshot)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        client
+            .write_all(
+                b"GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 512];
+        let response_len = tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response[..response_len].ends_with(b"\r\n\r\nOK"));
+        let _ = client
+            .write_all(
+                b"POST /containers/create HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        let _ = client.shutdown().await;
+
+        let (first, second) = engine_task.await.unwrap();
+        let first = String::from_utf8(first).unwrap();
+        assert!(first.contains("Connection: close\r\n"));
+        assert!(!first.to_ascii_lowercase().contains("upgrade:"));
+        assert!(
+            second.is_empty(),
+            "a second Docker request crossed the broker"
+        );
+        handler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_exec_streams_do_not_become_docker_tunnels() {
+        let root = TempDir::new().unwrap();
+        let engine_path = root.path().join("engine.sock");
+        let engine = UnixListener::bind(&engine_path).unwrap();
+        let engine_task = tokio::spawn(async move {
+            let (mut stream, _) = engine.accept().await.unwrap();
+            let mut first = vec![0_u8; 4096];
+            let first_len = stream.read(&mut first).await.unwrap();
+            first.truncate(first_len);
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\ndenied",
+                )
+                .await
+                .unwrap();
+            let mut second = vec![0_u8; 4096];
+            let second_len =
+                tokio::time::timeout(Duration::from_millis(300), stream.read(&mut second))
+                    .await
+                    .ok()
+                    .transpose()
+                    .unwrap()
+                    .unwrap_or(0);
+            second.truncate(second_len);
+            (first, second)
+        });
+
+        let mut snapshot = super::TargetSnapshot::default();
+        snapshot.containers.insert(
+            "container-id".to_string(),
+            super::AllowedContainer {
+                operations: [DockerOperation::Exec].into_iter().collect(),
+            },
+        );
+        snapshot
+            .exec_ids
+            .lock()
+            .unwrap()
+            .insert("ours".to_string(), "container-id".to_string());
+        let snapshot = Arc::new(snapshot);
+        let (mut client, mut broker_side) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn({
+            let endpoint = engine_path.clone();
+            let snapshot = Arc::clone(&snapshot);
+            async move {
+                super::handle_targeted_connection(&mut broker_side, &endpoint, &snapshot)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        client
+            .write_all(
+                b"POST /v1.52/exec/ours/start HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"Detach\":false}",
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 512];
+        let response_len = tokio::time::timeout(Duration::from_secs(1), client.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response[..response_len].starts_with(b"HTTP/1.1 403"));
+        let _ = client
+            .write_all(
+                b"POST /containers/create HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        let _ = client.shutdown().await;
+
+        let (first, second) = engine_task.await.unwrap();
+        assert!(
+            String::from_utf8(first)
+                .unwrap()
+                .contains("/exec/ours/start")
+        );
+        assert!(
+            second.is_empty(),
+            "a rejected exec exposed the Docker tunnel"
+        );
+        handler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorized_exec_streams_require_a_valid_engine_upgrade() {
+        let root = TempDir::new().unwrap();
+        let engine_path = root.path().join("engine.sock");
+        let engine = UnixListener::bind(&engine_path).unwrap();
+        let engine_task = tokio::spawn(async move {
+            let (mut stream, _) = engine.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let request_len = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..request_len]).contains("/exec/ours/start"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\nengine-ready",
+                )
+                .await
+                .unwrap();
+            let mut client_bytes = [0_u8; 11];
+            stream.read_exact(&mut client_bytes).await.unwrap();
+            assert_eq!(&client_bytes, b"client-data");
+            stream.write_all(b"engine-data").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut snapshot = super::TargetSnapshot::default();
+        snapshot.containers.insert(
+            "container-id".to_string(),
+            super::AllowedContainer {
+                operations: [DockerOperation::Exec].into_iter().collect(),
+            },
+        );
+        snapshot
+            .exec_ids
+            .lock()
+            .unwrap()
+            .insert("ours".to_string(), "container-id".to_string());
+        let snapshot = Arc::new(snapshot);
+        let (mut client, mut broker_side) = UnixStream::pair().unwrap();
+        let handler = tokio::spawn({
+            let endpoint = engine_path.clone();
+            let snapshot = Arc::clone(&snapshot);
+            async move {
+                super::handle_targeted_connection(&mut broker_side, &endpoint, &snapshot)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        client
+            .write_all(
+                b"POST /v1.52/exec/ours/start HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"Detach\":false}",
+            )
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut response = Vec::new();
+            while !response.ends_with(b"engine-ready") {
+                let mut chunk = [0_u8; 256];
+                let read = client.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "exec upgrade ended before its first stream bytes");
+                response.extend_from_slice(&chunk[..read]);
+            }
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 101 UPGRADED"));
+        assert!(response.ends_with(b"engine-ready"));
+        client.write_all(b"client-data").await.unwrap();
+        let mut engine_bytes = [0_u8; 11];
+        client.read_exact(&mut engine_bytes).await.unwrap();
+        assert_eq!(&engine_bytes, b"engine-data");
+        client.shutdown().await.unwrap();
+
+        engine_task.await.unwrap();
+        handler.await.unwrap();
+    }
+
     #[test]
     fn buffered_engine_responses_decode_chunked_json() {
         let response = super::parse_engine_response(
@@ -1328,8 +1788,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn targeted_routes_require_exact_path_shapes() {
+        let mut snapshot = super::TargetSnapshot::default();
+        snapshot.containers.insert(
+            "container-id".to_string(),
+            super::AllowedContainer {
+                operations: DockerOperation::ALL.iter().copied().collect(),
+            },
+        );
+        snapshot
+            .aliases
+            .insert("api".to_string(), "container-id".to_string());
+        snapshot
+            .exec_ids
+            .lock()
+            .unwrap()
+            .insert("ours".to_string(), "container-id".to_string());
+
+        for (method, target, body) in [
+            ("GET", "/v1.52/containers/api/json/suffix", b"".as_slice()),
+            ("GET", "/v1.52/containers/api/json/", b"".as_slice()),
+            (
+                "GET",
+                "/v1.52/containers/api/%6a%73%6f%6e/suffix",
+                b"".as_slice(),
+            ),
+            (
+                "POST",
+                "/v1.52/exec/ours/start/suffix",
+                br#"{"Detach":false}"#.as_slice(),
+            ),
+            ("GET", "/v1.52/exec/ours/json/suffix", b"".as_slice()),
+        ] {
+            assert_eq!(
+                super::authorize_request(&snapshot, &request(method, target, body)).unwrap_err(),
+                super::AuthorizationError::Forbidden,
+                "expected exact route rejection for {method} {target}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn target_snapshot_ignores_non_success_engine_responses() {
+    async fn targeted_broker_fails_closed_when_snapshot_discovery_fails() {
         const CONTAINER_ID: &str =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1337,26 +1838,16 @@ mod tests {
         let engine_path = root.path().join("engine.sock");
         let engine = UnixListener::bind(&engine_path).unwrap();
         let engine_task = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = engine.accept().await.unwrap();
-                let mut request = vec![0_u8; 4096];
-                let read = stream.read(&mut request).await.unwrap();
-                let first_line = String::from_utf8_lossy(&request[..read])
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .to_string();
-                let body = if first_line.contains("/containers/json") {
-                    format!(r#"[{{"Id":"{CONTAINER_ID}","Names":["/api"]}}]"#)
-                } else {
-                    r#"{"HostConfig":{},"Mounts":[]}"#.to_string()
-                };
-                let response = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
+            let (mut stream, _) = engine.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("/containers/json"));
+            let body = format!(r#"[{{"Id":"{CONTAINER_ID}","Names":["/api"]}}]"#);
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
         });
         let grant = DockerTargetGrant {
             selector: DockerTargetSelector::ContainerName {
@@ -1366,10 +1857,18 @@ mod tests {
             allow_unsafe_target: false,
         };
 
-        let snapshot = super::resolve_target_snapshot(&engine_path, &[grant]).await;
+        let policy = DockerAccessPolicy::Targeted {
+            endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
+            targets: vec![grant],
+        };
+        let error = match DockerBroker::start(&policy).await {
+            Err(error) => error,
+            Ok(_) => panic!("targeted broker accepted a failed Engine snapshot"),
+        };
 
-        assert!(snapshot.containers.is_empty());
-        engine_task.abort();
+        assert!(error.to_string().contains("Docker target snapshot"));
+        assert!(!error.to_string().contains(CONTAINER_ID));
+        engine_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1414,8 +1913,12 @@ mod tests {
             allow_unsafe_target,
         };
 
-        let denied = super::resolve_target_snapshot(&engine_path, &[grant(false)]).await;
-        let accepted = super::resolve_target_snapshot(&engine_path, &[grant(true)]).await;
+        let denied = super::resolve_target_snapshot(&engine_path, &[grant(false)])
+            .await
+            .unwrap();
+        let accepted = super::resolve_target_snapshot(&engine_path, &[grant(true)])
+            .await
+            .unwrap();
 
         assert!(denied.containers.is_empty());
         assert!(accepted.containers.contains_key(CONTAINER_ID));
