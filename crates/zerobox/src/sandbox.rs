@@ -23,7 +23,7 @@ use zerobox_utils_absolute_path::AbsolutePathBuf;
 #[cfg(unix)]
 use crate::docker_broker::DockerBroker;
 #[cfg(target_os = "linux")]
-use crate::dynamic_fs::DynamicDenyMounts;
+use crate::dynamic_fs::{DynamicDenyMounts, dynamic_deny_mount_roots};
 #[cfg(target_os = "linux")]
 use crate::linux_runtime::LinuxRuntime;
 use crate::proxy;
@@ -591,7 +591,9 @@ impl Sandbox {
                 .map(Path::to_path_buf)
                 .or_else(|| std::env::current_exe().ok())
                 .ok_or_else(|| anyhow::anyhow!("cannot determine Linux sandbox helper"))?;
-            let runtime = LinuxRuntime::create(&cwd, &allow_write, &helper_source)?;
+            let runtime_exclusions =
+                linux_runtime_exclusions(&cwd, &allow_write, &deny_read_globs, &deny_write_globs)?;
+            let runtime = LinuxRuntime::create(&cwd, &runtime_exclusions, &helper_source)?;
             deny_read.push(runtime.parent().to_path_buf());
             deny_write.push(runtime.parent().to_path_buf());
             Some(runtime)
@@ -1347,6 +1349,24 @@ fn ensure_private_proxy_directory(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_runtime_exclusions(
+    cwd: &Path,
+    allow_write: &[PathBuf],
+    deny_read_globs: &[String],
+    deny_write_globs: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut exclusions = allow_write.to_vec();
+    exclusions.extend(dynamic_deny_mount_roots(
+        cwd,
+        deny_read_globs,
+        deny_write_globs,
+    )?);
+    exclusions.sort();
+    exclusions.dedup();
+    Ok(exclusions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2403,6 +2423,28 @@ mod tests {
         assert_eq!(sandbox.deny_read_globs, vec!["*.pem"]);
         assert_eq!(sandbox.deny_write, vec![p("literal?.log")]);
         assert_eq!(sandbox.deny_write_globs, vec!["logs/**"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_runtime_exclusions_include_dynamic_deny_mount_roots() {
+        let cwd = tempfile::tempdir().expect("create cwd");
+        let writable = tempfile::tempdir().expect("create writable root");
+        let absolute_deny = tempfile::tempdir().expect("create absolute deny root");
+        let deny_read_globs = vec![format!("{}/**", absolute_deny.path().display())];
+        let deny_write_globs = vec!["*.pem".to_string()];
+
+        let exclusions = linux_runtime_exclusions(
+            cwd.path(),
+            &[writable.path().to_path_buf()],
+            &deny_read_globs,
+            &deny_write_globs,
+        )
+        .expect("derive runtime exclusions");
+
+        assert!(exclusions.contains(&writable.path().to_path_buf()));
+        assert!(exclusions.contains(&cwd.path().canonicalize().unwrap()));
+        assert!(exclusions.contains(&absolute_deny.path().canonicalize().unwrap()));
     }
 
     #[test]

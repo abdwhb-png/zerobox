@@ -140,6 +140,29 @@ impl DynamicDenyPolicy {
     }
 }
 
+pub(crate) fn dynamic_deny_mount_roots(
+    cwd: &Path,
+    deny_read: &[String],
+    deny_write: &[String],
+) -> Result<Vec<PathBuf>> {
+    if deny_read.is_empty() && deny_write.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !cwd.is_absolute() {
+        bail!("dynamic deny glob root must be absolute: {}", cwd.display());
+    }
+    let canonical_cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("failed to canonicalize dynamic deny root {}", cwd.display()))?;
+    let mut roots = deny_read
+        .iter()
+        .chain(deny_write)
+        .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern).map(|entry| entry.mount_root))
+        .collect::<Result<Vec<_>>>()?;
+    roots.sort_by_key(|path| path.components().count());
+    roots.dedup();
+    Ok(roots)
+}
+
 fn compile_pattern(cwd: &Path, canonical_cwd: &Path, source: &str) -> Result<CompiledPattern> {
     if source.is_empty() {
         bail!("dynamic deny glob must not be empty");
