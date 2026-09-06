@@ -1,0 +1,30 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -788,5 +788,27 @@
+         });
+     }
+ }
+ 
++struct BridgeConnectionPermit {
++    active: Arc<AtomicUsize>,
++}
++
++impl Drop for BridgeConnectionPermit {
++    fn drop(&mut self) {
++        self.active.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++fn try_acquire_bridge_connection(
++    active: Arc<AtomicUsize>,
++    limit: usize,
++) -> Option<BridgeConnectionPermit> {
++    active
++        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
++            (current < limit).then_some(current + 1)
++        })
++        .ok()?;
++    Some(BridgeConnectionPermit { active })
++}
++
+ fn receive_unix_stream(control: &UnixStream) -> io::Result<Option<UnixStream>> {

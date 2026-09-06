@@ -425,6 +425,18 @@ if [ -f "$DOCKER_BROKER_HIDDEN_ROUTE_PATCH" ]; then
     patch --fuzz=0 -p0 < "$DOCKER_BROKER_HIDDEN_ROUTE_PATCH"
 fi
 
+DOCKER_BROKER_RESOURCE_LIMITS_PATCH="$SCRIPT_DIR/upstream-docker-broker-resource-limits.patch"
+if [ -f "$DOCKER_BROKER_RESOURCE_LIMITS_PATCH" ]; then
+    echo "    docker-broker-resource-limits"
+    patch --fuzz=0 -p0 < "$DOCKER_BROKER_RESOURCE_LIMITS_PATCH"
+fi
+
+DOCKER_BROKER_CONNECTION_PERMIT_PATCH="$SCRIPT_DIR/upstream-docker-broker-connection-permit.patch"
+if [ -f "$DOCKER_BROKER_CONNECTION_PERMIT_PATCH" ]; then
+    echo "    docker-broker-connection-permit"
+    git apply -p0 "$DOCKER_BROKER_CONNECTION_PERMIT_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \

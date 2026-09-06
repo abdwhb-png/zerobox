@@ -41,7 +41,7 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 
 - Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`
 - Codex rust shim baseline: `rust-v0.131.0-alpha.22` at commit `9b8cf56cdefb09f54564ccc295fd42f6647f558f`
-- Version identity for this fork: `0.3.3-fork.9` (Python: `0.3.3+fork.9`)
+- Version identity for this fork: `0.3.3-fork.10` (Python: `0.3.3+fork.10`)
 
 ## Build and usage (local Linux / WSL2 only)
 
@@ -245,7 +245,11 @@ namespace as a loopback `DOCKER_HOST`.
 container name or Compose project/service labels and permits only `ps`,
 `inspect`, `logs`, `stats`, `exec`, `start`, `stop`, and `restart`. Discovery
 is filtered, unknown targets return 404, disallowed operations return 403, and
-detached or privileged exec is rejected. Containers with privileged mode,
+exec-create requests with `Privileged: true`, `Detach: true`, or non-null
+`DetachKeys` are rejected; exec-start requests with `Detach: true` or
+`Privileged: true` are also rejected. Attached exec commands can still launch
+background processes inside the target container, so the broker does not
+guarantee process termination when the client disconnects. Containers with privileged mode,
 host namespaces, host bind mounts, runtime sockets, devices, dangerous added
 capabilities, or disabled confinement are excluded unless the trusted grant
 explicitly accepts that unsafe target.

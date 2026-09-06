@@ -27,6 +27,7 @@ const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 struct CompiledPattern {
     matcher: GlobMatcher,
     mount_root: PathBuf,
+    mount_destination: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub(crate) struct DynamicDenyPolicy {
     deny_read: Vec<CompiledPattern>,
     deny_write: Vec<CompiledPattern>,
     mount_roots: Vec<PathBuf>,
+    mount_destinations: Vec<PathBuf>,
     base_policy: FileSystemSandboxPolicy,
     cwd: PathBuf,
 }
@@ -66,37 +68,49 @@ impl DynamicDenyPolicy {
             bail!("dynamic deny glob root must be absolute: {}", cwd.display());
         }
 
+        let canonical_cwd = std::fs::canonicalize(cwd).with_context(|| {
+            format!("failed to canonicalize dynamic deny root {}", cwd.display())
+        })?;
         let deny_read = deny_read
             .iter()
-            .map(|pattern| compile_pattern(cwd, pattern))
+            .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
             .collect::<Result<Vec<_>>>()?;
         let deny_write = deny_write
             .iter()
-            .map(|pattern| compile_pattern(cwd, pattern))
+            .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
             .collect::<Result<Vec<_>>>()?;
         let mut mount_roots = deny_read
             .iter()
             .chain(&deny_write)
-            .map(|pattern| pattern.mount_root.clone())
+            .map(|pattern| {
+                (
+                    pattern.mount_root.clone(),
+                    pattern.mount_destination.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        mount_roots.sort_by_key(|path| path.components().count());
-        let mut minimal_roots = Vec::<PathBuf>::new();
-        for root in mount_roots {
+        mount_roots.sort_by_key(|(path, _)| path.components().count());
+        let mut minimal_roots = Vec::<(PathBuf, PathBuf)>::new();
+        for (root, destination) in mount_roots {
             if minimal_roots
                 .iter()
-                .any(|existing| root.starts_with(existing))
+                .any(|(existing_root, existing_destination)| {
+                    root.starts_with(existing_root) && destination.starts_with(existing_destination)
+                })
             {
                 continue;
             }
-            minimal_roots.push(root);
+            minimal_roots.push((root, destination));
         }
+        let (mount_roots, mount_destinations) = minimal_roots.into_iter().unzip();
 
         Ok(Some(Self {
             deny_read,
             deny_write,
-            mount_roots: minimal_roots,
+            mount_roots,
+            mount_destinations,
             base_policy,
-            cwd: cwd.to_path_buf(),
+            cwd: canonical_cwd,
         }))
     }
 
@@ -126,7 +140,7 @@ impl DynamicDenyPolicy {
     }
 }
 
-fn compile_pattern(cwd: &Path, source: &str) -> Result<CompiledPattern> {
+fn compile_pattern(cwd: &Path, canonical_cwd: &Path, source: &str) -> Result<CompiledPattern> {
     if source.is_empty() {
         bail!("dynamic deny glob must not be empty");
     }
@@ -135,27 +149,38 @@ fn compile_pattern(cwd: &Path, source: &str) -> Result<CompiledPattern> {
     }
 
     let expanded = expand_home(source)?;
+    if has_parent_component(Path::new(&expanded)) {
+        bail!("dynamic deny glob must not contain '..': {source:?}");
+    }
     let relative = !Path::new(&expanded).is_absolute();
     let anchored = if relative {
-        if has_parent_component(Path::new(&expanded)) {
-            bail!("dynamic deny glob must not contain '..': {source:?}");
-        }
         let pattern = if expanded.contains('/') {
             expanded
         } else {
             format!("**/{expanded}")
         };
-        cwd.join(pattern)
+        canonical_cwd.join(pattern)
     } else {
         PathBuf::from(expanded)
     };
-    let anchored = normalize_pattern_path(&anchored)?;
-    let pattern = anchored.to_string_lossy().into_owned();
-    let mount_root = if relative {
-        cwd.to_path_buf()
+    let mut anchored = normalize_pattern_path(&anchored)?;
+    let (mount_root, mount_destination) = if relative {
+        (canonical_cwd.to_path_buf(), cwd.to_path_buf())
     } else {
-        safe_static_prefix(&anchored)?
+        let destination = safe_static_prefix(&anchored)?;
+        let mount_root = std::fs::canonicalize(&destination).with_context(|| {
+            format!(
+                "failed to canonicalize dynamic deny prefix {}",
+                destination.display()
+            )
+        })?;
+        let suffix = anchored.strip_prefix(&destination).map_err(|_| {
+            anyhow::anyhow!("dynamic deny glob prefix mismatch: {}", anchored.display())
+        })?;
+        anchored = mount_root.join(suffix);
+        (mount_root, destination)
     };
+    let pattern = anchored.to_string_lossy().into_owned();
 
     let matcher = GlobBuilder::new(&pattern)
         .literal_separator(true)
@@ -167,6 +192,7 @@ fn compile_pattern(cwd: &Path, source: &str) -> Result<CompiledPattern> {
     Ok(CompiledPattern {
         matcher,
         mount_root,
+        mount_destination,
     })
 }
 
@@ -232,9 +258,13 @@ fn safe_static_prefix(pattern: &Path) -> Result<PathBuf> {
 
 fn matches_any(patterns: &[CompiledPattern], path: &Path) -> bool {
     path.ancestors().any(|candidate| {
-        patterns
-            .iter()
-            .any(|pattern| pattern.matcher.is_match(candidate))
+        patterns.iter().any(|pattern| {
+            pattern.matcher.is_match(candidate) || {
+                let mut directory = candidate.as_os_str().to_os_string();
+                directory.push("/");
+                pattern.matcher.is_match(Path::new(&directory))
+            }
+        })
     })
 }
 
@@ -300,7 +330,12 @@ impl DynamicDenyMounts {
         let mut sessions = Vec::new();
         let mut binds = Vec::new();
 
-        for (index, lower_root) in policy.mount_roots().iter().enumerate() {
+        for (index, (lower_root, destination)) in policy
+            .mount_roots()
+            .iter()
+            .zip(&policy.mount_destinations)
+            .enumerate()
+        {
             let mountpoint = root.path().join(format!("view-{index}"));
             std::fs::create_dir(&mountpoint).with_context(|| {
                 format!("failed to create FUSE mountpoint {}", mountpoint.display())
@@ -327,7 +362,7 @@ impl DynamicDenyMounts {
             sessions.push(session);
             binds.push(DynamicBindMount {
                 source: mountpoint,
-                destination: lower_root.clone(),
+                destination: destination.clone(),
             });
         }
 
@@ -692,16 +727,45 @@ impl GuardedPassthroughFs {
     }
 
     fn stat_path(&self, path: &Path) -> io::Result<libc::stat> {
+        let fd = self.open_metadata_checked(path)?;
+        fstat(fd.as_raw_fd())
+    }
+
+    fn open_metadata_checked(&self, path: &Path) -> io::Result<OwnedFd> {
         self.check_read(path, None)?;
         let fd = self.open_relative(path, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
         let stat = fstat(fd.as_raw_fd())?;
-        if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
-            && let Ok(followed) = self.open_relative(path, libc::O_PATH, 0)
-        {
-            let resolved = Self::resolved_for_fd(followed.as_raw_fd());
+        let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+        self.check_read(path, resolved.as_deref())?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            let target = readlink_fd(fd.as_raw_fd())?;
+            let link = resolved.unwrap_or_else(|| self.absolute_path(path));
+            let target = resolve_symlink_target(&link, &target)?;
+            self.check_read(path, Some(&target))?;
+        }
+        Ok(fd)
+    }
+
+    fn readlink_path(&self, path: &Path) -> io::Result<PathBuf> {
+        let fd = self.open_metadata_checked(path)?;
+        readlink_fd(fd.as_raw_fd())
+    }
+
+    fn access_path(&self, path: &Path, mask: AccessFlags) -> io::Result<()> {
+        let write = mask.contains(AccessFlags::W_OK);
+        if write {
+            self.check_write(path, None)?;
+        } else {
+            self.check_read(path, None)?;
+        }
+        let fd = self.open_relative(path, libc::O_PATH, 0)?;
+        let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+        if write {
+            self.check_write(path, resolved.as_deref())?;
+        } else {
             self.check_read(path, resolved.as_deref())?;
         }
-        Ok(stat)
+        faccessat_empty(fd.as_raw_fd(), mask.bits())
     }
 
     fn attr_for_path(&self, path: &Path, inode: INodeNo) -> io::Result<FileAttr> {
@@ -759,8 +823,7 @@ impl Filesystem for GuardedPassthroughFs {
     fn readlink(&self, _req: &Request, inode: INodeNo, reply: ReplyData) {
         let result = (|| {
             let path = self.path_for_inode(inode)?;
-            self.check_read(&path, None)?;
-            readlinkat(self.lower_fd.as_raw_fd(), &path)
+            self.readlink_path(&path)
         })();
         match result {
             Ok(target) => reply.data(target.as_os_str().as_bytes()),
@@ -895,8 +958,9 @@ impl Filesystem for GuardedPassthroughFs {
     fn opendir(&self, _req: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let result = self.path_for_inode(inode).and_then(|path| {
             self.check_read(&path, None)?;
-            self.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-                .map(drop)
+            let fd = self.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            self.check_read(&path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref())?;
+            Ok(())
         });
         match result {
             Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
@@ -916,6 +980,8 @@ impl Filesystem for GuardedPassthroughFs {
             let path = self.path_for_inode(inode)?;
             self.check_read(&path, None)?;
             let fd = self.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let resolved_directory = Self::resolved_for_fd(fd.as_raw_fd());
+            self.check_read(&path, resolved_directory.as_deref())?;
             let proc_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
             let mut children = std::fs::read_dir(proc_path)?.collect::<io::Result<Vec<_>>>()?;
             children.sort_by_key(|entry| entry.file_name());
@@ -931,9 +997,12 @@ impl Filesystem for GuardedPassthroughFs {
             ];
             for child in children {
                 let child_path = path.join(child.file_name());
+                let resolved_child = resolved_directory
+                    .as_ref()
+                    .map(|directory| directory.join(child.file_name()));
                 if self
                     .policy
-                    .is_read_denied(&self.absolute_path(&child_path), None)
+                    .is_read_denied(&self.absolute_path(&child_path), resolved_child.as_deref())
                 {
                     continue;
                 }
@@ -1212,14 +1281,7 @@ impl Filesystem for GuardedPassthroughFs {
     fn access(&self, _req: &Request, inode: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         let result = (|| {
             let path = self.path_for_inode(inode)?;
-            if mask.contains(AccessFlags::W_OK) {
-                self.check_write(&path, None)?;
-            } else {
-                self.check_read(&path, None)?;
-            }
-            let (parent, name) = self.open_parent(&path)?;
-            cvt(unsafe { libc::faccessat(parent.as_raw_fd(), name.as_ptr(), mask.bits(), 0) })?;
-            Ok(())
+            self.access_path(&path, mask)
         })();
         match result {
             Ok(()) => reply.ok(),
@@ -1343,20 +1405,75 @@ fn pwrite(fd: RawFd, data: &[u8], offset: u64) -> io::Result<usize> {
     }
 }
 
-fn readlinkat(dirfd: RawFd, path: &Path) -> io::Result<PathBuf> {
-    let path = cstring(if path.as_os_str().is_empty() {
-        OsStr::new(".")
-    } else {
-        path.as_os_str()
-    })?;
+fn readlink_fd(fd: RawFd) -> io::Result<PathBuf> {
+    let path = CString::new("").expect("empty path contains no NUL");
     let mut data = vec![0_u8; 4096];
     let count =
-        unsafe { libc::readlinkat(dirfd, path.as_ptr(), data.as_mut_ptr().cast(), data.len()) };
+        unsafe { libc::readlinkat(fd, path.as_ptr(), data.as_mut_ptr().cast(), data.len()) };
     if count < 0 {
         return Err(io::Error::last_os_error());
     }
     data.truncate(count as usize);
     Ok(PathBuf::from(OsStr::from_bytes(&data)))
+}
+
+fn resolve_symlink_target(link: &Path, target: &Path) -> io::Result<PathBuf> {
+    let unresolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link.parent().unwrap_or(Path::new("/")).join(target)
+    };
+    let normalized = normalize_pattern_path(&unresolved)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
+    canonicalize_existing_prefix(&normalized)
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(&prefix) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ENOTDIR)
+                ) =>
+            {
+                let Some(name) = prefix.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_os_string());
+                if !prefix.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn faccessat_empty(fd: RawFd, mask: i32) -> io::Result<()> {
+    let path = CString::new("").expect("empty path contains no NUL");
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            fd,
+            path.as_ptr(),
+            mask,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn sync_fd(fd: RawFd, datasync: bool) -> io::Result<()> {
@@ -1531,6 +1648,31 @@ mod tests {
     }
 
     #[test]
+    fn metadata_via_symlinked_ancestor_checks_the_resolved_path() {
+        let lower = TempDir::new().unwrap();
+        std::fs::create_dir(lower.path().join("secret")).unwrap();
+        std::fs::write(lower.path().join("secret/token"), "secret").unwrap();
+        std::os::unix::fs::symlink("secret", lower.path().join("public")).unwrap();
+        let policy = Arc::new(policy(lower.path(), &["secret/**"], &[]));
+        let filesystem = GuardedPassthroughFs::new(lower.path(), policy).unwrap();
+
+        assert_eq!(
+            filesystem
+                .stat_path(Path::new("public/token"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            filesystem
+                .access_path(Path::new("public/token"), AccessFlags::R_OK)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn broad_absolute_patterns_are_rejected() {
         let root = TempDir::new().unwrap();
         let error = DynamicDenyPolicy::compile(root.path(), &["/**/*.pem".to_string()], &[])
@@ -1548,6 +1690,68 @@ mod tests {
         let policy = policy(root.path(), &[&pattern], &[]);
 
         assert_eq!(policy.mount_roots(), &[area]);
+    }
+
+    #[test]
+    fn symlinked_cwd_patterns_match_the_canonical_lower_root() {
+        let parent = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("project-link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let policy = policy(&link, &["**/*.pem"], &["generated/**"]);
+
+        assert!(policy.is_read_denied(&real.join("nested/key.pem"), None));
+        assert!(policy.is_write_denied(&real.join("generated/out.txt"), None));
+        assert_eq!(policy.mount_roots(), &[real]);
+    }
+
+    #[test]
+    fn absolute_patterns_canonicalize_a_symlinked_static_prefix() {
+        let parent = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("area-link");
+        std::fs::create_dir_all(real.join("private")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pattern = format!("{}/private/**/*.pem", link.display());
+
+        let policy = policy(parent.path(), &[&pattern], &[]);
+
+        assert!(policy.is_read_denied(&real.join("private/nested/key.pem"), None));
+        assert_eq!(policy.mount_roots(), &[real.join("private")]);
+    }
+
+    #[test]
+    fn absolute_patterns_reject_parent_components_after_symlinks() {
+        let parent = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("area-link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pattern = format!("{}/../secret/**", link.display());
+
+        let error = DynamicDenyPolicy::compile(parent.path(), &[pattern], &[])
+            .expect_err("absolute deny globs with '..' must fail closed");
+
+        assert!(error.to_string().contains("must not contain '..'"));
+    }
+
+    #[test]
+    fn dangling_symlink_targets_are_checked_against_read_denies() {
+        let lower = TempDir::new().unwrap();
+        std::fs::create_dir(lower.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink("secret/missing", lower.path().join("public")).unwrap();
+        let policy = Arc::new(policy(lower.path(), &["secret/**"], &[]));
+        let filesystem = GuardedPassthroughFs::new(lower.path(), policy).unwrap();
+
+        assert_eq!(
+            filesystem
+                .readlink_path(Path::new("public"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -1648,11 +1852,16 @@ mod tests {
         let private = TempDir::new().unwrap();
         std::fs::create_dir_all(lower.path().join("generated")).unwrap();
         std::fs::create_dir_all(lower.path().join("private/nested")).unwrap();
+        std::fs::create_dir_all(lower.path().join("secret")).unwrap();
+        std::fs::create_dir_all(lower.path().join("swap")).unwrap();
         std::fs::write(lower.path().join("visible.txt"), "visible").unwrap();
         std::fs::write(lower.path().join("secret.pem"), "secret").unwrap();
         std::fs::write(lower.path().join("private/nested/value.txt"), "private").unwrap();
         std::fs::write(lower.path().join("generated/out.txt"), "generated").unwrap();
+        std::fs::write(lower.path().join("secret/token"), "secret token").unwrap();
+        std::fs::write(lower.path().join("swap/visible"), "visible").unwrap();
         std::os::unix::fs::symlink("secret.pem", lower.path().join("alias.txt")).unwrap();
+        std::os::unix::fs::symlink("secret", lower.path().join("public")).unwrap();
         std::fs::hard_link(
             lower.path().join("secret.pem"),
             lower.path().join("named-hardlink.txt"),
@@ -1661,7 +1870,11 @@ mod tests {
 
         let mounts = DynamicDenyMounts::prepare_in(
             lower.path(),
-            &["*.pem".to_string(), "private".to_string()],
+            &[
+                "*.pem".to_string(),
+                "private".to_string(),
+                "secret/**".to_string(),
+            ],
             &["generated/**".to_string()],
             &FileSystemSandboxPolicy::unrestricted(),
             private.path(),
@@ -1699,6 +1912,20 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(
+            std::fs::read_link(view.join("public")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_dir(view.join("public")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::metadata(view.join("public/token"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
             std::fs::read_to_string(view.join("named-hardlink.txt")).unwrap(),
             "secret"
         );
@@ -1730,6 +1957,20 @@ mod tests {
         assert!(std::fs::rename(view.join("generated/out.txt"), view.join("moved.txt")).is_err());
         assert!(lower.path().join("generated/out.txt").exists());
 
+        std::fs::metadata(view.join("swap")).unwrap();
+        std::fs::rename(lower.path().join("swap"), lower.path().join("old-swap")).unwrap();
+        std::os::unix::fs::symlink("secret", lower.path().join("swap")).unwrap();
+        assert_eq!(
+            std::fs::read_dir(view.join("swap")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::metadata(view.join("swap/token"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
         std::fs::write(lower.path().join("created.pem"), "late secret").unwrap();
         assert_eq!(
             std::fs::read_to_string(view.join("created.pem"))
@@ -1738,5 +1979,84 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(mounts.root().is_dir());
+    }
+
+    #[test]
+    fn mounted_view_enforces_globs_from_a_symlinked_cwd() {
+        let parent = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("project-link");
+        std::fs::create_dir_all(real.join("generated")).unwrap();
+        std::fs::write(real.join("secret.pem"), "secret").unwrap();
+        std::fs::write(real.join("generated/out.txt"), "generated").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            &link,
+            &["**/*.pem".to_string()],
+            &["generated/**".to_string()],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let bind = &mounts.binds()[0];
+
+        assert_eq!(bind.destination, link);
+        assert_eq!(
+            std::fs::read_to_string(bind.source.join("secret.pem"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::write(bind.source.join("generated/out.txt"), "changed")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn mounted_view_enforces_absolute_globs_with_a_symlinked_prefix() {
+        let parent = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("area-link");
+        std::fs::create_dir_all(real.join("private/generated")).unwrap();
+        std::fs::write(real.join("private/key.pem"), "secret").unwrap();
+        std::fs::write(real.join("private/generated/out.txt"), "generated").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let deny_read = format!("{}/private/**/*.pem", link.display());
+        let deny_write = format!("{}/private/generated/**", link.display());
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            parent.path(),
+            &[deny_read],
+            &[deny_write],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let bind = mounts
+            .binds()
+            .iter()
+            .find(|bind| bind.destination == link.join("private"))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(bind.source.join("key.pem"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::write(bind.source.join("generated/out.txt"), "changed")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }
