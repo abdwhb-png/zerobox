@@ -117,6 +117,11 @@ unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 unwrap_used = "deny"
 
+# Keep TDD rebuilds incremental while limiting debug-info disk usage.
+[profile.dev]
+debug = 1
+incremental = true
+
 [profile.dist]
 inherits = "release"
 lto = "thin"
