@@ -25,6 +25,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod arg0;
+#[cfg(unix)]
+mod docker_broker;
 #[cfg(target_os = "linux")]
 mod dynamic_fs;
 #[cfg(unix)]
@@ -40,6 +42,9 @@ pub use sandbox::Sandbox;
 pub use sandbox::SandboxChild;
 pub use sandbox::SandboxOutput;
 pub use sandbox::SandboxSetupError;
+pub use zerobox_protocol::docker::{
+    DockerAccessPolicy, DockerOperation, DockerTargetGrant, DockerTargetSelector, UnixSocketPath,
+};
 
 pub fn zerobox_home() -> std::path::PathBuf {
     let path = std::env::var_os("ZEROBOX_HOME")

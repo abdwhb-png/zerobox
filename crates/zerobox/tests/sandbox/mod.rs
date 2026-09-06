@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod docker;
+#[cfg(target_os = "linux")]
 mod dynamic_globs;
 mod env;
 mod misc;

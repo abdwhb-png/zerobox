@@ -14,9 +14,9 @@ use std::time::Duration;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use clap::{Parser, Subcommand, error::ErrorKind};
-use zerobox::Sandbox;
 #[cfg(target_os = "linux")]
 use zerobox::arg0;
+use zerobox::{DockerAccessPolicy, Sandbox};
 
 #[derive(Parser, Debug)]
 #[command(name = "zerobox", version, about, long_about = None)]
@@ -47,6 +47,10 @@ pub struct Cli {
 
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub deny_net: Option<Vec<String>>,
+
+    /// Effective per-execution Docker policy supplied by a trusted launcher.
+    #[arg(long, hide = true, value_parser = parse_docker_policy)]
+    pub docker_policy: Option<DockerAccessPolicy>,
 
     #[arg(long, short = 'A')]
     pub allow_all: bool,
@@ -137,6 +141,10 @@ pub enum SnapshotAction {
         #[arg(long, default_value = "30")]
         older_than: u64,
     },
+}
+
+fn parse_docker_policy(value: &str) -> Result<DockerAccessPolicy, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid Docker policy JSON: {error}"))
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> ExitCode {
@@ -349,6 +357,9 @@ async fn tokio_main(
     }
     if let Some(ref domains) = cli.deny_net {
         sandbox = sandbox.deny_net(domains);
+    }
+    if let Some(ref docker_policy) = cli.docker_policy {
+        sandbox = sandbox.docker_access(docker_policy.clone());
     }
 
     for pair in &cli.set_env {
@@ -858,5 +869,22 @@ mod tests {
 
         assert_eq!(cli.deny_read_glob, vec!["**/*.{pem,key}"]);
         assert_eq!(cli.deny_write_glob, vec!["build/{debug,release}/**"]);
+    }
+
+    #[test]
+    fn docker_policy_cli_accepts_the_private_json_contract() {
+        let cli = Cli::try_parse_from([
+            "zerobox",
+            "--docker-policy",
+            r#"{"mode":"full","endpoint":"unix:///var/run/docker.sock"}"#,
+            "--",
+            "/bin/true",
+        ])
+        .expect("parse Docker policy");
+
+        assert!(matches!(
+            cli.docker_policy,
+            Some(zerobox::DockerAccessPolicy::Full { .. })
+        ));
     }
 }

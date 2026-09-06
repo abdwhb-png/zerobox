@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::process::Child;
 use zerobox_protocol::config_types::WindowsSandboxLevel;
+use zerobox_protocol::docker::DockerAccessPolicy;
 use zerobox_protocol::models::PermissionProfile;
 use zerobox_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
@@ -19,6 +20,8 @@ use zerobox_sandboxing::{
 };
 use zerobox_utils_absolute_path::AbsolutePathBuf;
 
+#[cfg(unix)]
+use crate::docker_broker::DockerBroker;
 #[cfg(target_os = "linux")]
 use crate::dynamic_fs::DynamicDenyMounts;
 use crate::proxy;
@@ -28,7 +31,20 @@ pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", 
 const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
 const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
-const RESERVED_CHILD_ENV_KEYS: &[&str] = &["ZEROBOX_HOME", "CODEX_HOME", PRIVATE_BIND_MOUNTS_ENV];
+const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
+const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
+const DOCKER_CONNECTION_ENV_KEYS: &[&str] = &[
+    DOCKER_HOST_ENV,
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+];
+const RESERVED_CHILD_ENV_KEYS: &[&str] = &[
+    "ZEROBOX_HOME",
+    "CODEX_HOME",
+    PRIVATE_BIND_MOUNTS_ENV,
+    DOCKER_BROKER_SOCKET_ENV,
+];
 
 pub struct SandboxOutput {
     pub status: ExitStatus,
@@ -121,6 +137,7 @@ pub struct Sandbox {
     full_write: bool,
     allow_net: Option<Vec<String>>,
     deny_net: Vec<String>,
+    docker_access: Option<DockerAccessPolicy>,
     secrets: Vec<(String, String)>,
     secret_hosts: Vec<(String, String)>,
     disabled: bool,
@@ -151,6 +168,7 @@ impl Sandbox {
             full_write: false,
             allow_net: None,
             deny_net: Vec::new(),
+            docker_access: None,
             secrets: Vec::new(),
             secret_hosts: Vec::new(),
             disabled: false,
@@ -256,6 +274,12 @@ impl Sandbox {
 
     pub fn allow_net_all(mut self) -> Self {
         self.allow_net = Some(Vec::new());
+        self
+    }
+
+    /// Route Docker Engine access through a per-execution broker.
+    pub fn docker_access(mut self, policy: DockerAccessPolicy) -> Self {
+        self.docker_access = Some(policy);
         self
     }
 
@@ -444,6 +468,7 @@ impl Sandbox {
             mut full_write,
             mut allow_net,
             mut deny_net,
+            mut docker_access,
             mut secrets,
             mut secret_hosts,
             mut disabled,
@@ -481,6 +506,7 @@ impl Sandbox {
                     &mut full_write,
                     &mut allow_net,
                     &mut deny_net,
+                    &mut docker_access,
                     &mut env,
                     &mut allow_env,
                     &mut deny_env,
@@ -490,6 +516,15 @@ impl Sandbox {
                     &mut full_access,
                 );
             }
+        }
+
+        let docker_access = docker_access.unwrap_or_default();
+        if !disabled
+            && let Some(endpoint) = docker_access.endpoint()
+            && let endpoint = canonicalize_docker_endpoint_for_deny(endpoint.as_path())
+            && !deny_read.iter().any(|path| path == &endpoint)
+        {
+            deny_read.push(endpoint);
         }
 
         validate_sandbox_configuration(effective_strict, disabled, full_access)?;
@@ -521,13 +556,18 @@ impl Sandbox {
 
         let strict_path =
             select_strict_path(effective_strict, env.get("PATH").map(String::as_str))?;
-        let child_env = finalize_child_env(
+        let mut child_env = finalize_child_env(
             build_env(inherit_env, allow_env.as_deref(), &deny_env, &env),
             secret_store.get_env_overrides(),
             strict_path.as_deref(),
         );
 
+        if !disabled {
+            remove_docker_connection_env(&mut child_env);
+        }
+
         let net_enabled = allow_net.is_some() || !secret_store.is_empty();
+        let docker_enabled = !disabled && !matches!(docker_access, DockerAccessPolicy::Disabled);
         let has_dynamic_denies = !deny_read_globs.is_empty() || !deny_write_globs.is_empty();
         let (sandbox_type, use_legacy_landlock) =
             if disabled || (full_access && !has_dynamic_denies) {
@@ -535,6 +575,29 @@ impl Sandbox {
             } else {
                 select_sandbox_type(effective_strict)?
             };
+
+        if docker_enabled && sandbox_type != SandboxType::LinuxSeccomp {
+            return Err(
+                anyhow::anyhow!("Docker access requires the Linux bubblewrap sandbox").into(),
+            );
+        }
+
+        #[cfg(unix)]
+        let docker_broker = if docker_enabled {
+            DockerBroker::start(&docker_access).await?
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let docker_broker: Option<()> = if docker_enabled {
+            return Err(anyhow::anyhow!("Docker access is supported only on Unix").into());
+        } else {
+            None
+        };
+
+        if docker_broker.is_some() {
+            child_env.insert(DOCKER_HOST_ENV.to_string(), "tcp://127.0.0.1:1".to_string());
+        }
 
         #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
@@ -598,7 +661,7 @@ impl Sandbox {
             anyhow::bail!("dynamic deny globs are supported only on Linux");
         };
 
-        let net_policy = if net_enabled {
+        let net_policy = if net_enabled || docker_broker.is_some() {
             NetworkSandboxPolicy::Enabled
         } else {
             NetworkSandboxPolicy::Restricted
@@ -617,7 +680,8 @@ impl Sandbox {
             None => None,
         };
 
-        let proxy_root = if proxy.is_some() && sandbox_type == SandboxType::LinuxSeccomp {
+        let managed_network = proxy.is_some() || docker_broker.is_some();
+        let proxy_root = if managed_network && sandbox_type == SandboxType::LinuxSeccomp {
             Some(PrivateProxyRoot::create()?)
         } else {
             None
@@ -639,7 +703,7 @@ impl Sandbox {
                 },
                 permissions: &permissions,
                 sandbox: sandbox_type,
-                enforce_managed_network: proxy.is_some(),
+                enforce_managed_network: managed_network,
                 network: proxy.as_ref(),
                 proxy_root: proxy_root.as_ref().map(PrivateProxyRoot::path),
                 setup_status_fd: setup_channel.as_ref().map(PrivateSetupChannel::write_fd),
@@ -705,6 +769,12 @@ impl Sandbox {
             cmd.env(PRIVATE_BIND_MOUNTS_ENV, serialized);
         }
 
+        #[cfg(unix)]
+        if let Some(docker_broker) = docker_broker.as_ref() {
+            cmd.env(DOCKER_BROKER_SOCKET_ENV, docker_broker.socket_path());
+            cmd.env(DOCKER_HOST_ENV, "tcp://127.0.0.1:1");
+        }
+
         Ok(PreparedCommand {
             cmd,
             resources: ManagedExecutionResources {
@@ -714,6 +784,7 @@ impl Sandbox {
                 setup_channel,
                 _target_env_file: target_env_file,
                 _dynamic_fs: dynamic_fs,
+                _docker_broker: docker_broker,
             },
         })
     }
@@ -729,6 +800,10 @@ struct ManagedExecutionResources {
     _dynamic_fs: Option<DynamicDenyMounts>,
     #[cfg(not(target_os = "linux"))]
     _dynamic_fs: Option<()>,
+    #[cfg(unix)]
+    _docker_broker: Option<DockerBroker>,
+    #[cfg(not(unix))]
+    _docker_broker: Option<()>,
 }
 
 impl ManagedExecutionResources {
@@ -739,6 +814,7 @@ impl ManagedExecutionResources {
             && self.setup_channel.is_none()
             && self._target_env_file.is_none()
             && self._dynamic_fs.is_none()
+            && self._docker_broker.is_none()
     }
 }
 
@@ -1448,6 +1524,7 @@ fn apply_profile(
     full_write: &mut bool,
     allow_net: &mut Option<Vec<String>>,
     deny_net: &mut Vec<String>,
+    docker_access: &mut Option<DockerAccessPolicy>,
     env: &mut HashMap<String, String>,
     allow_env: &mut Option<Vec<String>>,
     deny_env: &mut Vec<String>,
@@ -1498,6 +1575,9 @@ fn apply_profile(
     merge_strings(deny_env, &profile.deny_env);
     merge_optional_strings(allow_net, &profile.allow_net);
     merge_optional_strings(allow_env, &profile.allow_env);
+    if docker_access.is_none() {
+        *docker_access = profile.docker.clone();
+    }
 
     if let Some(ref profile_env) = profile.set_env {
         for (k, v) in profile_env {
@@ -1627,6 +1707,21 @@ fn remove_reserved_child_env(env: &mut HashMap<String, String>) {
     for key in RESERVED_CHILD_ENV_KEYS {
         env.remove(*key);
     }
+}
+
+fn remove_docker_connection_env(env: &mut HashMap<String, String>) {
+    for key in DOCKER_CONNECTION_ENV_KEYS {
+        env.remove(*key);
+    }
+}
+
+fn canonicalize_docker_endpoint_for_deny(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 fn init_home() {
@@ -2025,6 +2120,7 @@ mod tests {
         let mut full_write = false;
         let mut allow_net = None;
         let mut deny_net = Vec::new();
+        let mut docker_access = None;
         let mut env = HashMap::new();
         let mut allow_env = None;
         let mut deny_env = Vec::new();
@@ -2044,6 +2140,7 @@ mod tests {
             &mut full_write,
             &mut allow_net,
             &mut deny_net,
+            &mut docker_access,
             &mut env,
             &mut allow_env,
             &mut deny_env,
@@ -2673,6 +2770,7 @@ mod tests {
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
+                _docker_broker: None,
             },
         };
         let command = prepared.into_command().expect("unmanaged raw command");
@@ -2693,6 +2791,7 @@ mod tests {
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
+                _docker_broker: None,
             },
         };
 
@@ -2720,6 +2819,7 @@ mod tests {
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
+                _docker_broker: None,
             },
         };
 
@@ -2808,6 +2908,7 @@ mod tests {
         let mut fw = false;
         let mut an = None;
         let mut dn = Vec::new();
+        let mut docker_access = None;
         let mut env = HashMap::new();
         let mut ae = None;
         let mut de = Vec::new();
@@ -2816,8 +2917,24 @@ mod tests {
         let mut dis = false;
         let mut fa = false;
         apply_profile(
-            &profile, &mut ar, &mut dr, &mut drg, &mut aw, &mut dw, &mut dwg, &mut fw, &mut an,
-            &mut dn, &mut env, &mut ae, &mut de, &mut sec, &mut sh, &mut dis, &mut fa,
+            &profile,
+            &mut ar,
+            &mut dr,
+            &mut drg,
+            &mut aw,
+            &mut dw,
+            &mut dwg,
+            &mut fw,
+            &mut an,
+            &mut dn,
+            &mut docker_access,
+            &mut env,
+            &mut ae,
+            &mut de,
+            &mut sec,
+            &mut sh,
+            &mut dis,
+            &mut fa,
         );
         (ar, dr)
     }
@@ -2844,6 +2961,7 @@ mod tests {
         let mut fw = false;
         let mut an = None;
         let mut dn = Vec::new();
+        let mut docker_access = None;
         let mut env = HashMap::new();
         let mut ae = None;
         let mut de = Vec::new();
@@ -2862,6 +2980,7 @@ mod tests {
             &mut fw,
             &mut an,
             &mut dn,
+            &mut docker_access,
             &mut env,
             &mut ae,
             &mut de,
@@ -2874,6 +2993,56 @@ mod tests {
         assert!(deny_read.contains(&p("/my/custom/deny")));
         assert!(allow_read.len() > 1);
         assert!(deny_read.len() > 1);
+    }
+
+    #[test]
+    fn explicit_docker_policy_cannot_be_overridden_by_a_profile() {
+        let profile = crate::profile_core::Profile {
+            docker: Some(DockerAccessPolicy::Full {
+                endpoint: zerobox_protocol::docker::UnixSocketPath::default(),
+            }),
+            ..Default::default()
+        };
+        let mut allow_read = Vec::new();
+        let mut deny_read = Vec::new();
+        let mut deny_read_globs = Vec::new();
+        let mut allow_write = Vec::new();
+        let mut deny_write = Vec::new();
+        let mut deny_write_globs = Vec::new();
+        let mut full_write = false;
+        let mut allow_net = None;
+        let mut deny_net = Vec::new();
+        let mut docker_access = Some(DockerAccessPolicy::Disabled);
+        let mut env = HashMap::new();
+        let mut allow_env = None;
+        let mut deny_env = Vec::new();
+        let mut secrets = Vec::new();
+        let mut secret_hosts = Vec::new();
+        let mut disabled = false;
+        let mut full_access = false;
+
+        apply_profile(
+            &profile,
+            &mut allow_read,
+            &mut deny_read,
+            &mut deny_read_globs,
+            &mut allow_write,
+            &mut deny_write,
+            &mut deny_write_globs,
+            &mut full_write,
+            &mut allow_net,
+            &mut deny_net,
+            &mut docker_access,
+            &mut env,
+            &mut allow_env,
+            &mut deny_env,
+            &mut secrets,
+            &mut secret_hosts,
+            &mut disabled,
+            &mut full_access,
+        );
+
+        assert!(matches!(docker_access, Some(DockerAccessPolicy::Disabled)));
     }
 
     // wrap_self / is_sandboxed

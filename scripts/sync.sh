@@ -413,6 +413,12 @@ if [ -f "$PRIVATE_BIND_MOUNTS_PATCH" ]; then
     patch --fuzz=0 -p0 < "$PRIVATE_BIND_MOUNTS_PATCH"
 fi
 
+DOCKER_BROKER_ROUTE_PATCH="$SCRIPT_DIR/upstream-docker-broker-route.patch"
+if [ -f "$DOCKER_BROKER_ROUTE_PATCH" ]; then
+    echo "    docker-broker-route"
+    patch --fuzz=0 -p0 < "$DOCKER_BROKER_ROUTE_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \

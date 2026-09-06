@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+use zerobox_protocol::docker::DockerAccessPolicy;
 
 const MAX_INHERITANCE_DEPTH: usize = 100;
 
@@ -141,6 +142,7 @@ pub struct Profile {
     pub deny_write_globs: Option<Vec<String>>,
     pub allow_net: Option<Vec<String>>,
     pub deny_net: Option<Vec<String>>,
+    pub docker: Option<DockerAccessPolicy>,
     pub set_env: Option<HashMap<String, String>>,
     pub allow_env: Option<Vec<String>>,
     pub deny_env: Option<Vec<String>>,
@@ -282,6 +284,7 @@ pub fn merge_profiles(base: &Profile, child: &Profile) -> Profile {
         deny_write_globs: dedup_append(&base.deny_write_globs, &child.deny_write_globs),
         allow_net: dedup_append(&base.allow_net, &child.allow_net),
         deny_net: dedup_append(&base.deny_net, &child.deny_net),
+        docker: child.docker.clone().or_else(|| base.docker.clone()),
         set_env: merge_maps(&base.set_env, &child.set_env),
         allow_env: dedup_append(&base.allow_env, &child.allow_env),
         deny_env: dedup_append(&base.deny_env, &child.deny_env),
