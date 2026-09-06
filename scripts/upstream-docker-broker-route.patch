@@ -15,7 +15,7 @@
  const LOOPBACK_INTERFACE_NAME: &[u8] = b"lo";
 +const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
 +const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
- 
+
  #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
  pub(crate) struct ProxyRouteSpec {
 @@ -71,8 +73,9 @@
@@ -23,7 +23,7 @@
      let env: HashMap<String, String> = std::env::vars().collect();
      let plan = plan_proxy_routes(&env);
 +    let docker_route = private_docker_route(&env)?;
- 
+
 -    if plan.routes.is_empty() {
 +    if plan.routes.is_empty() && docker_route.is_none() {
          let message = if plan.has_proxy_config {
@@ -32,7 +32,7 @@
 @@ -103,7 +106,7 @@
      }
      spawn_proxy_socket_dir_cleanup_worker(socket_dir, host_bridge_pids)?;
- 
+
 -    let mut routes = Vec::with_capacity(plan.routes.len());
 +    let mut routes = Vec::with_capacity(plan.routes.len() + usize::from(docker_route.is_some()));
      for route in plan.routes {
@@ -45,10 +45,10 @@
 +    if let Some(docker_route) = docker_route {
 +        routes.push(docker_route);
 +    }
- 
+
      serde_json::to_string(&ProxyRouteSpec { routes }).map_err(io::Error::other)
  }
- 
+
 +fn private_docker_route(env: &HashMap<String, String>) -> io::Result<Option<ProxyRouteEntry>> {
 +    let Some(path) = env.get(DOCKER_BROKER_SOCKET_ENV) else {
 +        return Ok(None);
@@ -104,7 +104,7 @@
 +
  pub(crate) fn activate_proxy_routes_in_netns(serialized_spec: &str) -> io::Result<()> {
      let spec: ProxyRouteSpec = serde_json::from_str(serialized_spec).map_err(io::Error::other)?;
- 
+
 @@ -680,6 +738,7 @@
      use super::parse_proxy_socket_dir_owner_pid;
      use super::plan_proxy_routes;
@@ -149,9 +149,9 @@
          {
 @@ -456,6 +459,7 @@
  }
- 
+
  const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
 +const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
- 
+
  #[derive(Debug, serde::Deserialize)]
  #[serde(deny_unknown_fields)]

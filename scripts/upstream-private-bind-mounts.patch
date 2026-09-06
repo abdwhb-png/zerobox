@@ -3,7 +3,7 @@
 @@ -211,7 +213,11 @@
          exec_or_panic(command, setup_status_fd, target_environment.as_ref());
      }
- 
+
 -    if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
 +    let private_bind_mounts = load_private_bind_mounts();
 +    if file_system_sandbox_policy.has_full_disk_write_access()
@@ -20,7 +20,7 @@
 +            &private_bind_mounts,
          );
      }
- 
+
 @@ -298,6 +304,9 @@
      let mut target = target?;
      for (name, value) in std::env::vars() {
@@ -35,7 +35,7 @@
 @@ -367,6 +373,7 @@
      }
  }
- 
+
 +#[allow(clippy::too_many_arguments)]
  fn run_bwrap_with_proc_fallback(
      sandbox_policy_cwd: &Path,
@@ -60,7 +60,7 @@
 @@ -449,6 +458,62 @@
      })
  }
- 
+
 +const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
 +
 +#[derive(Debug, serde::Deserialize)]
