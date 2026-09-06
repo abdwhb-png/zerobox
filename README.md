@@ -225,7 +225,9 @@ directory also hides its descendants. `deny-write-glob` preserves reads and
 blocks creation, writing, deletion, renaming, linking, and metadata changes.
 Denies always override allows. Requested and resolved symlink paths are both
 checked. Pre-existing hardlink aliases remain governed by their requested
-name, which is an explicit limit of path-based policy.
+name, which is an explicit limit of path-based policy. Mutations resolve and
+check their parent before using the same directory descriptor; nofollow
+metadata operations modify the link itself and cannot mutate a denied target.
 
 Dynamic globs require Linux Bubblewrap, `/dev/fuse`, and `fusermount3`.
 Zerobox mounts a guarded view under its private runtime directory and exposes
@@ -247,6 +249,13 @@ detached or privileged exec is rejected. Containers with privileged mode,
 host namespaces, host bind mounts, runtime sockets, devices, dangerous added
 capabilities, or disabled confinement are excluded unless the trusted grant
 explicitly accepts that unsafe target.
+
+The initial targeted snapshot is mandatory. Engine transport, timeout,
+protocol, status, or JSON failures abort broker startup; only a valid empty
+Engine result produces an empty snapshot. Non-streaming routes are one request
+per connection and strip client upgrade headers. An attached exec becomes a
+duplex stream only after the Engine returns a valid `101` TCP upgrade;
+otherwise its bounded response is relayed and the connection is closed.
 
 `Full` relays the complete Docker Engine API. It is equivalent to host control
 and can bypass the command's other filesystem and network restrictions. Docker

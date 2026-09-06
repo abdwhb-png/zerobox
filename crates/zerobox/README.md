@@ -217,6 +217,9 @@ let output = Sandbox::command("docker")
 
 `Full` forwards the complete Engine API and is equivalent to host control.
 `exec` inherits the selected container's own mounts, network, and secrets.
+Targeted startup fails closed if the initial Engine snapshot cannot be
+transported or parsed. Non-streaming routes close after one request, and exec
+streaming starts only after a valid Engine `101` TCP upgrade.
 Use an external operator policy to decide grants; do not let an untrusted
 repository construct its own Docker policy.
 
