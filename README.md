@@ -24,12 +24,12 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 
 - **Deny by default:** Writes, network, and environment variables are blocked unless you allow them
 - **Credential injection:** Pass API keys that the process never sees. Zerobox injects real values only for approved hosts
-- **File access control:** Allow or deny reads and writes to specific paths
+- **File access control:** Allow or deny exact paths and dynamically deny globs
 - **Network filtering:** Allow or deny outbound traffic by domain
 - **Clean environment:** Only essential env vars (PATH, HOME, etc.) are inherited by default
 - **SDKs for Rust, TypeScript, and Python** with a consistent API across languages
 - **Scope:** Local Linux / WSL2 only for this fork
-- **Single binary:** No Docker, no VMs, ~10ms overhead
+- **Single binary:** No VM or Docker dependency for ordinary sandboxing
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=wZiPm9BOPCg" target="_blank" title="Watch the video">
@@ -201,6 +201,60 @@ Segments must be non-empty absolute paths; they do not need to exist. The
 selected value is restored after secret placeholders are prepared, so a secret
 named `PATH` cannot replace it.
 
+## Dynamic deny globs
+
+Use the explicit glob flags when a deny must also cover files created or
+renamed after the command starts:
+
+```bash
+./target/release/zerobox \
+  --allow-write=. \
+  --deny-read-glob='*.pem' \
+  --deny-write-glob='generated/**' \
+  -- make build
+```
+
+A relative pattern without `/` matches basenames at every depth under the
+working directory. A relative pattern containing `/` is anchored to that
+directory. `*`, `?`, `[]`, `{a,b}`, and `**` follow `globset` semantics with
+`/` as the separator. `~` and absolute patterns are accepted, but a pattern
+whose safe static prefix is only `/` is rejected.
+
+`deny-read-glob` blocks reads, useful metadata, and all mutations. A matching
+directory also hides its descendants. `deny-write-glob` preserves reads and
+blocks creation, writing, deletion, renaming, linking, and metadata changes.
+Denies always override allows. Requested and resolved symlink paths are both
+checked. Pre-existing hardlink aliases remain governed by their requested
+name, which is an explicit limit of path-based policy.
+
+Dynamic globs require Linux Bubblewrap, `/dev/fuse`, and `fusermount3`.
+Zerobox mounts a guarded view under its private runtime directory and exposes
+it only inside the command namespace. Mount failure blocks spawn; there is no
+static fallback. Policies without globs use the normal non-FUSE path.
+
+## Controlled Docker access
+
+Zerobox can consume a trusted launcher's effective `DockerAccessPolicy`. It
+never mounts the real Docker socket in the sandbox. A private owner-only broker
+connects to a local Unix Engine endpoint and is presented inside the network
+namespace as a loopback `DOCKER_HOST`.
+
+`Disabled` starts no broker. `Targeted` pins exact container IDs selected by
+container name or Compose project/service labels and permits only `ps`,
+`inspect`, `logs`, `stats`, `exec`, `start`, `stop`, and `restart`. Discovery
+is filtered, unknown targets return 404, disallowed operations return 403, and
+detached or privileged exec is rejected. Containers with privileged mode,
+host namespaces, host bind mounts, runtime sockets, devices, dangerous added
+capabilities, or disabled confinement are excluded unless the trusted grant
+explicitly accepts that unsafe target.
+
+`Full` relays the complete Docker Engine API. It is equivalent to host control
+and can bypass the command's other filesystem and network restrictions. Docker
+`exec` also uses the target container's own mounts, network, and secrets. See
+Docker's [daemon security guidance](https://docs.docker.com/engine/security/).
+Only local Unix endpoints are supported in this release; TCP, TLS, SSH, and
+Docker contexts are not.
+
 For network rules, `localhost`, `127.0.0.1`, and `::1` are the same loopback
 class only when the rule names one of those three aliases and includes the
 exact destination port. This does not allow the rest of `127.0.0.0/8` or any
@@ -280,8 +334,10 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 | ------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `--allow-read <paths>`          | `--allow-read=/tmp,/data`              | Restrict readable user data to listed paths. System libraries remain accessible. Default: all reads allowed. |
 | `--deny-read <paths>`           | `--deny-read=/secret`                  | Block reading from these paths. Takes precedence over `--allow-read`.                                        |
+| `--deny-read-glob <pattern>`    | `--deny-read-glob='**/*.pem'`          | Dynamically block reads and mutations matching one glob. Repeat for multiple patterns.                       |
 | `--allow-write [paths]`         | `--allow-write=.`                      | Allow writing to these paths. Without a value, allows writing everywhere. Default: no writes.                |
 | `--deny-write <paths>`          | `--deny-write=./.git`                  | Block writing to these paths. Takes precedence over `--allow-write`.                                         |
+| `--deny-write-glob <pattern>`   | `--deny-write-glob='generated/**'`     | Dynamically block mutations matching one glob while preserving reads. Repeat for multiple patterns.         |
 | `--allow-net [domains]`         | `--allow-net=example.com`              | Allow outbound network. Without a value, allows all domains. Default: no network.                            |
 | `--deny-net <domains>`          | `--deny-net=evil.com`                  | Block network to these domains. Takes precedence over `--allow-net`.                                         |
 | `--env <KEY=VALUE>`             | `--env NODE_ENV=prod`                  | Set env var in the sandbox. Can be repeated.                                                                 |

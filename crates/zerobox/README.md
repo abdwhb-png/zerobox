@@ -165,6 +165,61 @@ let output = Sandbox::command("ls")
     .await?;
 ```
 
+## Dynamic deny globs
+
+Exact path APIs remain literal. Use the explicit glob APIs when late-created
+or renamed matches must remain denied:
+
+```rust
+let output = Sandbox::command("make")
+    .arg("build")
+    .allow_write(".")
+    .deny_read_glob("*.pem")
+    .deny_write_glob("generated/**")
+    .run()
+    .await?;
+```
+
+Relative basename patterns match at every working-directory depth; relative
+patterns containing `/` are working-directory anchored. Dynamic globs require
+Linux FUSE and fail closed if their private guarded view cannot be mounted.
+See the [main README](../../README.md#dynamic-deny-globs) for complete
+semantics and the hardlink limit.
+
+## Docker policy
+
+Trusted launchers can pass an effective policy without exposing the real
+Engine socket in the sandbox:
+
+```rust
+use std::str::FromStr;
+use zerobox::{
+    DockerAccessPolicy, DockerOperation, DockerTargetGrant,
+    DockerTargetSelector, UnixSocketPath,
+};
+
+let output = Sandbox::command("docker")
+    .args(&["logs", "app-api-1"])
+    .docker_access(DockerAccessPolicy::Targeted {
+        endpoint: UnixSocketPath::from_str("/var/run/docker.sock")?,
+        targets: vec![DockerTargetGrant {
+            selector: DockerTargetSelector::ComposeService {
+                project: "app".into(),
+                service: "api".into(),
+            },
+            operations: Some(vec![DockerOperation::Logs]),
+            allow_unsafe_target: false,
+        }],
+    })
+    .run()
+    .await?;
+```
+
+`Full` forwards the complete Engine API and is equivalent to host control.
+`exec` inherits the selected container's own mounts, network, and secrets.
+Use an external operator policy to decide grants; do not let an untrusted
+repository construct its own Docker policy.
+
 ## Builder reference
 
 | Method | Description |
@@ -173,12 +228,15 @@ let output = Sandbox::command("ls")
 | `arg(x)` / `args(xs)` | Append arguments. |
 | `cwd(path)` | Working directory. |
 | `allow_read(path)` / `deny_read(path)` | Readable / blocked paths. |
+| `deny_read_glob(pattern)` | Dynamically block matching reads, metadata, and mutations. |
 | `allow_write(path)` / `deny_write(path)` | Writable / blocked paths. |
+| `deny_write_glob(pattern)` | Dynamically block matching mutations while preserving reads. |
 | `allow_net(domains)` / `deny_net(domains)` | Allowed / blocked domains. Pass `&[]` for all. |
 | `env(k, v)` | Set an env var. |
 | `allow_env(keys)` / `deny_env(keys)` | Inherit / block parent env vars. |
 | `secret(k, v)` / `secret_host(k, hosts)` | Secret and its allowed hosts. |
 | `profile(name)` / `profiles(names)` / `no_profile()` | Select or skip profiles. |
+| `docker_access(policy)` | Apply a trusted per-execution disabled, targeted, or full Docker policy. |
 | `full_access()` / `no_sandbox()` / `strict_sandbox()` | Coarse policy switches. |
 | `snapshot()` / `restore()` | Record / roll back filesystem changes. |
 | `run()` / `spawn()` / `status()` | Terminators (collect / stream / inherit stdio). |

@@ -195,7 +195,9 @@ See the [main README](https://github.com/afshinm/zerobox#environment-variables) 
 | --- | --- | --- |
 | `profile` | `str \| list[str]` | Named profile(s). A list merges left-to-right. Default `"workspace"`. |
 | `allow_read` / `deny_read` | `list[str]` | Readable / blocked paths. |
+| `deny_read_globs` | `list[str]` | Dynamic read-and-mutation deny patterns. |
 | `allow_write` / `deny_write` | `list[str]` | Writable / blocked paths. |
+| `deny_write_globs` | `list[str]` | Dynamic mutation deny patterns that preserve reads. |
 | `allow_net` | `bool \| list[str]` | `True` allows all. A list restricts to those domains. |
 | `deny_net` | `list[str]` | Blocked domains. |
 | `allow_all` | `bool` | Full filesystem + network access. |
