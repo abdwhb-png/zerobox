@@ -41,7 +41,7 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 
 - Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`
 - Codex rust shim baseline: `rust-v0.131.0-alpha.22` at commit `9b8cf56cdefb09f54564ccc295fd42f6647f558f`
-- Version identity for this fork: `0.3.3-fork.11` (Python: `0.3.3+fork.11`)
+- Version identity for this fork: `0.3.3-fork.12` (Python: `0.3.3+fork.12`)
 
 ## Build and usage (local Linux / WSL2 only)
 

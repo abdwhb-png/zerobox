@@ -22,6 +22,9 @@ use zerobox_protocol::permissions::FileSystemSandboxPolicy;
 use crate::process_owner::{is_process_alive, owned_run_prefix, owner_pid};
 
 const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+// FUSE exposes this kernel-internal bit on opens originating from execve(2).
+// It is not a userspace O_* flag and must not be forwarded to openat2(2).
+const FMODE_EXEC: i32 = 0x20;
 
 #[derive(Debug, Clone)]
 struct CompiledPattern {
@@ -842,7 +845,8 @@ impl Filesystem for GuardedPassthroughFs {
     fn open(&self, _req: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result = (|| {
             let path = self.path_for_inode(inode)?;
-            let fd = self.open_checked(&path, flags.0 & !(libc::O_CREAT | libc::O_EXCL), 0)?;
+            let flags = flags.0 & !(libc::O_CREAT | libc::O_EXCL | FMODE_EXEC);
+            let fd = self.open_checked(&path, flags, 0)?;
             let file = File::from(fd);
             Ok(self.state().insert_handle(file, path))
         })();

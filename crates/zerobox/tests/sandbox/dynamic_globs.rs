@@ -3,6 +3,66 @@ use std::os::unix::fs::PermissionsExt;
 use zerobox::Sandbox;
 
 #[tokio::test]
+async fn sdk_dynamic_globs_execute_shebang_scripts_without_weakening_denies() {
+    let project = temp_dir();
+    let denied = project.path().join("package/node_modules/blocked.txt");
+    std::fs::create_dir_all(denied.parent().unwrap()).unwrap();
+    let script = project.path().join("runner.sh");
+    std::fs::write(&script, "#!/bin/sh\nprintf shebang-ok\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Sandbox::command("/bin/sh")
+        .args(&[
+            "-c",
+            "./runner.sh && ! printf blocked >package/node_modules/blocked.txt 2>/dev/null",
+        ])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob("*/node_modules/*")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run shebang script through dynamic glob sandbox");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "shebang-ok");
+    assert!(!denied.exists());
+}
+
+#[tokio::test]
+async fn sdk_dynamic_globs_preserve_shebang_process_errors() {
+    let project = temp_dir();
+    std::fs::create_dir_all(project.path().join("package/node_modules")).unwrap();
+    let script = project.path().join("failure.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'real-target-error\\n' >&2\nexit 37\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Sandbox::command("/bin/sh")
+        .args(&["-c", "./failure.sh"])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob("*/node_modules/*")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run failing shebang script through dynamic glob sandbox");
+
+    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "real-target-error\n"
+    );
+}
+
+#[tokio::test]
 async fn sdk_dynamic_globs_are_enforced_inside_bubblewrap() {
     let project = temp_dir();
     std::fs::create_dir_all(project.path().join("generated")).unwrap();
