@@ -660,7 +660,20 @@ impl GuardedPassthroughFs {
     fn open_checked(&self, path: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_TRUNC | libc::O_APPEND | libc::O_CREAT) != 0;
-        let fd = self.open_relative(path, flags, mode)?;
+        if write {
+            self.check_write(path, None)?;
+            self.check_existing_resolved_write(path)?;
+        }
+        let resolve = libc::RESOLVE_BENEATH
+            | libc::RESOLVE_NO_MAGICLINKS
+            | if write { libc::RESOLVE_NO_SYMLINKS } else { 0 };
+        let fd = open_path(
+            self.lower_fd.as_raw_fd(),
+            path,
+            flags | libc::O_CLOEXEC,
+            mode,
+            resolve,
+        )?;
         let resolved = Self::resolved_for_fd(fd.as_raw_fd());
         if write {
             self.check_write(path, resolved.as_deref())?;
@@ -668,6 +681,14 @@ impl GuardedPassthroughFs {
             self.check_read(path, resolved.as_deref())?;
         }
         Ok(fd)
+    }
+
+    fn check_existing_resolved_write(&self, path: &Path) -> io::Result<()> {
+        match self.open_relative(path, libc::O_PATH, 0) {
+            Ok(fd) => self.check_write(path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref()),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn stat_path(&self, path: &Path) -> io::Result<libc::stat> {
@@ -694,6 +715,16 @@ impl GuardedPassthroughFs {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let fd = self.open_relative(parent, libc::O_PATH | libc::O_DIRECTORY, 0)?;
         Ok((fd, cstring(name)?))
+    }
+
+    fn open_parent_for_write(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
+        self.check_write(path, None)?;
+        let (parent, name) = self.open_parent(path)?;
+        let resolved = Self::resolved_for_fd(parent.as_raw_fd())
+            .map(|path| path.join(OsStr::from_bytes(name.as_bytes())));
+        self.check_write(path, resolved.as_deref())?;
+        self.check_existing_resolved_write(path)?;
+        Ok((parent, name))
     }
 
     fn reply_entry(&self, path: &Path, reply: ReplyEntry) {
@@ -941,8 +972,15 @@ impl Filesystem for GuardedPassthroughFs {
     ) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            self.check_write(&path, None)?;
-            let fd = self.open_checked(&path, flags | libc::O_CREAT, mode & !umask & 0o7777)?;
+            let (parent_fd, name) = self.open_parent_for_write(&path)?;
+            let fd = open_path(
+                parent_fd.as_raw_fd(),
+                Path::new(OsStr::from_bytes(name.as_bytes())),
+                flags | libc::O_CREAT | libc::O_CLOEXEC,
+                mode & !umask & 0o7777,
+                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
+            )?;
+            self.check_write(&path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref())?;
             let stat = fstat(fd.as_raw_fd())?;
             let inode = self.state().inode_for_path(&path);
             let handle = self.state().insert_handle(File::from(fd), path);
@@ -971,8 +1009,7 @@ impl Filesystem for GuardedPassthroughFs {
     ) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            self.check_write(&path, None)?;
-            let (parent_fd, name) = self.open_parent(&path)?;
+            let (parent_fd, name) = self.open_parent_for_write(&path)?;
             cvt(unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), mode & !umask) })?;
             Ok(path)
         })();
@@ -994,8 +1031,7 @@ impl Filesystem for GuardedPassthroughFs {
     ) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            self.check_write(&path, None)?;
-            let (parent_fd, name) = self.open_parent(&path)?;
+            let (parent_fd, name) = self.open_parent_for_write(&path)?;
             cvt(unsafe {
                 libc::mknodat(
                     parent_fd.as_raw_fd(),
@@ -1033,10 +1069,8 @@ impl Filesystem for GuardedPassthroughFs {
         let result = (|| {
             let old = self.child_path(parent, name)?;
             let new = self.child_path(new_parent, new_name)?;
-            self.check_write(&old, None)?;
-            self.check_write(&new, None)?;
-            let (old_parent, old_name) = self.open_parent(&old)?;
-            let (new_parent, new_name) = self.open_parent(&new)?;
+            let (old_parent, old_name) = self.open_parent_for_write(&old)?;
+            let (new_parent, new_name) = self.open_parent_for_write(&new)?;
             cvt(unsafe {
                 libc::syscall(
                     libc::SYS_renameat2,
@@ -1066,8 +1100,7 @@ impl Filesystem for GuardedPassthroughFs {
     ) {
         let result = (|| {
             let path = self.child_path(parent, link_name)?;
-            self.check_write(&path, None)?;
-            let (parent_fd, name) = self.open_parent(&path)?;
+            let (parent_fd, name) = self.open_parent_for_write(&path)?;
             let target = cstring(target.as_os_str())?;
             cvt(unsafe { libc::symlinkat(target.as_ptr(), parent_fd.as_raw_fd(), name.as_ptr()) })?;
             Ok(path)
@@ -1089,10 +1122,8 @@ impl Filesystem for GuardedPassthroughFs {
         let result = (|| {
             let old = self.path_for_inode(inode)?;
             let new = self.child_path(new_parent, new_name)?;
-            self.check_write(&old, None)?;
-            self.check_write(&new, None)?;
-            let (old_parent, old_name) = self.open_parent(&old)?;
-            let (new_parent, new_name) = self.open_parent(&new)?;
+            let (old_parent, old_name) = self.open_parent_for_write(&old)?;
+            let (new_parent, new_name) = self.open_parent_for_write(&new)?;
             cvt(unsafe {
                 libc::linkat(
                     old_parent.as_raw_fd(),
@@ -1130,10 +1161,16 @@ impl Filesystem for GuardedPassthroughFs {
     ) {
         let result = (|| {
             let path = self.path_for_inode(inode)?;
-            self.check_write(&path, None)?;
-            let (parent, name) = self.open_parent(&path)?;
+            let (parent, name) = self.open_parent_for_write(&path)?;
             if let Some(mode) = mode {
-                cvt(unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) })?;
+                cvt(unsafe {
+                    libc::fchmodat(
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        mode,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                })?;
             }
             if uid.is_some() || gid.is_some() {
                 cvt(unsafe {
@@ -1156,7 +1193,12 @@ impl Filesystem for GuardedPassthroughFs {
                     timespec(mtime.unwrap_or(TimeOrNow::Now))?,
                 ];
                 cvt(unsafe {
-                    libc::utimensat(parent.as_raw_fd(), name.as_ptr(), times.as_ptr(), 0)
+                    libc::utimensat(
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
                 })?;
             }
             self.attr_for_path(&path, inode)
@@ -1209,8 +1251,7 @@ impl GuardedPassthroughFs {
     fn remove(&self, parent: INodeNo, name: &OsStr, flags: i32, reply: ReplyEmpty) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            self.check_write(&path, None)?;
-            let (parent, name) = self.open_parent(&path)?;
+            let (parent, name) = self.open_parent_for_write(&path)?;
             cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) })?;
             self.state().remove_path_tree(&path);
             Ok(())
