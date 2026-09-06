@@ -282,22 +282,7 @@ pub(crate) struct DynamicDenyMounts {
 }
 
 impl DynamicDenyMounts {
-    pub(crate) fn prepare(
-        cwd: &Path,
-        deny_read: &[String],
-        deny_write: &[String],
-        base_policy: &FileSystemSandboxPolicy,
-    ) -> Result<Option<Self>> {
-        Self::prepare_in(
-            cwd,
-            deny_read,
-            deny_write,
-            base_policy,
-            &crate::zerobox_home().join("tmp").join("views"),
-        )
-    }
-
-    fn prepare_in(
+    pub(crate) fn prepare_in(
         cwd: &Path,
         deny_read: &[String],
         deny_write: &[String],

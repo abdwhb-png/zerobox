@@ -437,6 +437,12 @@ if [ -f "$DOCKER_BROKER_CONNECTION_PERMIT_PATCH" ]; then
     git apply -p0 "$DOCKER_BROKER_CONNECTION_PERMIT_PATCH"
 fi
 
+SETUP_ARTIFACT_ERRORS_PATCH="$SCRIPT_DIR/upstream-setup-artifact-errors.patch"
+if [ -f "$SETUP_ARTIFACT_ERRORS_PATCH" ]; then
+    echo "    setup-artifact-errors"
+    patch --fuzz=0 -p0 < "$SETUP_ARTIFACT_ERRORS_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \

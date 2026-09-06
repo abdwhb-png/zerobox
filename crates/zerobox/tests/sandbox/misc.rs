@@ -2,6 +2,13 @@ use crate::support::*;
 
 #[cfg(unix)]
 fn run_with_status_fd(args: &[&str]) -> (Output, String) {
+    let mut command = Command::new(zerobox_exec());
+    command.args(args);
+    run_command_with_status_fd(command)
+}
+
+#[cfg(unix)]
+fn run_command_with_status_fd(mut command: Command) -> (Output, String) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     use std::os::unix::process::CommandExt;
@@ -10,8 +17,6 @@ fn run_with_status_fd(args: &[&str]) -> (Output, String) {
     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
     let read_fd = fds[0];
     let write_fd = fds[1];
-    let mut command = Command::new(zerobox_exec());
-    command.args(args);
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(write_fd, 3) < 0 {
@@ -30,6 +35,54 @@ fn run_with_status_fd(args: &[&str]) -> (Output, String) {
         .read_to_string(&mut status)
         .expect("read status");
     (output, status)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_artifacts_survive_workspace_mounts_and_dynamic_denies() {
+    let workspace = temp_dir();
+    let zerobox_home = workspace.path().join(".zerobox");
+    let staged_bin_dir = workspace.path().join("bin");
+    let staged_zerobox = staged_bin_dir.join("zerobox");
+    std::fs::create_dir_all(&staged_bin_dir).expect("create staged binary directory");
+    std::fs::hard_link(zerobox_exec(), &staged_zerobox).expect("hard-link zerobox into workspace");
+
+    let allow_write = format!("--allow-write={}", workspace.path().display());
+    let mut command = Command::new(&staged_zerobox);
+    command
+        .current_dir(workspace.path())
+        .env("ZEROBOX_HOME", &zerobox_home)
+        .args([
+            "--status-fd=3",
+            "--profile=analysis-strict",
+            "--allow-read=/",
+            allow_write.as_str(),
+            "--deny-write-glob=*.pem",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf allowed > allowed.txt && ! printf blocked > secret.pem 2>/dev/null && test ! -e secret.pem",
+        ]);
+
+    let (output, status) = run_command_with_status_fd(command);
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstatus: {status}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("allowed.txt")).unwrap(),
+        "allowed"
+    );
+    assert!(!workspace.path().join("secret.pem").exists());
+
+    let events: Vec<serde_json::Value> = status
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSONL lifecycle event"))
+        .collect();
+    assert_eq!(events[0]["event"], "child_started");
+    assert_eq!(events[1]["event"], "child_exit");
+    assert_eq!(events[1]["code"], 0);
 }
 
 #[cfg(unix)]

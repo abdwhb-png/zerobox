@@ -49,7 +49,15 @@ pub(crate) struct DockerBroker {
 }
 
 impl DockerBroker {
+    #[cfg(any(test, not(target_os = "linux")))]
     pub(crate) async fn start(policy: &DockerAccessPolicy) -> Result<Option<Self>> {
+        Self::start_in(policy, &crate::zerobox_home().join("tmp").join("docker")).await
+    }
+
+    pub(crate) async fn start_in(
+        policy: &DockerAccessPolicy,
+        runtime_root: &Path,
+    ) -> Result<Option<Self>> {
         let (endpoint, mode) = match policy {
             DockerAccessPolicy::Disabled => return Ok(None),
             DockerAccessPolicy::Full { endpoint } => {
@@ -62,7 +70,7 @@ impl DockerBroker {
             }
         };
 
-        let root = create_private_broker_root()?;
+        let root = create_private_broker_root_in(runtime_root)?;
         let socket_path = root.join(BROKER_SOCKET_NAME);
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind Docker broker {}", socket_path.display()))?;
@@ -1438,10 +1446,6 @@ fn is_runtime_socket_path(path: &str) -> bool {
         || path.ends_with("podman.sock")
         || path.ends_with("containerd.sock")
         || path.ends_with("containerd/containerd.sock")
-}
-
-fn create_private_broker_root() -> Result<PathBuf> {
-    create_private_broker_root_in(&crate::zerobox_home().join("tmp").join("docker"))
 }
 
 fn create_private_broker_root_in(parent: &Path) -> Result<PathBuf> {

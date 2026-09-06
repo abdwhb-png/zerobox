@@ -102,7 +102,10 @@ mod imp {
 
         let current_exe = std::env::current_exe()?;
         let zerobox_linux_sandbox_exe = path.join(ZEROBOX_LINUX_SANDBOX_ARG0);
-        std::os::unix::fs::symlink(&current_exe, &zerobox_linux_sandbox_exe)?;
+        crate::linux_runtime::stage_helper(&current_exe, &zerobox_linux_sandbox_exe, unsafe {
+            libc::geteuid()
+        })
+        .map_err(std::io::Error::other)?;
 
         let updated_path = path_with_entry_prepended(path, std::env::var_os("PATH"));
         // SAFETY: this is called by the CLI entrypoint before the Tokio runtime

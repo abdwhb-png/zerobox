@@ -29,6 +29,8 @@ pub mod arg0;
 mod docker_broker;
 #[cfg(target_os = "linux")]
 mod dynamic_fs;
+#[cfg(target_os = "linux")]
+mod linux_runtime;
 #[cfg(unix)]
 mod process_owner;
 pub mod profile_core;

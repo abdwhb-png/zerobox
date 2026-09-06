@@ -24,6 +24,8 @@ use zerobox_utils_absolute_path::AbsolutePathBuf;
 use crate::docker_broker::DockerBroker;
 #[cfg(target_os = "linux")]
 use crate::dynamic_fs::DynamicDenyMounts;
+#[cfg(target_os = "linux")]
+use crate::linux_runtime::LinuxRuntime;
 use crate::proxy;
 use crate::secret;
 
@@ -582,9 +584,47 @@ impl Sandbox {
             );
         }
 
+        #[cfg(target_os = "linux")]
+        let linux_runtime = if sandbox_type == SandboxType::LinuxSeccomp {
+            let helper_source = linux_sandbox_exe
+                .as_deref()
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_exe().ok())
+                .ok_or_else(|| anyhow::anyhow!("cannot determine Linux sandbox helper"))?;
+            let runtime = LinuxRuntime::create(&cwd, &allow_write, &helper_source)?;
+            deny_read.push(runtime.parent().to_path_buf());
+            deny_write.push(runtime.parent().to_path_buf());
+            Some(runtime)
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let linux_runtime: Option<()> = None;
+
+        #[cfg(target_os = "linux")]
+        let linux_sandbox_exe = linux_runtime
+            .as_ref()
+            .map(|runtime| runtime.helper().to_path_buf());
+        #[cfg(not(target_os = "linux"))]
+        let linux_sandbox_exe: Option<PathBuf> = None;
+
         #[cfg(unix)]
         let docker_broker = if docker_enabled {
-            DockerBroker::start(&docker_access).await?
+            #[cfg(target_os = "linux")]
+            {
+                DockerBroker::start_in(
+                    &docker_access,
+                    linux_runtime
+                        .as_ref()
+                        .expect("Docker requires a Linux runtime")
+                        .docker_root(),
+                )
+                .await?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                DockerBroker::start(&docker_access).await?
+            }
         } else {
             None
         };
@@ -601,7 +641,13 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
-            let file = PrivateTargetEnvironment::create(&child_env)?;
+            let file = PrivateTargetEnvironment::create_in(
+                &child_env,
+                linux_runtime
+                    .as_ref()
+                    .expect("Linux sandbox requires a private runtime")
+                    .env_root(),
+            )?;
             allow_read.push(file.read_root().to_path_buf());
             Some(file)
         } else {
@@ -614,12 +660,6 @@ impl Sandbox {
             .as_ref()
             .map(|file| linux_helper_environment(file.path()))
             .unwrap_or(child_env);
-
-        let linux_sandbox_exe: Option<PathBuf> = if cfg!(target_os = "linux") {
-            linux_sandbox_exe.or_else(|| std::env::current_exe().ok())
-        } else {
-            None
-        };
 
         #[cfg(target_os = "linux")]
         let setup_channel = if setup_status && sandbox_type == SandboxType::LinuxSeccomp {
@@ -646,7 +686,16 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         let dynamic_fs = if sandbox_type == SandboxType::LinuxSeccomp {
-            DynamicDenyMounts::prepare(&cwd, &deny_read_globs, &deny_write_globs, &fs_policy)?
+            DynamicDenyMounts::prepare_in(
+                &cwd,
+                &deny_read_globs,
+                &deny_write_globs,
+                &fs_policy,
+                linux_runtime
+                    .as_ref()
+                    .expect("Linux sandbox requires a private runtime")
+                    .views_root(),
+            )?
         } else if disabled || (deny_read_globs.is_empty() && deny_write_globs.is_empty()) {
             None
         } else {
@@ -682,7 +731,12 @@ impl Sandbox {
 
         let managed_network = proxy.is_some() || docker_broker.is_some();
         let proxy_root = if managed_network && sandbox_type == SandboxType::LinuxSeccomp {
-            Some(PrivateProxyRoot::create()?)
+            Some(PrivateProxyRoot::create_in(
+                linux_runtime
+                    .as_ref()
+                    .expect("Linux sandbox requires a private runtime")
+                    .proxy_root(),
+            )?)
         } else {
             None
         };
@@ -785,6 +839,7 @@ impl Sandbox {
                 _target_env_file: target_env_file,
                 _dynamic_fs: dynamic_fs,
                 _docker_broker: docker_broker,
+                _linux_runtime: linux_runtime,
             },
         })
     }
@@ -804,6 +859,10 @@ struct ManagedExecutionResources {
     _docker_broker: Option<DockerBroker>,
     #[cfg(not(unix))]
     _docker_broker: Option<()>,
+    #[cfg(target_os = "linux")]
+    _linux_runtime: Option<LinuxRuntime>,
+    #[cfg(not(target_os = "linux"))]
+    _linux_runtime: Option<()>,
 }
 
 impl ManagedExecutionResources {
@@ -815,6 +874,7 @@ impl ManagedExecutionResources {
             && self._target_env_file.is_none()
             && self._dynamic_fs.is_none()
             && self._docker_broker.is_none()
+            && self._linux_runtime.is_none()
     }
 }
 
@@ -1046,11 +1106,6 @@ struct PrivateTargetEnvironment {
 
 impl PrivateTargetEnvironment {
     #[cfg(target_os = "linux")]
-    fn create(environment: &HashMap<String, String>) -> Result<Self> {
-        Self::create_in(environment, &crate::zerobox_home().join("tmp").join("env"))
-    }
-
-    #[cfg(target_os = "linux")]
     fn create_in(environment: &HashMap<String, String>, root: &Path) -> Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -1150,10 +1205,6 @@ struct PrivateProxyRoot {
 }
 
 impl PrivateProxyRoot {
-    fn create() -> Result<Self> {
-        Self::create_in(&crate::zerobox_home().join("tmp").join("runs"))
-    }
-
     fn path(&self) -> &Path {
         &self.path
     }
@@ -2771,6 +2822,7 @@ mod tests {
                 _target_env_file: None,
                 _dynamic_fs: None,
                 _docker_broker: None,
+                _linux_runtime: None,
             },
         };
         let command = prepared.into_command().expect("unmanaged raw command");
@@ -2792,6 +2844,7 @@ mod tests {
                 _target_env_file: None,
                 _dynamic_fs: None,
                 _docker_broker: None,
+                _linux_runtime: None,
             },
         };
 
@@ -2820,6 +2873,7 @@ mod tests {
                 _target_env_file: None,
                 _dynamic_fs: None,
                 _docker_broker: None,
+                _linux_runtime: None,
             },
         };
 

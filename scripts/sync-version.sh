@@ -29,9 +29,9 @@ awk -v ver="$VERSION" '
 
 # Update workspace dependency version pins (version = "=x.y.z") to match.
 if sed --version >/dev/null 2>&1; then
-  sed -i "s/version = \"=[0-9.]*\"/version = \"=$VERSION\"/g" "$ROOT/Cargo.toml"
+  sed -i "s/version = \"=[0-9.]*-fork\.[0-9]*\"/version = \"=$VERSION\"/g" "$ROOT/Cargo.toml"
 else
-  sed -i '' "s/version = \"=[0-9.]*\"/version = \"=$VERSION\"/g" "$ROOT/Cargo.toml"
+  sed -i '' "s/version = \"=[0-9.]*-fork\.[0-9]*\"/version = \"=$VERSION\"/g" "$ROOT/Cargo.toml"
 fi
 
 echo "Cargo.toml workspace version:"

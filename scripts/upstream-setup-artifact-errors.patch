@@ -1,0 +1,127 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -172,7 +172,7 @@
+     if command.is_empty() {
+         panic!("No command specified to execute.");
+     }
+-    let target_environment = load_target_environment();
++    let target_environment = load_target_environment(setup_status_fd);
+     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
+     let EffectivePermissions {
+         permission_profile,
+@@ -286,20 +286,73 @@
+     exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+ }
+ 
+-fn load_target_environment() -> Option<HashMap<String, String>> {
++#[derive(Debug)]
++struct SetupArtifactError {
++    code: &'static str,
++    message: String,
++}
++
++impl SetupArtifactError {
++    fn new(code: &'static str, message: impl Into<String>) -> Self {
++        Self {
++            code,
++            message: message.into(),
++        }
++    }
++
++    fn code(&self) -> &'static str {
++        self.code
++    }
++}
++
++impl fmt::Display for SetupArtifactError {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.message)
++    }
++}
++
++impl std::error::Error for SetupArtifactError {}
++
++fn load_target_environment(setup_status_fd: Option<i32>) -> Option<HashMap<String, String>> {
+     let path = std::env::var_os(TARGET_ENV_FILE_ENV)?;
+-    let bytes = fs::read(&path).unwrap_or_else(|error| {
+-        panic!(
+-            "failed to read private target environment {}: {error}",
+-            Path::new(&path).display()
+-        )
+-    });
+-    Some(serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+-        panic!(
+-            "failed to decode private target environment {}: {error}",
+-            Path::new(&path).display()
+-        )
+-    }))
++    match load_target_environment_from(Path::new(&path)) {
++        Ok(environment) => Some(environment),
++        Err(error) => exit_setup_artifact_error(setup_status_fd, &error),
++    }
++}
++
++fn load_target_environment_from(
++    path: &Path,
++) -> Result<HashMap<String, String>, SetupArtifactError> {
++    let bytes = fs::read(path).map_err(|error| {
++        SetupArtifactError::new(
++            "target_env_read",
++            format!(
++                "failed to read private target environment {}: {error}",
++                path.display()
++            ),
++        )
++    })?;
++    serde_json::from_slice(&bytes).map_err(|error| {
++        SetupArtifactError::new(
++            "target_env_decode",
++            format!(
++                "failed to decode private target environment {}: {error}",
++                path.display()
++            ),
++        )
++    })
++}
++
++fn exit_setup_artifact_error(status_fd: Option<i32>, error: &SetupArtifactError) -> ! {
++    eprintln!("Linux sandbox setup failed [{}]: {error}", error.code());
++    if let Some(status_fd) = status_fd {
++        let _ = write_setup_frame(status_fd, &format!("ERR:{}", error.code()));
++        unsafe {
++            libc::close(status_fd);
++        }
++    }
++    std::process::exit(126);
+ }
+ 
+ fn merge_internal_target_environment(
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -741,3 +741,26 @@
+         ]
+     );
+ }
++
++#[test]
++fn private_target_environment_read_failure_is_typed() {
++    let root = tempfile::tempdir().expect("target environment root");
++    let missing = root.path().join("missing.json");
++
++    let error = load_target_environment_from(&missing)
++        .expect_err("missing private target environment must fail");
++
++    assert_eq!(error.code(), "target_env_read");
++}
++
++#[test]
++fn private_target_environment_decode_failure_is_typed() {
++    let root = tempfile::tempdir().expect("target environment root");
++    let invalid = root.path().join("invalid.json");
++    std::fs::write(&invalid, b"not-json").expect("write invalid target environment");
++
++    let error = load_target_environment_from(&invalid)
++        .expect_err("invalid private target environment must fail");
++
++    assert_eq!(error.code(), "target_env_decode");
++}
