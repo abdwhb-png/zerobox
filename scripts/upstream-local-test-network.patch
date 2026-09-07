@@ -38,7 +38,7 @@
 +            }
 --- upstream/linux-sandbox/src/proxy_routing.rs
 +++ upstream/linux-sandbox/src/proxy_routing.rs
-@@ -950,1 +950,99 @@
+@@ -950,1 +950,105 @@
 -fn ensure_loopback_interface_up() -> io::Result<()> {
 +pub(crate) fn prepare_private_loopback(spec: Option<&str>) -> io::Result<()> {
 +    ensure_loopback_interface_up()?;
@@ -89,6 +89,7 @@
 +            loop {
 +                let (tcp, _) = listener.accept()?;
 +                let Some(permit) = try_acquire_bridge_connection(active.clone(), 64) else {
++                    eprintln!("private loopback connection rejected: connection limit reached");
 +                    drop(tcp);
 +                    continue;
 +                };
@@ -97,8 +98,13 @@
 +                    let _permit = permit;
 +                    // Denial or transport failure closes only this connection.
 +                    // No direct host route exists if the proxy rejects CONNECT.
-+                    if let Ok(unix) = granted_loopback_tunnel(&path, port) {
-+                        let _ = proxy_tcp_unix(tcp, unix);
++                    match granted_loopback_tunnel(&path, port) {
++                        Ok(unix) => {
++                            if let Err(error) = proxy_tcp_unix(tcp, unix) {
++                                eprintln!("private loopback connection failed: {error}");
++                            }
++                        }
++                        Err(error) => eprintln!("private loopback connection failed: {error}"),
 +                    }
 +                });
 +            }

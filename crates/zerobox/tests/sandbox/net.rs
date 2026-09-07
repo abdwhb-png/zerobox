@@ -17,6 +17,51 @@ async fn private_listeners_reject_unproxied_host_network_access() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_loopback_refusals_report_the_cause_and_preserve_target_failure() {
+    let host = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = host.local_addr().unwrap().port();
+    let script = format!(
+        r#"import socket, sys
+c = socket.create_connection(('127.0.0.1', {port}), 2)
+try:
+    assert c.recv(1) == b'', 'denied connection returned data'
+except ConnectionResetError:
+    pass
+c.close()
+print('target-output')
+sys.stderr.write('target-failure\n')
+sys.exit(37)
+"#
+    );
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/",
+        "--allow-local-binding",
+        &format!("--allow-net=localhost:{port}"),
+        &format!("--deny-net=localhost:{port}"),
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "target-output\n");
+    assert!(stderr(&output).contains("target-failure\n"));
+    assert!(
+        stderr(&output)
+            .contains("private loopback connection failed: loopback proxy refused CONNECT"),
+        "proxy failure was hidden: {}",
+        stderr(&output)
+    );
+    host.set_nonblocking(true).unwrap();
+    assert_eq!(
+        host.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn local_test_listeners_preserve_explicit_host_loopback_grants() {
     let (port, host) = local_http_server(std::net::Ipv4Addr::LOCALHOST.into());
     let output = run(&[
