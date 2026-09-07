@@ -41,6 +41,7 @@ pub(crate) struct DynamicDenyPolicy {
     mount_destinations: Vec<PathBuf>,
     base_policy: FileSystemSandboxPolicy,
     cwd: PathBuf,
+    access_cache: Arc<Mutex<HashMap<PathBuf, (bool, bool)>>>,
 }
 
 impl DynamicDenyPolicy {
@@ -114,6 +115,7 @@ impl DynamicDenyPolicy {
             mount_destinations,
             base_policy,
             cwd: canonical_cwd,
+            access_cache: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -122,24 +124,38 @@ impl DynamicDenyPolicy {
     }
 
     pub(crate) fn is_read_denied(&self, requested: &Path, resolved: Option<&Path>) -> bool {
-        !self
-            .base_policy
-            .can_read_path_with_cwd(requested, &self.cwd)
-            || resolved
-                .is_some_and(|path| !self.base_policy.can_read_path_with_cwd(path, &self.cwd))
-            || matches_any(&self.deny_read, requested)
-            || resolved.is_some_and(|path| matches_any(&self.deny_read, path))
+        self.path_access(requested).0 || resolved.is_some_and(|path| self.path_access(path).0)
     }
 
     pub(crate) fn is_write_denied(&self, requested: &Path, resolved: Option<&Path>) -> bool {
-        !self
-            .base_policy
-            .can_write_path_with_cwd(requested, &self.cwd)
-            || resolved
-                .is_some_and(|path| !self.base_policy.can_write_path_with_cwd(path, &self.cwd))
-            || self.is_read_denied(requested, resolved)
-            || matches_any(&self.deny_write, requested)
-            || resolved.is_some_and(|path| matches_any(&self.deny_write, path))
+        self.path_access(requested).1 || resolved.is_some_and(|path| self.path_access(path).1)
+    }
+
+    fn path_access(&self, path: &Path) -> (bool, bool) {
+        // Cache only the immutable policy's answer for a lexical path. Never
+        // cache inode metadata, data, existence, or a symlink/FD resolution:
+        // every operation still supplies its freshly resolved destination.
+        const MAX_CACHED_PATHS: usize = 8192;
+        if let Some(access) = self
+            .access_cache
+            .lock()
+            .expect("policy cache poisoned")
+            .get(path)
+        {
+            return *access;
+        }
+        let read_denied = !self.base_policy.can_read_path_with_cwd(path, &self.cwd)
+            || matches_any(&self.deny_read, path);
+        let write_denied = read_denied
+            || !self.base_policy.can_write_path_with_cwd(path, &self.cwd)
+            || matches_any(&self.deny_write, path);
+        let access = (read_denied, write_denied);
+        let mut cache = self.access_cache.lock().expect("policy cache poisoned");
+        if cache.len() >= MAX_CACHED_PATHS {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), access);
+        access
     }
 }
 
@@ -1586,6 +1602,26 @@ mod tests {
     }
 
     #[test]
+    fn memoized_policy_answers_stay_bounded_and_check_fresh_destinations() {
+        let root = TempDir::new().unwrap();
+        let policy = policy(root.path(), &["*.pem"], &["*/node_modules/*"]);
+        let visible = root.path().join("visible");
+        for _ in 0..100 {
+            assert!(!policy.is_read_denied(&visible, None));
+        }
+        assert_eq!(policy.access_cache.lock().unwrap().len(), 1);
+        assert!(policy.is_read_denied(&visible, Some(&root.path().join("secret.pem"))));
+        assert!(policy.is_write_denied(
+            &visible,
+            Some(&root.path().join("package/node_modules/file"))
+        ));
+        for i in 0..9000 {
+            policy.is_read_denied(&root.path().join(format!("file-{i}")), None);
+        }
+        assert!(policy.access_cache.lock().unwrap().len() <= 8192);
+    }
+
+    #[test]
     fn basename_patterns_match_at_every_project_depth() {
         let root = TempDir::new().unwrap();
         let policy = policy(root.path(), &["*.pem"], &[]);
@@ -1991,6 +2027,46 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(mounts.root().is_dir());
+    }
+
+    #[test]
+    fn mounted_view_observes_external_edits_and_directory_type_changes() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::create_dir(lower.path().join("changing")).unwrap();
+        std::fs::create_dir(lower.path().join("destination")).unwrap();
+        std::fs::write(lower.path().join("visible.txt"), "old").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        assert!(std::fs::metadata(view.join("changing")).unwrap().is_dir());
+        assert_eq!(
+            std::fs::read_to_string(view.join("visible.txt")).unwrap(),
+            "old"
+        );
+        std::fs::write(lower.path().join("visible.txt"), "new-content").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.join("visible.txt")).unwrap(),
+            "new-content"
+        );
+        std::fs::remove_dir(lower.path().join("changing")).unwrap();
+        std::os::unix::fs::symlink("destination", lower.path().join("changing")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(view.join("changing"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(view.join("changing")).unwrap(),
+            PathBuf::from("destination")
+        );
     }
 
     #[test]

@@ -443,6 +443,24 @@ if [ -f "$SETUP_ARTIFACT_ERRORS_PATCH" ]; then
     patch --fuzz=0 -p0 < "$SETUP_ARTIFACT_ERRORS_PATCH"
 fi
 
+PRIVATE_STREAM_IPC_PATCH="$SCRIPT_DIR/upstream-private-stream-ipc.patch"
+if [ -f "$PRIVATE_STREAM_IPC_PATCH" ]; then
+    echo "    private-stream-ipc"
+    patch --fuzz=0 -p0 < "$PRIVATE_STREAM_IPC_PATCH"
+fi
+
+LOCAL_TEST_NETWORK_PATCH="$SCRIPT_DIR/upstream-local-test-network.patch"
+if [ -f "$LOCAL_TEST_NETWORK_PATCH" ]; then
+    echo "    local-test-network"
+    patch --fuzz=0 -p0 < "$LOCAL_TEST_NETWORK_PATCH"
+fi
+
+CONCURRENT_DENY_TARGETS_PATCH="$SCRIPT_DIR/upstream-concurrent-deny-targets.patch"
+if [ -f "$CONCURRENT_DENY_TARGETS_PATCH" ]; then
+    echo "    concurrent-deny-targets"
+    patch --fuzz=0 -p0 < "$CONCURRENT_DENY_TARGETS_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \

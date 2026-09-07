@@ -345,6 +345,43 @@ fn status_fd_reports_setup_error_as_jsonl_and_exit_125() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_tmp_maps_session_storage_without_exposing_host_tmp() {
+    let session = temp_dir();
+    let sibling = temp_dir();
+    let host_marker = session.path().join("host-only");
+    std::fs::write(&host_marker, "host").unwrap();
+    let private = session.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let command = format!(
+        "test \"$TMPDIR\" = /tmp && test ! -e '{}' && test ! -e '{}' && printf private >/tmp/owned && test \"$(cat /tmp/owned)\" = private",
+        host_marker.display(),
+        sibling.path().display(),
+    );
+    let out = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/",
+        "--deny-read=/tmp",
+        "-C",
+        env!("CARGO_MANIFEST_DIR"),
+        &format!("--private-tmp={}", private.display()),
+        "--",
+        "/bin/sh",
+        "-c",
+        &command,
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(private.join("owned")).unwrap(),
+        "private"
+    );
+    assert_eq!(std::fs::read_to_string(host_marker).unwrap(), "host");
+    assert!(!sibling.path().join("owned").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn invalid_strict_path_emits_setup_error_and_exit_125() {
     let (out, status) = run_with_status_fd(&[
         "--status-fd=3",

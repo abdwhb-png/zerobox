@@ -64,6 +64,14 @@ pub struct Cli {
     #[arg(long)]
     pub strict_sandbox: bool,
 
+    /// Use an owner-only session directory as private sandbox /tmp.
+    #[arg(long)]
+    pub private_tmp: Option<PathBuf>,
+
+    /// Permit local TCP servers inside the isolated network namespace.
+    #[arg(long)]
+    pub allow_local_binding: bool,
+
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub set_env: Vec<String>,
 
@@ -298,9 +306,13 @@ async fn tokio_main(
         .args(&cli.command[1..])
         .linux_sandbox_exe_opt(linux_sandbox_exe)
         .setup_status(status.enabled());
+    sandbox = sandbox.allow_local_binding(cli.allow_local_binding);
 
     if let Some(ref cwd) = cli.cwd {
         sandbox = sandbox.cwd(cwd);
+    }
+    if let Some(ref private_tmp) = cli.private_tmp {
+        sandbox = sandbox.private_tmp(private_tmp);
     }
 
     if cli.no_sandbox {
@@ -728,7 +740,11 @@ impl StatusReporter {
     fn setup_error(&mut self, code: &str, message: &str) -> std::io::Result<()> {
         // 512 code points stay below PIPE_BUF even when every character is
         // JSON-escaped as `\uXXXX`.
-        let message = message.chars().take(512).collect::<String>();
+        let mut chars = message.chars();
+        let mut message = chars.by_ref().take(512).collect::<String>();
+        if chars.next().is_some() {
+            message.push_str(" [truncated; full diagnostic on stderr]");
+        }
         self.emit_terminal(
             serde_json::json!({"version":1,"event":"setup_error","code":code,"message":message}),
         )
@@ -818,6 +834,23 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    #[test]
+    fn long_setup_diagnostics_explicitly_report_truncation() {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let mut reporter = StatusReporter::new(Some(writer.into_raw_fd())).unwrap();
+        reporter.setup_error("setup", &"x".repeat(2000)).unwrap();
+        let mut line = String::new();
+        BufReader::new(reader).read_line(&mut line).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            event["message"]
+                .as_str()
+                .unwrap()
+                .ends_with("[truncated; full diagnostic on stderr]")
+        );
+        assert!(line.len() < 4096);
+    }
 
     #[test]
     fn status_fd_preparse_skips_non_utf8_arguments() {

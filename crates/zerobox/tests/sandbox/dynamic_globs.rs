@@ -3,6 +3,50 @@ use std::os::unix::fs::PermissionsExt;
 use zerobox::Sandbox;
 
 #[tokio::test]
+#[ignore = "wall-clock benchmark: run explicitly on an idle host with --ignored --nocapture"]
+async fn dynamic_glob_hot_metadata_does_not_recompute_static_policy() {
+    let project = temp_dir();
+    let entry = project
+        .path()
+        .join("packages/app/src/components/nested/entry.txt");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, "entry").unwrap();
+    let script = format!(
+        "import os,time\nt=time.monotonic()\nfor _ in range(500): os.stat({:?})\nprint(time.monotonic()-t)",
+        entry.to_str().unwrap()
+    );
+    let mut sandbox = Sandbox::command("/usr/bin/python3")
+        .args(&["-c", &script])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob("*/node_modules/*")
+        .deny_read_glob("*.pem")
+        .deny_read_glob("*.key")
+        .deny_read_glob(".env.*")
+        .linux_sandbox_exe(zerobox_exec());
+    for i in 0..50 {
+        sandbox = sandbox.deny_read(project.path().join(format!("denied-{i}")));
+    }
+    let output = sandbox.run().await.expect("start metadata benchmark");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seconds: f64 = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eprintln!("500 hot metadata operations: {seconds:.3}s");
+    // Latency is a measurement, not a portable wall-clock assertion. The
+    // policy cache and backing-file coherency have deterministic coverage.
+    assert!(seconds.is_finite() && seconds > 0.0);
+}
+
+#[tokio::test]
 async fn sdk_dynamic_globs_execute_shebang_scripts_without_weakening_denies() {
     let project = temp_dir();
     let denied = project.path().join("package/node_modules/blocked.txt");

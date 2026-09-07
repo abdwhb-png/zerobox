@@ -23,7 +23,7 @@ use zerobox_utils_absolute_path::AbsolutePathBuf;
 #[cfg(unix)]
 use crate::docker_broker::DockerBroker;
 #[cfg(target_os = "linux")]
-use crate::dynamic_fs::{DynamicDenyMounts, dynamic_deny_mount_roots};
+use crate::dynamic_fs::{DynamicBindMount, DynamicDenyMounts, dynamic_deny_mount_roots};
 #[cfg(target_os = "linux")]
 use crate::linux_runtime::LinuxRuntime;
 use crate::proxy;
@@ -33,6 +33,8 @@ pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", 
 const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
 const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
+const ALLOW_LOCAL_BINDING_ENV: &str = "ZEROBOX_ALLOW_LOCAL_BINDING";
+const HOST_LOOPBACK_PORTS_ENV: &str = "ZEROBOX_HOST_LOOPBACK_PORTS";
 const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
 const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
 const DOCKER_CONNECTION_ENV_KEYS: &[&str] = &[
@@ -45,6 +47,8 @@ const RESERVED_CHILD_ENV_KEYS: &[&str] = &[
     "ZEROBOX_HOME",
     "CODEX_HOME",
     PRIVATE_BIND_MOUNTS_ENV,
+    ALLOW_LOCAL_BINDING_ENV,
+    HOST_LOOPBACK_PORTS_ENV,
     DOCKER_BROKER_SOCKET_ENV,
 ];
 
@@ -60,9 +64,15 @@ pub struct SandboxOutput {
 pub enum SandboxSetupError {
     Preparation(anyhow::Error),
     Spawn(anyhow::Error),
-    HelperExited { status: ExitStatus },
+    HelperExited {
+        status: ExitStatus,
+    },
     HelperProtocol(String),
     HelperTimeout,
+    HelperDiagnostics {
+        source: Box<SandboxSetupError>,
+        stderr: String,
+    },
 }
 
 impl std::fmt::Display for SandboxSetupError {
@@ -77,6 +87,7 @@ impl std::fmt::Display for SandboxSetupError {
                 write!(f, "Linux sandbox helper setup protocol failed: {message}")
             }
             Self::HelperTimeout => write!(f, "Linux sandbox helper did not confirm target startup"),
+            Self::HelperDiagnostics { source, stderr } => write!(f, "{source}\n{stderr}"),
         }
     }
 }
@@ -149,6 +160,8 @@ pub struct Sandbox {
     use_profile: bool,
     linux_sandbox_exe: Option<PathBuf>,
     setup_status: bool,
+    private_tmp: Option<PathBuf>,
+    allow_local_binding: bool,
 }
 
 impl Sandbox {
@@ -180,6 +193,8 @@ impl Sandbox {
             use_profile: true,
             linux_sandbox_exe: None,
             setup_status: false,
+            private_tmp: None,
+            allow_local_binding: false,
         }
     }
 
@@ -254,6 +269,19 @@ impl Sandbox {
 
     pub fn deny_write(mut self, path: impl Into<PathBuf>) -> Self {
         self.deny_write.push(path.into());
+        self
+    }
+
+    /// Mount an owner-only session directory at `/tmp`, hiding host temp files.
+    /// The caller owns the directory lifetime; commands can share it explicitly.
+    pub fn private_tmp(mut self, path: impl Into<PathBuf>) -> Self {
+        self.private_tmp = Some(path.into());
+        self
+    }
+
+    /// Permit TCP listeners inside the private network namespace only.
+    pub fn allow_local_binding(mut self, enabled: bool) -> Self {
+        self.allow_local_binding = enabled;
         self
     }
 
@@ -480,6 +508,8 @@ impl Sandbox {
             use_profile,
             linux_sandbox_exe,
             setup_status,
+            private_tmp,
+            allow_local_binding,
         } = self;
 
         let cwd = match cwd {
@@ -544,6 +574,28 @@ impl Sandbox {
         validate_literal_deny_paths(&deny_read, &deny_write)?;
         if !full_access {
             validate_paths(&allow_read, &deny_read, &allow_write, &deny_write, &cwd)?;
+        }
+
+        if allow_local_binding && (disabled || full_access || !cfg!(target_os = "linux")) {
+            return Err(anyhow::anyhow!("local binding requires the Linux sandbox").into());
+        }
+        if let Some(path) = &private_tmp {
+            if disabled || full_access || !cfg!(target_os = "linux") {
+                return Err(anyhow::anyhow!("private /tmp requires the Linux sandbox").into());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if !path.is_absolute()
+                    || std::fs::canonicalize(path).context("resolve private /tmp source")? != *path
+                {
+                    return Err(anyhow::anyhow!(
+                        "private /tmp source must be an absolute non-symlink path"
+                    )
+                    .into());
+                }
+                ensure_private_proxy_directory(path)?;
+            }
+            env.insert("TMPDIR".to_string(), "/tmp".to_string());
         }
 
         let secret_store = Arc::new(
@@ -725,6 +777,12 @@ impl Sandbox {
             Some(deny_net.as_slice())
         };
         let proxy = proxy::build_proxy(allow_net.as_deref(), deny_slice, &secret_store).await?;
+        if allow_local_binding && net_enabled && proxy.is_none() {
+            return Err(anyhow::anyhow!(
+                "private local binding requires a managed proxy for outbound network access"
+            )
+            .into());
+        }
 
         let _proxy_handle = match proxy {
             Some(ref p) => Some(p.run().await.context("failed to start network proxy")?),
@@ -817,12 +875,54 @@ impl Sandbox {
         }
         remove_reserved_child_env(&mut final_env);
         cmd.envs(&final_env);
+        if allow_local_binding {
+            cmd.env(ALLOW_LOCAL_BINDING_ENV, "1");
+            // Reserve only explicit loopback grants. Each connection still
+            // passes through the managed proxy, including deny precedence.
+            let mut ports = allow_net
+                .iter()
+                .flatten()
+                .filter_map(|domain| {
+                    let (host, port) = domain.rsplit_once(':')?;
+                    if !["localhost", "127.0.0.1", "[::1]"]
+                        .contains(&host.to_ascii_lowercase().as_str())
+                    {
+                        return None;
+                    }
+                    port.parse::<u16>().ok().filter(|port| *port != 0)
+                })
+                .collect::<Vec<_>>();
+            ports.sort_unstable();
+            ports.dedup();
+            if ports.len() > 64 {
+                return Err(anyhow::anyhow!(
+                    "at most 64 explicit host loopback ports can be forwarded"
+                )
+                .into());
+            }
+            cmd.env(
+                HOST_LOOPBACK_PORTS_ENV,
+                serde_json::to_string(&ports).context("serialize host loopback ports")?,
+            );
+        }
 
         #[cfg(target_os = "linux")]
-        if let Some(dynamic_fs) = dynamic_fs.as_ref() {
-            let serialized = serde_json::to_string(dynamic_fs.binds())
-                .context("failed to serialize private FUSE bind mounts")?;
-            cmd.env(PRIVATE_BIND_MOUNTS_ENV, serialized);
+        {
+            let mut binds = dynamic_fs
+                .as_ref()
+                .map(|fs| fs.binds().to_vec())
+                .unwrap_or_default();
+            if let Some(source) = private_tmp {
+                binds.push(DynamicBindMount {
+                    source,
+                    destination: PathBuf::from("/tmp"),
+                });
+            }
+            if !binds.is_empty() {
+                let serialized = serde_json::to_string(&binds)
+                    .context("failed to serialize private bind mounts")?;
+                cmd.env(PRIVATE_BIND_MOUNTS_ENV, serialized);
+            }
         }
 
         #[cfg(unix)]
@@ -941,17 +1041,40 @@ impl PreparedCommand {
                 self.cmd.pre_exec(move || clear_cloexec(fd));
             }
         }
-        let mut child = self
-            .cmd
-            .spawn()
-            .context("failed to spawn command")
-            .map_err(SandboxSetupError::Spawn)?;
+        let mut child = {
+            #[cfg(target_os = "linux")]
+            let _publication = crate::linux_runtime::lock_helper_publication()?;
+            self.cmd
+                .spawn()
+                .with_context(|| {
+                    format!(
+                        "failed to spawn command {}",
+                        self.cmd.as_std().get_program().to_string_lossy()
+                    )
+                })
+                .map_err(SandboxSetupError::Spawn)?
+        };
         let host_pid = child.id();
         if let Some(channel) = self.resources.setup_channel.as_mut() {
             channel.close_parent_write();
         }
         let started_pid = if let Some(channel) = self.resources.setup_channel.as_ref() {
-            let _inner_pid = channel.wait_for_started(&mut child).await?;
+            if let Err(error) = channel.wait_for_started(&mut child).await {
+                // No target has been confirmed. Preserve the helper's diagnostics
+                // before dropping its piped stdio and the owned setup resources.
+                let kill_error = child.start_kill().err();
+                let mut stderr = capture_setup_stderr(&mut child).await;
+                if let Some(error) = kill_error {
+                    stderr.push_str(&format!("\n[setup cleanup termination failed: {error}]"));
+                }
+                if let Err(error) = child.wait().await {
+                    stderr.push_str(&format!("\n[setup cleanup wait failed: {error}]"));
+                }
+                return Err(SandboxSetupError::HelperDiagnostics {
+                    source: Box::new(error),
+                    stderr,
+                });
+            }
             host_pid.ok_or_else(|| {
                 SandboxSetupError::HelperProtocol(
                     "spawned helper has no host process id".to_string(),
@@ -964,6 +1087,32 @@ impl PreparedCommand {
         };
         Ok((child, started_pid))
     }
+}
+
+async fn capture_setup_stderr(child: &mut Child) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let Some(stderr) = child.stderr.take() else {
+        // Inherited stderr was already delivered directly to the caller.
+        return String::new();
+    };
+    const LIMIT: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        stderr.take(LIMIT + 1).read_to_end(&mut bytes),
+    )
+    .await;
+    let truncated = bytes.len() as u64 > LIMIT;
+    bytes.truncate(LIMIT as usize);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    match result {
+        Err(_) => text.push_str("\n[setup stderr capture timed out; diagnostic may be incomplete]"),
+        Ok(Err(error)) => text.push_str(&format!("\n[setup stderr capture failed: {error}]")),
+        Ok(Ok(_)) if truncated => text.push_str("\n[setup stderr truncated at 65536 bytes]"),
+        Ok(Ok(_)) => {}
+    }
+    text
 }
 
 #[cfg(target_os = "linux")]
@@ -1939,7 +2088,7 @@ pub(crate) fn resolve_path(base: &Path, p: &Path) -> Result<AbsolutePathBuf> {
 fn select_sandbox_type(strict: bool) -> Result<(SandboxType, bool)> {
     match get_platform_sandbox(false) {
         Some(SandboxType::LinuxSeccomp) => {
-            if can_create_user_namespace() {
+            if can_create_user_namespace()? {
                 Ok((SandboxType::LinuxSeccomp, false))
             } else if strict {
                 anyhow::bail!(
@@ -1954,28 +2103,47 @@ fn select_sandbox_type(strict: bool) -> Result<(SandboxType, bool)> {
 }
 
 #[cfg(target_os = "linux")]
-fn can_create_user_namespace() -> bool {
+fn can_create_user_namespace() -> Result<bool> {
+    run_user_namespace_probe(|| unsafe { libc::unshare(libc::CLONE_NEWUSER) == 0 })
+}
+
+// Keep the child callback async-signal-safe: this can fork a multithreaded SDK host.
+#[cfg(target_os = "linux")]
+fn run_user_namespace_probe(probe: impl FnOnce() -> bool) -> Result<bool> {
+    let _publication = crate::linux_runtime::lock_helper_publication()?;
+    let mut limits: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read namespace probe FD limit");
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        return false;
+        return Err(std::io::Error::last_os_error()).context("fork namespace probe");
     }
     if pid == 0 {
-        let exit_code = if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
-            0
-        } else {
-            1
-        };
+        // CLOEXEC is insufficient: this probe never execs. A concurrent
+        // helper copy's writable FD otherwise stays open here during unshare,
+        // making that helper's execve fail with ETXTBSY after its owner closes it.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
+            // Older kernels lack close_range. close(2) is async-signal-safe;
+            // EBADF for unused slots is expected and every slot is visited.
+            for fd in 3..limits.rlim_max.min(i32::MAX as _) as i32 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+        let exit_code = if probe() { 0 } else { 1 };
         unsafe { libc::_exit(exit_code) };
     }
 
-    wait_for_user_namespace_probe_with(pid, |status| {
+    Ok(wait_for_user_namespace_probe_with(pid, |status| {
         let waited = unsafe { libc::waitpid(pid, status, 0) };
         if waited < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(waited)
         }
-    })
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -1996,13 +2164,29 @@ fn wait_for_user_namespace_probe_with(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn can_create_user_namespace() -> bool {
-    true
+fn can_create_user_namespace() -> Result<bool> {
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_probe_releases_inherited_helper_write_descriptors() {
+        use std::os::fd::AsRawFd;
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        assert!(
+            run_user_namespace_probe(|| unsafe { libc::fcntl(fd, libc::F_GETFD) == -1 }).unwrap(),
+            "namespace probe retained a writable helper FD until exit"
+        );
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+            "parent FD must remain open"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct InterruptedFragmentedReader {

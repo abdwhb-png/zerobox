@@ -1,0 +1,141 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -202,1 +202,5 @@
+-        let proxy_routing_active = allow_network_for_proxy;
++        if std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1") {
++            crate::proxy_routing::prepare_private_loopback(proxy_route_spec.as_deref())
++                .unwrap_or_else(|err| panic!("failed to prepare private loopback: {err}"));
++        }
++        let proxy_routing_active = allow_network_for_proxy;
+@@ -215,2 +215,3 @@
+-        && !allow_network_for_proxy
+-        && private_bind_mounts.is_empty()
++        && !allow_network_for_proxy
++        && std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() != Ok("1")
++        && private_bind_mounts.is_empty()
+@@ -365,1 +365,3 @@
+-            && name != DOCKER_BROKER_SOCKET_ENV
++            && name != DOCKER_BROKER_SOCKET_ENV
++            && name != "ZEROBOX_ALLOW_LOCAL_BINDING"
++            && name != "ZEROBOX_HOST_LOOPBACK_PORTS"
+--- upstream/linux-sandbox/src/landlock.rs
++++ upstream/linux-sandbox/src/landlock.rs
+@@ -113,1 +113,3 @@
+-    } else if proxy_routed_network {
++    } else if proxy_routed_network
++        || std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1")
++    {
+@@ -272,5 +272,5 @@
+-            // The target may connect only to the host-managed outbound TCP
+-            // bridge. Binding is used by some clients for ephemeral source
+-            // addresses, but promoting a socket to an inbound listener is
+-            // never required and must fail closed.
+-            deny_syscall(&mut rules, libc::SYS_listen);
++            // Listeners stay inside the private network namespace. Keep the
++            // default closed; a trusted launcher must opt into local servers.
++            if std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() != Ok("1") {
++                deny_syscall(&mut rules, libc::SYS_listen);
++            }
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -950,1 +950,99 @@
+-fn ensure_loopback_interface_up() -> io::Result<()> {
++pub(crate) fn prepare_private_loopback(spec: Option<&str>) -> io::Result<()> {
++    ensure_loopback_interface_up()?;
++    let ports: Vec<u16> = serde_json::from_str(
++        &std::env::var("ZEROBOX_HOST_LOOPBACK_PORTS").unwrap_or_else(|_| "[]".into())
++    ).map_err(io::Error::other)?;
++    if ports.len() > 64 || ports.contains(&0) {
++        return Err(io::Error::other("invalid host loopback forwarding ports"));
++    }
++    if !ports.is_empty() {
++        let routes: ProxyRouteSpec = serde_json::from_str(
++            spec.ok_or_else(|| io::Error::other("host loopback forwarding requires a managed proxy"))?
++        ).map_err(io::Error::other)?;
++        let route = routes.routes.iter().find(|route| route.env_key == "HTTP_PROXY")
++            .ok_or_else(|| io::Error::other("host loopback forwarding requires the HTTP proxy"))?;
++        for port in ports {
++            for ip in ["127.0.0.1", "::1"] {
++                spawn_granted_loopback_bridge(&route.uds_path, ip, port)?;
++            }
++        }
++    }
++    // Unreserved loopback ports belong exclusively to this private namespace.
++    unsafe {
++        std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
++        std::env::set_var("no_proxy", "localhost,127.0.0.1,::1");
++    }
++    Ok(())
++}
++
++fn spawn_granted_loopback_bridge(path: &Path, ip: &str, port: u16) -> io::Result<()> {
++    let listener = TcpListener::bind((ip, port))?;
++    let (read_fd, write_fd) = create_ready_pipe()?;
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        let error = io::Error::last_os_error();
++        close_fd(read_fd)?;
++        close_fd(write_fd)?;
++        return Err(error);
++    }
++    if pid == 0 {
++        let result = (|| -> io::Result<()> {
++            close_fd(read_fd)?;
++            harden_bridge_process()?;
++            let mut ready = unsafe { File::from_raw_fd(write_fd) };
++            ready.write_all(&[HOST_BRIDGE_READY])?;
++            drop(ready);
++            let active = Arc::new(AtomicUsize::new(0));
++            loop {
++                let (tcp, _) = listener.accept()?;
++                let Some(permit) = try_acquire_bridge_connection(active.clone(), 64) else {
++                    drop(tcp);
++                    continue;
++                };
++                let path = path.to_path_buf();
++                std::thread::spawn(move || {
++                    let _permit = permit;
++                    // Denial or transport failure closes only this connection.
++                    // No direct host route exists if the proxy rejects CONNECT.
++                    if let Ok(unix) = granted_loopback_tunnel(&path, port) {
++                        let _ = proxy_tcp_unix(tcp, unix);
++                    }
++                });
++            }
++        })();
++        if let Err(error) = result {
++            eprintln!("private loopback bridge failed: {error}");
++            unsafe { libc::_exit(1) };
++        }
++        unsafe { libc::_exit(0) };
++    }
++    close_fd(write_fd)?;
++    let mut ready = [0];
++    unsafe { File::from_raw_fd(read_fd) }.read_exact(&mut ready)?;
++    if ready[0] != HOST_BRIDGE_READY {
++        return Err(io::Error::other("private loopback bridge did not become ready"));
++    }
++    Ok(())
++}
++
++fn granted_loopback_tunnel(path: &Path, port: u16) -> io::Result<UnixStream> {
++    let mut stream = UnixStream::connect(path)?;
++    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
++    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
++    write!(stream, "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")?;
++    let mut response = Vec::new();
++    while !response.ends_with(b"\r\n\r\n") {
++        if response.len() >= 8192 {
++            return Err(io::Error::other("oversized loopback proxy response"));
++        }
++        let mut byte = [0];
++        stream.read_exact(&mut byte)?;
++        response.push(byte[0]);
++    }
++    if !response.starts_with(b"HTTP/1.1 200 ") && !response.starts_with(b"HTTP/1.0 200 ") {
++        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "loopback proxy refused CONNECT"));
++    }
++    Ok(stream)
++}
++
++fn ensure_loopback_interface_up() -> io::Result<()> {

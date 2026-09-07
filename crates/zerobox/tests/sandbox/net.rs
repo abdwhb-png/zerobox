@@ -1,5 +1,112 @@
 use crate::support::*;
 
+#[tokio::test]
+async fn private_listeners_reject_unproxied_host_network_access() {
+    let error = zerobox::Sandbox::command("/bin/true")
+        .no_profile()
+        .allow_read("/")
+        .allow_net(&[] as &[&str])
+        .allow_local_binding(true)
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .err()
+        .expect("private listeners cannot run in the host network namespace");
+    assert!(error.to_string().contains("managed proxy"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_test_listeners_preserve_explicit_host_loopback_grants() {
+    let (port, host) = local_http_server(std::net::Ipv4Addr::LOCALHOST.into());
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/",
+        "--allow-local-binding",
+        &format!("--allow-net=localhost:{port}"),
+        "--",
+        "curl",
+        "-fsS",
+        "--max-time",
+        "3",
+        &format!("http://localhost:{port}"),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OK");
+    assert!(host.join().unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_binding_is_opt_in_and_stays_inside_the_network_namespace() {
+    let host = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = host.local_addr().unwrap().port();
+    let script = format!(
+        r#"import socket, threading
+s = socket.socket()
+s.bind(('127.0.0.1', {port}))
+s.listen(1)
+def serve():
+    c, _ = s.accept()
+    c.sendall(b'private-server')
+    c.close()
+t = threading.Thread(target=serve); t.start()
+c = socket.create_connection(('127.0.0.1', {port}), 2)
+assert c.recv(128) == b'private-server'
+c.close(); t.join(); s.close()
+print('private-listener-ok')
+"#
+    );
+    for outbound in [false, true] {
+        let mut args = vec![
+            "--profile=analysis-strict",
+            "--allow-read=/",
+            "--allow-local-binding",
+        ];
+        if outbound {
+            args.push("--allow-net=example.com");
+        }
+        args.extend(["--", "/usr/bin/python3", "-c", &script]);
+        let out = run(&args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "private-listener-ok\n");
+        args.retain(|arg| *arg != "--allow-local-binding");
+        let denied = run(&args);
+        assert!(!denied.status.success());
+        assert!(
+            stderr(&denied).contains("Operation not permitted"),
+            "{}",
+            stderr(&denied)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn proxy_routed_private_stream_socketpairs_work_without_host_unix_sockets() {
+    let out = zerobox::Sandbox::command("/usr/bin/python3").args(&["-c",
+        r#"import errno, socket
+for flags in [0, socket.SOCK_CLOEXEC, socket.SOCK_NONBLOCK, socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK]:
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM | flags, 0)
+    a.sendall(b'private child output')
+    assert b.recv(128) == b'private child output'
+    a.close(); b.close()
+for create in [lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)]:
+    try: create()
+    except OSError as e: assert e.errno == errno.EPERM, e
+    else: raise AssertionError('host socket-capable operation allowed')
+print('private-ipc-ok')
+"#,
+    ]).no_profile().allow_read("/").allow_net(&["example.com"])
+        .linux_sandbox_exe(zerobox_exec()).run().await.expect("start sandbox");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"private-ipc-ok\n");
+}
+
 #[cfg(target_os = "linux")]
 fn local_http_server(ip: std::net::IpAddr) -> (u16, std::thread::JoinHandle<bool>) {
     use std::io::{Read, Write};

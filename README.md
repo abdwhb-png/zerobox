@@ -41,11 +41,25 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 
 - Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`
 - Codex rust shim baseline: `rust-v0.131.0-alpha.22` at commit `9b8cf56cdefb09f54564ccc295fd42f6647f558f`
-- Version identity for this fork: `0.3.3-fork.12` (Python: `0.3.3+fork.12`)
+- Version identity for this fork: `0.3.3-fork.13` (Python: `0.3.3+fork.13`)
 
 ## Build and usage (local Linux / WSL2 only)
 
 No published install artifacts are exposed in this fork.
+
+`--private-tmp /absolute/owner-only-directory` maps persistent per-session
+storage at `/tmp` and sets `TMPDIR=/tmp` without exposing host temporary files.
+`--allow-local-binding` enables TCP test listeners only in the private network
+namespace. Explicit loopback port grants still reach the host through the
+managed proxy; other loopback ports stay private. Unrestricted unproxied
+network access cannot be combined with private listeners. Neither option
+falls back to unsandboxed execution.
+
+Buffered subprocess I/O may use private Unix stream socketpairs. Named host
+Unix sockets, datagram socketpairs, UDP, and raw sockets remain prohibited in
+managed-network mode. Setup errors retain helper diagnostics separately from
+the target's exit code and output. FUSE caches immutable policy computations,
+not file contents or backing metadata.
 
 Reproducible external install recipe:
 

@@ -2,12 +2,24 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use tempfile::TempDir;
 use zerobox_sandboxing::landlock::ZEROBOX_LINUX_SANDBOX_ARG0;
 
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+
+// A fork can inherit a helper's writable staging FD before CLOEXEC or the
+// namespace probe closes it. Serialize only staging and process creation,
+// never the execution of target commands.
+static HELPER_PUBLICATION: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_helper_publication() -> Result<MutexGuard<'static, ()>> {
+    HELPER_PUBLICATION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Linux helper publication lock poisoned"))
+}
 
 /// Owner-only, per-execution state that must not live below the sandboxed
 /// workspace. The contained paths are intentionally short for AF_UNIX users.
@@ -217,6 +229,7 @@ fn validate_runtime_socket_budget(parent: &Path) -> Result<()> {
 }
 
 pub(crate) fn stage_helper(source: &Path, destination: &Path, uid: u32) -> Result<()> {
+    let _publication = lock_helper_publication()?;
     let source = source
         .canonicalize()
         .with_context(|| format!("failed to resolve Linux helper {}", source.display()))?;
@@ -259,6 +272,7 @@ pub(crate) fn stage_helper(source: &Path, destination: &Path, uid: u32) -> Resul
             output.write_all(&buffer[..read])?;
         }
         output.sync_all()?;
+        drop(output);
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o500))?;
         std::fs::rename(&temporary, destination)?;
         File::open(destination.parent().expect("helper destination parent"))?.sync_all()?;
