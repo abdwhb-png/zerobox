@@ -321,6 +321,8 @@ pub(crate) struct DynamicDenyMounts {
     _sessions: Vec<fuser::BackgroundSession>,
     _root: tempfile::TempDir,
     binds: Vec<DynamicBindMount>,
+    #[cfg(test)]
+    policy: Arc<DynamicDenyPolicy>,
 }
 
 impl DynamicDenyMounts {
@@ -394,6 +396,8 @@ impl DynamicDenyMounts {
         }
 
         Ok(Some(Self {
+            #[cfg(test)]
+            policy,
             _sessions: sessions,
             _root: root,
             binds,
@@ -1015,7 +1019,7 @@ impl Filesystem for GuardedPassthroughFs {
             children.sort_by_key(|entry| entry.file_name());
             let parent_path = path.parent().unwrap_or(Path::new(""));
             let parent_inode = self.state().inode_for_path(parent_path);
-            let mut entries = vec![
+            let entries = [
                 (inode, FileType::Directory, OsStr::new(".").to_os_string()),
                 (
                     parent_inode,
@@ -1023,7 +1027,22 @@ impl Filesystem for GuardedPassthroughFs {
                     OsStr::new("..").to_os_string(),
                 ),
             ];
-            for child in children {
+            for (index, (entry_inode, kind, name)) in
+                entries.into_iter().enumerate().skip(offset as usize)
+            {
+                if reply.add(entry_inode, (index + 1) as u64, kind, name) {
+                    return Ok(());
+                }
+            }
+            // Directory cookies refer to the unfiltered sorted names. Apply
+            // the offset before policy/metadata work, and stop when the kernel
+            // page is full. Rechecking all children on every page is quadratic
+            // for large package directories. No filesystem state is cached.
+            for (index, child) in children
+                .into_iter()
+                .enumerate()
+                .skip(offset.saturating_sub(2) as usize)
+            {
                 let child_path = path.join(child.file_name());
                 let resolved_child = resolved_directory
                     .as_ref()
@@ -1037,22 +1056,15 @@ impl Filesystem for GuardedPassthroughFs {
                 let kind = FileType::from_std(child.file_type()?)
                     .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
                 let child_inode = self.state().inode_for_path(&child_path);
-                entries.push((child_inode, kind, child.file_name()));
+                if reply.add(child_inode, (index + 3) as u64, kind, child.file_name()) {
+                    break;
+                }
             }
-            Ok::<_, io::Error>(entries)
+            Ok::<_, io::Error>(())
         })();
 
         match result {
-            Ok(entries) => {
-                for (index, (inode, kind, name)) in
-                    entries.into_iter().enumerate().skip(offset as usize)
-                {
-                    if reply.add(inode, (index + 1) as u64, kind, name) {
-                        break;
-                    }
-                }
-                reply.ok();
-            }
+            Ok(()) => reply.ok(),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -2027,6 +2039,47 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(mounts.root().is_dir());
+    }
+
+    #[test]
+    fn reading_one_directory_page_does_not_check_the_entire_directory() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        for i in 0..2000 {
+            std::fs::write(
+                lower
+                    .path()
+                    .join(format!("entry-{i:04}-{}", "x".repeat(80))),
+                "",
+            )
+            .unwrap();
+        }
+        std::fs::write(lower.path().join("hidden.pem"), "secret").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let mut entries = std::fs::read_dir(view).unwrap();
+        assert!(entries.next().unwrap().is_ok());
+        assert!(
+            mounts.policy.access_cache.lock().unwrap().len() < 2000,
+            "first directory page eagerly evaluated every child"
+        );
+        drop(entries);
+        let mut names = std::fs::read_dir(view)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 2000);
+        assert!(!names.iter().any(|name| name == "hidden.pem"));
     }
 
     #[test]

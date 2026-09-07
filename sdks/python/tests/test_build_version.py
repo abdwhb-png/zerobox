@@ -20,7 +20,7 @@ from scripts.hatch_build import VERSION, semver_to_pep440  # noqa: E402
 
 
 def test_repository_version_is_generic_fork_release() -> None:
-    assert VERSION == "0.3.3+fork.13"
+    assert VERSION == "0.3.3+fork.14"
 
 
 @pytest.mark.parametrize(
