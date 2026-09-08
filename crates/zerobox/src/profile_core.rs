@@ -141,6 +141,7 @@ pub struct Profile {
     pub deny_write: Option<Vec<String>>,
     pub deny_write_globs: Option<Vec<String>>,
     pub allow_net: Option<Vec<String>>,
+    pub allow_host_net: Option<Vec<String>>,
     pub deny_net: Option<Vec<String>>,
     pub docker: Option<DockerAccessPolicy>,
     pub set_env: Option<HashMap<String, String>>,
@@ -283,6 +284,7 @@ pub fn merge_profiles(base: &Profile, child: &Profile) -> Profile {
         deny_write: dedup_append(&base.deny_write, &child.deny_write),
         deny_write_globs: dedup_append(&base.deny_write_globs, &child.deny_write_globs),
         allow_net: dedup_append(&base.allow_net, &child.allow_net),
+        allow_host_net: dedup_append(&base.allow_host_net, &child.allow_host_net),
         deny_net: dedup_append(&base.deny_net, &child.deny_net),
         docker: child.docker.clone().or_else(|| base.docker.clone()),
         set_env: merge_maps(&base.set_env, &child.set_env),
@@ -541,6 +543,29 @@ mod tests {
         assert_eq!(
             profile.deny_write_globs,
             Some(vec!["/home/tester/cache/**".to_string()])
+        );
+    }
+
+    #[test]
+    fn host_network_routes_merge_independently_from_public_domains() {
+        let base = super::Profile {
+            allow_net: Some(vec!["github.com".to_string()]),
+            allow_host_net: Some(vec!["*.dev.test:443".to_string()]),
+            ..Default::default()
+        };
+        let child = super::Profile {
+            allow_host_net: Some(vec!["dashboard.internal.test:8443".to_string()]),
+            ..Default::default()
+        };
+
+        let merged = super::merge_profiles(&base, &child);
+        assert_eq!(merged.allow_net, Some(vec!["github.com".to_string()]));
+        assert_eq!(
+            merged.allow_host_net,
+            Some(vec![
+                "*.dev.test:443".to_string(),
+                "dashboard.internal.test:8443".to_string(),
+            ])
         );
     }
 }

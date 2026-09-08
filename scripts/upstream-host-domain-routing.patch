@@ -1,0 +1,753 @@
+--- upstream/network-proxy/src/config.rs
++++ upstream/network-proxy/src/config.rs
+@@ -231,6 +231,8 @@
+     pub mode: NetworkMode,
+     #[serde(default)]
+     pub domains: Option<NetworkDomainPermissions>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub host_domains: Option<NetworkDomainPermissions>,
+     #[serde(default)]
+     pub unix_sockets: Option<NetworkUnixSocketPermissions>,
+     pub allow_local_binding: bool,
+@@ -251,6 +253,7 @@
+             dangerously_allow_all_unix_sockets: false,
+             mode: NetworkMode::default(),
+             domains: None,
++            host_domains: None,
+             unix_sockets: None,
+             allow_local_binding: false,
+             mitm: false,
+@@ -267,6 +270,10 @@
+         self.domain_entries(NetworkDomainPermission::Deny)
+     }
+ 
++    pub fn allowed_host_domains(&self) -> Option<Vec<String>> {
++        self.host_domain_entries(NetworkDomainPermission::Allow)
++    }
++
+     fn domain_entries(&self, permission: NetworkDomainPermission) -> Option<Vec<String>> {
+         self.domains
+             .as_ref()
+@@ -281,6 +288,20 @@
+             .filter(|entries: &Vec<String>| !entries.is_empty())
+     }
+ 
++    fn host_domain_entries(&self, permission: NetworkDomainPermission) -> Option<Vec<String>> {
++        self.host_domains
++            .as_ref()
++            .map(|domains| {
++                domains
++                    .effective_entries()
++                    .iter()
++                    .filter(|entry| entry.permission == permission)
++                    .map(|entry| entry.pattern.clone())
++                    .collect()
++            })
++            .filter(|entries: &Vec<String>| !entries.is_empty())
++    }
++
+     pub fn allow_unix_sockets(&self) -> Vec<String> {
+         self.unix_sockets
+             .as_ref()
+@@ -305,6 +326,10 @@
+         self.set_domain_entries(denied_domains, NetworkDomainPermission::Deny);
+     }
+ 
++    pub fn set_allowed_host_domains(&mut self, allowed_host_domains: Vec<String>) {
++        self.set_host_domain_entries(allowed_host_domains, NetworkDomainPermission::Allow);
++    }
++
+     pub fn upsert_domain_permission(
+         &mut self,
+         host: String,
+@@ -347,6 +372,30 @@
+         self.domains = (!domains.entries.is_empty()).then_some(domains);
+     }
+ 
++    fn set_host_domain_entries(
++        &mut self,
++        entries: Vec<String>,
++        permission: NetworkDomainPermission,
++    ) {
++        let mut domains = self.host_domains.take().unwrap_or_default();
++        domains
++            .entries
++            .retain(|entry| entry.permission != permission);
++        for entry in entries {
++            if !domains
++                .entries
++                .iter()
++                .any(|existing| existing.pattern == entry && existing.permission == permission)
++            {
++                domains.entries.push(NetworkDomainPermissionEntry {
++                    pattern: entry,
++                    permission,
++                });
++            }
++        }
++        self.host_domains = (!domains.entries.is_empty()).then_some(domains);
++    }
++
+     fn set_unix_socket_entries(
+         &mut self,
+         entries: Vec<String>,
+@@ -682,6 +731,7 @@
+                 dangerously_allow_all_unix_sockets: false,
+                 mode: NetworkMode::Full,
+                 domains: None,
++                host_domains: None,
+                 unix_sockets: None,
+                 allow_local_binding: false,
+                 mitm: false,
+--- upstream/network-proxy/src/state.rs
++++ upstream/network-proxy/src/state.rs
+@@ -12,6 +12,7 @@
+ use crate::runtime::ConfigState;
+ use serde::Deserialize;
+ use std::collections::HashSet;
++use std::net::IpAddr;
+ use std::sync::Arc;
+ 
+ pub use crate::runtime::BlockedRequest;
+@@ -62,8 +63,10 @@
+ ) -> anyhow::Result<ConfigState> {
+     crate::config::validate_unix_socket_allowlist_paths(&config)?;
+     let allowed_domains = config.network.allowed_domains().unwrap_or_default();
++    let allowed_host_domains = config.network.allowed_host_domains().unwrap_or_default();
+     let denied_domains = config.network.denied_domains().unwrap_or_default();
+     let allow_rules = parse_network_rules("network.allowed_domains", &allowed_domains)?;
++    let allow_host_rules = parse_host_network_rules(&allowed_host_domains)?;
+     let deny_rules = parse_network_rules("network.denied_domains", &denied_domains)?;
+     validate_non_global_wildcard_domain_patterns("network.denied_domains", &denied_domains)
+         .map_err(NetworkProxyConstraintError::into_anyhow)?;
+@@ -82,6 +85,7 @@
+         allow_set,
+         deny_set,
+         allow_rules,
++        allow_host_rules,
+         deny_rules,
+         mitm,
+         constraints,
+@@ -90,6 +94,44 @@
+     })
+ }
+ 
++fn parse_host_network_rules(entries: &[String]) -> anyhow::Result<Vec<NetworkRule>> {
++    entries
++        .iter()
++        .map(|entry| {
++            let rule = NetworkRule::parse(entry).map_err(|err| {
++                NetworkProxyConstraintError::InvalidValue {
++                    field_name: "network.allowed_host_domains",
++                    candidate: entry.clone(),
++                    allowed: err.to_string(),
++                }
++            })?;
++            let domain = rule
++                .pattern
++                .strip_prefix("**.")
++                .or_else(|| rule.pattern.strip_prefix("*."))
++                .unwrap_or(&rule.pattern);
++            let valid_domain = !domain.is_empty()
++                && !domain.contains('*')
++                && matches!(url::Host::parse(domain), Ok(url::Host::Domain(_)));
++            if rule.port.is_none()
++                || rule.pattern == "*"
++                || rule.is_explicit_loopback()
++                || rule.pattern.parse::<IpAddr>().is_ok()
++                || !valid_domain
++            {
++                return Err(NetworkProxyConstraintError::InvalidValue {
++                    field_name: "network.allowed_host_domains",
++                    candidate: rule.as_string(),
++                    allowed: "exact DNS hostnames or scoped wildcards with an explicit port"
++                        .to_string(),
++                }
++                .into_anyhow());
++            }
++            Ok(rule)
++        })
++        .collect()
++}
++
+ fn parse_network_rules(
+     field_name: &'static str,
+     entries: &[String],
+--- upstream/network-proxy/src/runtime.rs
++++ upstream/network-proxy/src/runtime.rs
+@@ -160,6 +160,7 @@
+     pub allow_set: GlobSet,
+     pub deny_set: GlobSet,
+     pub allow_rules: Vec<NetworkRule>,
++    pub allow_host_rules: Vec<NetworkRule>,
+     pub deny_rules: Vec<NetworkRule>,
+     pub mitm: Option<Arc<MitmState>>,
+     pub constraints: NetworkProxyConstraints,
+@@ -375,7 +376,7 @@
+             Ok(host) => host,
+             Err(_) => return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)),
+         };
+-        let (deny_set, allow_set, deny_rules, allow_rules, allowed_domains) = {
++        let (deny_set, allow_set, deny_rules, allow_rules, allow_host_rules, allowed_domains) = {
+             let guard = self.state.read().await;
+             let allowed_domains = guard.config.network.allowed_domains();
+             (
+@@ -383,6 +384,7 @@
+                 guard.allow_set.clone(),
+                 guard.deny_rules.clone(),
+                 guard.allow_rules.clone(),
++                guard.allow_host_rules.clone(),
+                 allowed_domains,
+             )
+         };
+@@ -401,6 +403,10 @@
+             return Ok(HostBlockDecision::Blocked(HostBlockReason::Denied));
+         }
+ 
++        if rules_match_host_or_unscoped(&allow_host_rules, host_str, port, false) {
++            return Ok(HostBlockDecision::Allowed);
++        }
++
+         let is_allowlisted = rules_match_host_or_unscoped(&allow_rules, host_str, port, false)
+             || (allow_rules.is_empty() && globset_matches_host_or_unscoped(&allow_set, host_str));
+         {
+@@ -450,6 +456,27 @@
+         }
+     }
+ 
++    pub async fn is_host_domain_route(&self, host: &str, port: u16) -> Result<bool> {
++        self.reload_if_needed().await?;
++        let host = match Host::parse(host) {
++            Ok(host) => host,
++            Err(_) => return Ok(false),
++        };
++        let guard = self.state.read().await;
++        if rules_match_host_or_unscoped(&guard.deny_rules, host.as_str(), port, true)
++            || (guard.deny_rules.is_empty()
++                && globset_matches_host_or_unscoped(&guard.deny_set, host.as_str()))
++        {
++            return Ok(false);
++        }
++        Ok(rules_match_host_or_unscoped(
++            &guard.allow_host_rules,
++            host.as_str(),
++            port,
++            false,
++        ))
++    }
++
+     pub async fn record_blocked(&self, entry: BlockedRequest) -> Result<()> {
+         self.reload_if_needed().await?;
+         let blocked_for_observer = entry.clone();
+@@ -944,6 +971,75 @@
+         network
+     }
+ 
++    fn network_settings_with_host_domains(
++        allowed_host_domains: &[&str],
++        denied_domains: &[&str],
++    ) -> NetworkProxySettings {
++        let mut network = network_settings(&[], denied_domains);
++        network.set_allowed_host_domains(strings(allowed_host_domains));
++        network
++    }
++
++    #[tokio::test]
++    async fn host_domain_rules_allow_only_the_matching_hostname_and_port() {
++        let state = network_proxy_state_for_policy(network_settings_with_host_domains(
++            &["*.dev.test:443"],
++            &[],
++        ));
++
++        assert_eq!(
++            state
++                .host_blocked("shein-ecom.dev.test", 443)
++                .await
++                .unwrap(),
++            HostBlockDecision::Allowed
++        );
++        assert_eq!(
++            state.host_blocked("shein-ecom.dev.test", 80).await.unwrap(),
++            HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
++        );
++        assert_eq!(
++            state.host_blocked("dev.test", 443).await.unwrap(),
++            HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
++        );
++    }
++
++    #[tokio::test]
++    async fn explicit_deny_wins_over_a_host_domain_route() {
++        let state = network_proxy_state_for_policy(network_settings_with_host_domains(
++            &["*.dev.test:443"],
++            &["shein-ecom.dev.test:443"],
++        ));
++
++        assert_eq!(
++            state
++                .host_blocked("shein-ecom.dev.test", 443)
++                .await
++                .unwrap(),
++            HostBlockDecision::Blocked(HostBlockReason::Denied)
++        );
++    }
++
++    #[test]
++    fn host_domain_rules_require_a_scoped_hostname_and_explicit_port() {
++        for invalid in [
++            "*.dev.test",
++            "*:443",
++            "localhost:443",
++            "127.0.0.1:443",
++            "https://app.dev.test:443",
++            "app.dev.test:443/path",
++        ] {
++            let mut network = NetworkProxySettings::default();
++            network.set_allowed_host_domains(vec![invalid.to_string()]);
++            let result = build_config_state(
++                NetworkProxyConfig { network },
++                NetworkProxyConstraints::default(),
++            );
++            assert!(result.is_err(), "host domain rule {invalid:?} must fail");
++        }
++    }
++
+     fn network_settings_with_unix_sockets(
+         allowed_domains: &[&str],
+         denied_domains: &[&str],
+--- upstream/network-proxy/src/connect_policy.rs
++++ upstream/network-proxy/src/connect_policy.rs
+@@ -16,6 +16,12 @@
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+ 
++#[derive(Clone, Debug)]
++pub(crate) struct HostDomainRoute {
++    pub(crate) host: String,
++    pub(crate) port: u16,
++}
++
+ #[derive(Clone)]
+ pub(crate) struct TargetCheckedTcpConnector {
+     policy: TargetPolicy,
+@@ -46,6 +52,16 @@
+     type Error = BoxError;
+ 
+     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
++        if let Some(route) = input.extensions().get::<HostDomainRoute>() {
++            if self.policy.allows_host_domain_route(route).await? {
++                return TcpConnector::new().serve(input).await;
++            }
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "host-domain route rejected by policy",
++            )
++            .into());
++        }
+         if input.extensions().get::<ProxyAddress>().is_some() {
+             return TcpConnector::new().serve(input).await;
+         }
+@@ -90,6 +106,16 @@
+ }
+ 
+ impl TargetPolicy {
++    async fn allows_host_domain_route(&self, route: &HostDomainRoute) -> Result<bool, BoxError> {
++        match self {
++            Self::Config { .. } => Ok(false),
++            Self::State(state) => state
++                .is_host_domain_route(&route.host, route.port)
++                .await
++                .map_err(proxy_state_error),
++        }
++    }
++
+     async fn allows_non_public_target(&self, addr: SocketAddr) -> Result<bool, BoxError> {
+         match self {
+             Self::Config {
+@@ -230,4 +256,30 @@
+             .expect_err("the final rebound address must be rechecked");
+         assert!(format!("{error:?}").contains("network target rejected by policy"));
+     }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn host_domain_route_marker_is_rechecked_before_loopback_connect() {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++            .await
++            .expect("bind host-local target");
++        let target = listener.local_addr().expect("host-local target addr");
++        let hostname = "route-target.invalid";
++        let mut settings = NetworkProxySettings::default();
++        settings.set_allowed_host_domains(vec![format!("{hostname}:{}", target.port())]);
++        settings.set_denied_domains(vec![format!("{hostname}:{}", target.port())]);
++        let connector =
++            TargetCheckedTcpConnector::new(Arc::new(network_proxy_state_for_policy(settings)));
++
++        let mut request: rama_tcp::client::Request =
++            rama_tcp::client::Request::new(HostWithPort::from(target));
++        request.extensions_mut().insert(HostDomainRoute {
++            host: hostname.to_string(),
++            port: target.port(),
++        });
++        let error = Service::serve(&connector, request)
++            .await
++            .expect_err("deny rule must invalidate the internal route marker");
++
++        assert!(format!("{error:?}").contains("host-domain route rejected by policy"));
++    }
+ }
+--- upstream/network-proxy/src/http_proxy.rs
++++ upstream/network-proxy/src/http_proxy.rs
+@@ -1,4 +1,5 @@
+ use crate::config::NetworkMode;
++use crate::connect_policy::HostDomainRoute;
+ use crate::connect_policy::TargetCheckedTcpConnector;
+ use crate::mitm;
+ use crate::network_policy::BlockDecisionAuditEventArgs;
+@@ -58,6 +59,7 @@
+ use rama_http_backend::server::layer::upgrade::UpgradeLayer;
+ use rama_http_backend::server::layer::upgrade::Upgraded;
+ use rama_net::Protocol;
++use rama_net::address::HostWithPort;
+ use rama_net::address::ProxyAddress;
+ use rama_net::client::ConnectorService;
+ use rama_net::client::EstablishedClientConnection;
+@@ -245,6 +247,20 @@
+         }
+     }
+ 
++    match app_state.is_host_domain_route(&host, authority.port).await {
++        Ok(true) => {
++            req.extensions_mut().insert(HostDomainRoute {
++                host: host.clone(),
++                port: authority.port,
++            });
++        }
++        Ok(false) => {}
++        Err(err) => {
++            error!("failed to evaluate host-domain route for CONNECT {host}: {err}");
++            return Err(text_response(StatusCode::INTERNAL_SERVER_ERROR, "error"));
++        }
++    }
++
+     let mode = app_state
+         .network_mode()
+         .await
+@@ -335,10 +351,11 @@
+     // MITM intercepts HTTPS traffic to inspect/modify headers. Required for:
+     // - Limited mode: enforcing method restrictions on inner requests
+     // - Any mode with header transformer: secret placeholder substitution
+-    if upgraded
+-        .extensions()
+-        .get::<Arc<mitm::MitmState>>()
+-        .is_some()
++    if upgraded.extensions().get::<HostDomainRoute>().is_none()
++        && upgraded
++            .extensions()
++            .get::<Arc<mitm::MitmState>>()
++            .is_some()
+     {
+         let host = normalize_host(&target.host.to_string());
+         let port = target.port;
+@@ -370,11 +387,14 @@
+     };
+ 
+     let target_host = target.host.to_string();
+-    let proxy = if allow_upstream_proxy && !is_canonical_loopback_alias(&target_host) {
+-        proxy_for_connect()
+-    } else {
+-        None
+-    };
++    let host_domain_route = upgraded.extensions().get::<HostDomainRoute>().is_some();
++    let proxy =
++        if allow_upstream_proxy && !host_domain_route && !is_canonical_loopback_alias(&target_host)
++        {
++            proxy_for_connect()
++        } else {
++            None
++        };
+     match proxy.as_ref() {
+         Some(proxy) => info!(
+             "CONNECT route selected (host={}, port={}, route=upstream_proxy, proxy={})",
+@@ -408,8 +428,13 @@
+         extensions.insert(proxy);
+     }
+ 
+-    let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
+-        .with_protocol(Protocol::HTTPS);
++    let dial_authority = if extensions.get::<HostDomainRoute>().is_some() {
++        HostWithPort::from(SocketAddr::from(([127, 0, 0, 1], authority.port)))
++    } else {
++        authority.clone()
++    };
++    let req =
++        TcpRequest::new_with_extensions(dial_authority, extensions).with_protocol(Protocol::HTTPS);
+     let proxy_connector = HttpProxyConnector::optional(TargetCheckedTcpConnector::new(app_state));
+     let tls_config = TlsConnectorDataBuilder::new()
+         .with_alpn_protocols_http_auto()
+@@ -1041,9 +1066,17 @@
+     use pretty_assertions::assert_eq;
+     use rama_http::Method;
+     use rama_http::Request;
++    use rama_tls_rustls::dep::pki_types::PrivatePkcs8KeyDer;
++    use rama_tls_rustls::dep::pki_types::ServerName;
++    use rama_tls_rustls::dep::rcgen;
++    use rama_tls_rustls::dep::rustls;
++    use rama_tls_rustls::dep::rustls::server::ClientHello;
++    use rama_tls_rustls::dep::rustls::server::ResolvesServerCert;
++    use rama_tls_rustls::dep::rustls::sign::CertifiedKey as RustlsCertifiedKey;
+     use std::net::Ipv4Addr;
+     use std::net::TcpListener as StdTcpListener;
+     use std::sync::Arc;
++    use std::sync::Mutex;
+     use tokio::io::AsyncReadExt;
+     use tokio::io::AsyncWriteExt;
+     use tokio::net::TcpListener as TokioTcpListener;
+@@ -1166,6 +1199,247 @@
+         let _ = target_task.await;
+     }
+ 
++    #[tokio::test]
++    async fn http_connect_host_domain_route_dials_host_loopback_without_dns() {
++        let target_listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++            .await
++            .expect("target listener should bind");
++        let target_addr = target_listener
++            .local_addr()
++            .expect("target listener should expose local addr");
++        let target_task = tokio::spawn(async move {
++            let (mut stream, _) = target_listener
++                .accept()
++                .await
++                .expect("host-local target should accept");
++            let mut marker = [0_u8; 4];
++            timeout(Duration::from_secs(2), stream.read_exact(&mut marker))
++                .await
++                .expect("tunnel should forward before timeout")
++                .expect("target should receive marker");
++            marker
++        });
++
++        let state = Arc::new(network_proxy_state_for_policy({
++            let mut network = NetworkProxySettings::default();
++            network.set_allowed_host_domains(vec![format!(
++                "route-target.invalid:{}",
++                target_addr.port()
++            )]);
++            network
++        }));
++        let listener =
++            StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("proxy listener should bind");
++        let proxy_addr = listener
++            .local_addr()
++            .expect("proxy listener should expose local addr");
++        let proxy_task = tokio::spawn(run_http_proxy_with_std_listener(
++            state, listener, /*policy_decider*/ None,
++        ));
++
++        let mut stream = tokio::net::TcpStream::connect(proxy_addr)
++            .await
++            .expect("client should connect to proxy");
++        let authority = format!("route-target.invalid:{}", target_addr.port());
++        let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
++        stream
++            .write_all(request.as_bytes())
++            .await
++            .expect("client should write CONNECT request");
++
++        let mut response = [0_u8; 256];
++        let bytes_read = timeout(Duration::from_secs(2), stream.read(&mut response))
++            .await
++            .expect("proxy should respond before timeout")
++            .expect("client should read proxy response");
++        assert!(
++            String::from_utf8_lossy(&response[..bytes_read]).starts_with("HTTP/1.1 200 OK\r\n")
++        );
++        stream
++            .write_all(b"ping")
++            .await
++            .expect("client should write tunnel payload");
++
++        assert_eq!(
++            timeout(Duration::from_secs(2), target_task)
++                .await
++                .expect("target task should complete")
++                .expect("target task should succeed"),
++            *b"ping"
++        );
++
++        drop(stream);
++        proxy_task.abort();
++        let _ = proxy_task.await;
++    }
++
++    #[derive(Debug)]
++    struct RecordingCertificateResolver {
++        certified_key: Arc<RustlsCertifiedKey>,
++        observed_sni: Arc<Mutex<Option<String>>>,
++    }
++
++    impl ResolvesServerCert for RecordingCertificateResolver {
++        fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<RustlsCertifiedKey>> {
++            *self
++                .observed_sni
++                .lock()
++                .expect("SNI lock should not be poisoned") =
++                client_hello.server_name().map(str::to_string);
++            Some(self.certified_key.clone())
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn host_domain_tunnel_preserves_tls_sni_and_http_host() {
++        ensure_rustls_crypto_provider();
++        let hostname = "shein-ecom.dev.test";
++        let generated = rcgen::generate_simple_self_signed(vec![hostname.to_string()])
++            .expect("test certificate should generate");
++        let cert_der = generated.cert.der().clone();
++        let key_der = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der()).into();
++        let provider = rustls::crypto::CryptoProvider::get_default()
++            .expect("rustls crypto provider should be installed");
++        let certified_key = Arc::new(
++            RustlsCertifiedKey::from_der(vec![cert_der.clone()], key_der, provider)
++                .expect("test certified key should build"),
++        );
++        let observed_sni = Arc::new(Mutex::new(None));
++        let resolver = RecordingCertificateResolver {
++            certified_key,
++            observed_sni: observed_sni.clone(),
++        };
++        let server_config = Arc::new(
++            rustls::ServerConfig::builder()
++                .with_no_client_auth()
++                .with_cert_resolver(Arc::new(resolver)),
++        );
++
++        let target_listener =
++            StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("TLS target should bind");
++        let target_addr = target_listener
++            .local_addr()
++            .expect("TLS target should expose local addr");
++        let target_task = tokio::task::spawn_blocking(move || {
++            let (stream, _) = target_listener.accept().expect("TLS target should accept");
++            stream
++                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
++                .expect("TLS target read timeout should apply");
++            let connection = rustls::ServerConnection::new(server_config)
++                .expect("TLS server connection should build");
++            let mut tls = rustls::StreamOwned::new(connection, stream);
++            let mut request = Vec::new();
++            let mut chunk = [0_u8; 512];
++            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
++                let read = std::io::Read::read(&mut tls, &mut chunk)
++                    .expect("TLS server should read HTTP request");
++                if read == 0 {
++                    break;
++                }
++                request.extend_from_slice(&chunk[..read]);
++            }
++            std::io::Write::write_all(
++                &mut tls,
++                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
++            )
++            .expect("TLS server should write response");
++            std::io::Write::flush(&mut tls).expect("TLS server should flush response");
++            String::from_utf8(request).expect("HTTP request should be UTF-8")
++        });
++
++        let state = Arc::new(network_proxy_state_for_policy({
++            let mut network = NetworkProxySettings::default();
++            network.set_allowed_host_domains(vec![format!("*.dev.test:{}", target_addr.port())]);
++            network
++        }));
++        let proxy_listener =
++            StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("proxy listener should bind");
++        let proxy_addr = proxy_listener
++            .local_addr()
++            .expect("proxy listener should expose local addr");
++        let proxy_task = tokio::spawn(run_http_proxy_with_std_listener(
++            state,
++            proxy_listener,
++            /*policy_decider*/ None,
++        ));
++
++        let client_response = tokio::task::spawn_blocking(move || {
++            let mut stream = std::net::TcpStream::connect(proxy_addr)
++                .expect("TLS client should connect to proxy");
++            stream
++                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
++                .expect("TLS client read timeout should apply");
++            let authority = format!("{hostname}:{}", target_addr.port());
++            std::io::Write::write_all(
++                &mut stream,
++                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
++            )
++            .expect("TLS client should write CONNECT request");
++            let mut connect_response = Vec::new();
++            let mut byte = [0_u8; 1];
++            while !connect_response.ends_with(b"\r\n\r\n") {
++                std::io::Read::read_exact(&mut stream, &mut byte)
++                    .expect("TLS client should read CONNECT response");
++                connect_response.push(byte[0]);
++            }
++            assert!(String::from_utf8_lossy(&connect_response).starts_with("HTTP/1.1 200 OK\r\n"));
++
++            let mut roots = rustls::RootCertStore::empty();
++            roots
++                .add(cert_der)
++                .expect("test certificate should be a valid root");
++            let client_config = Arc::new(
++                rustls::ClientConfig::builder()
++                    .with_root_certificates(roots)
++                    .with_no_client_auth(),
++            );
++            let server_name = ServerName::try_from(hostname.to_string())
++                .expect("test hostname should be a valid server name");
++            let connection = rustls::ClientConnection::new(client_config, server_name)
++                .expect("TLS client connection should build");
++            let mut tls = rustls::StreamOwned::new(connection, stream);
++            std::io::Write::write_all(
++                &mut tls,
++                format!("GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n")
++                    .as_bytes(),
++            )
++            .expect("TLS client should write HTTP request");
++            std::io::Write::flush(&mut tls).expect("TLS client should flush request");
++            let mut response = Vec::new();
++            let mut chunk = [0_u8; 512];
++            loop {
++                match std::io::Read::read(&mut tls, &mut chunk) {
++                    Ok(0) => break,
++                    Ok(read) => response.extend_from_slice(&chunk[..read]),
++                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
++                    Err(error) => panic!("TLS client should read HTTP response: {error}"),
++                }
++            }
++            String::from_utf8(response).expect("HTTP response should be UTF-8")
++        });
++
++        let response = timeout(Duration::from_secs(5), client_response)
++            .await
++            .expect("TLS client should complete before timeout")
++            .expect("TLS client task should succeed");
++        let request = timeout(Duration::from_secs(5), target_task)
++            .await
++            .expect("TLS target should complete before timeout")
++            .expect("TLS target task should succeed");
++        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
++        assert!(request.contains(&format!("Host: {hostname}\r\n")));
++        assert_eq!(
++            observed_sni
++                .lock()
++                .expect("SNI lock should not be poisoned")
++                .as_deref(),
++            Some(hostname)
++        );
++
++        proxy_task.abort();
++        let _ = proxy_task.await;
++    }
++
+     #[tokio::test(flavor = "current_thread")]
+     async fn http_plain_proxy_blocks_unix_socket_when_method_not_allowed() {
+         let state = Arc::new(network_proxy_state_for_policy(
+

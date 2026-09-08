@@ -10,11 +10,12 @@ use crate::secret::SecretStore;
 
 pub async fn build_proxy(
     allow_domains: Option<&[String]>,
+    allow_host_domains: &[String],
     deny_domains: Option<&[String]>,
     secret_store: &Arc<SecretStore>,
 ) -> Result<Option<NetworkProxy>> {
     let has_secrets = !secret_store.is_empty();
-    let has_net = allow_domains.is_some() || has_secrets;
+    let has_net = allow_domains.is_some() || !allow_host_domains.is_empty() || has_secrets;
     if !has_net {
         return Ok(None);
     }
@@ -22,6 +23,7 @@ pub async fn build_proxy(
     let allow = allow_domains.unwrap_or(&[]);
     let secret_hosts = secret_store.get_allowed_hosts();
     let has_filters = !allow.is_empty()
+        || !allow_host_domains.is_empty()
         || !secret_hosts.is_empty()
         || deny_domains.is_some_and(|d| !d.is_empty())
         || has_secrets;
@@ -38,14 +40,19 @@ pub async fn build_proxy(
     } else {
         let mut all: Vec<String> = allow.to_vec();
         all.extend(secret_hosts);
-        if all.is_empty() {
+        if all.is_empty() && has_secrets {
             config.network.set_allowed_domains(vec!["*".to_string()]);
-        } else {
+        } else if !all.is_empty() {
             config.network.set_allowed_domains(all);
         }
     }
     if let Some(deny) = deny_domains {
         config.network.set_denied_domains(deny.to_vec());
+    }
+    if !allow_host_domains.is_empty() {
+        config
+            .network
+            .set_allowed_host_domains(allow_host_domains.to_vec());
     }
 
     if has_secrets {
@@ -94,5 +101,23 @@ impl ConfigReloader for StaticReloader {
 impl RequestHeaderTransformer for SecretStore {
     fn transform_headers(&self, headers: &mut rama_http::HeaderMap, target_host: &str) {
         self.substitute_headers(headers, target_host);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn host_only_proxy_does_not_enable_the_public_network_wildcard() {
+        let host_routes = vec!["*.dev.test:443".to_string()];
+        let proxy = build_proxy(None, &host_routes, None, &Arc::new(SecretStore::default()))
+            .await
+            .expect("host-only proxy should build")
+            .expect("host-only route should require a proxy");
+
+        let config = proxy.current_cfg().await.expect("proxy config should load");
+        assert_eq!(config.network.allowed_domains(), None);
+        assert_eq!(config.network.allowed_host_domains(), Some(host_routes));
     }
 }

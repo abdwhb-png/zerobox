@@ -149,6 +149,7 @@ pub struct Sandbox {
     deny_write_globs: Vec<String>,
     full_write: bool,
     allow_net: Option<Vec<String>>,
+    allow_host_net: Vec<String>,
     deny_net: Vec<String>,
     docker_access: Option<DockerAccessPolicy>,
     secrets: Vec<(String, String)>,
@@ -182,6 +183,7 @@ impl Sandbox {
             deny_write_globs: Vec::new(),
             full_write: false,
             allow_net: None,
+            allow_host_net: Vec::new(),
             deny_net: Vec::new(),
             docker_access: None,
             secrets: Vec::new(),
@@ -304,6 +306,12 @@ impl Sandbox {
 
     pub fn allow_net_all(mut self) -> Self {
         self.allow_net = Some(Vec::new());
+        self
+    }
+
+    pub fn allow_host_net(mut self, domains: &[impl AsRef<str>]) -> Self {
+        self.allow_host_net
+            .extend(domains.iter().map(|s| s.as_ref().to_string()));
         self
     }
 
@@ -497,6 +505,7 @@ impl Sandbox {
             mut deny_write_globs,
             mut full_write,
             mut allow_net,
+            mut allow_host_net,
             mut deny_net,
             mut docker_access,
             mut secrets,
@@ -537,6 +546,7 @@ impl Sandbox {
                     &mut deny_write_globs,
                     &mut full_write,
                     &mut allow_net,
+                    &mut allow_host_net,
                     &mut deny_net,
                     &mut docker_access,
                     &mut env,
@@ -620,7 +630,8 @@ impl Sandbox {
             remove_docker_connection_env(&mut child_env);
         }
 
-        let net_enabled = allow_net.is_some() || !secret_store.is_empty();
+        let net_enabled =
+            allow_net.is_some() || !allow_host_net.is_empty() || !secret_store.is_empty();
         let docker_enabled = !disabled && !matches!(docker_access, DockerAccessPolicy::Disabled);
         let has_dynamic_denies = !deny_read_globs.is_empty() || !deny_write_globs.is_empty();
         let (sandbox_type, use_legacy_landlock) =
@@ -776,7 +787,13 @@ impl Sandbox {
         } else {
             Some(deny_net.as_slice())
         };
-        let proxy = proxy::build_proxy(allow_net.as_deref(), deny_slice, &secret_store).await?;
+        let proxy = proxy::build_proxy(
+            allow_net.as_deref(),
+            &allow_host_net,
+            deny_slice,
+            &secret_store,
+        )
+        .await?;
         if allow_local_binding && net_enabled && proxy.is_none() {
             return Err(anyhow::anyhow!(
                 "private local binding requires a managed proxy for outbound network access"
@@ -1743,6 +1760,7 @@ fn apply_profile(
     deny_write_globs: &mut Vec<String>,
     full_write: &mut bool,
     allow_net: &mut Option<Vec<String>>,
+    allow_host_net: &mut Vec<String>,
     deny_net: &mut Vec<String>,
     docker_access: &mut Option<DockerAccessPolicy>,
     env: &mut HashMap<String, String>,
@@ -1794,6 +1812,7 @@ fn apply_profile(
     merge_strings(deny_net, &profile.deny_net);
     merge_strings(deny_env, &profile.deny_env);
     merge_optional_strings(allow_net, &profile.allow_net);
+    merge_strings(allow_host_net, &profile.allow_host_net);
     merge_optional_strings(allow_env, &profile.allow_env);
     if docker_access.is_none() {
         *docker_access = profile.docker.clone();
@@ -2374,6 +2393,7 @@ mod tests {
         let mut deny_write_globs = Vec::new();
         let mut full_write = false;
         let mut allow_net = None;
+        let mut allow_host_net = Vec::new();
         let mut deny_net = Vec::new();
         let mut docker_access = None;
         let mut env = HashMap::new();
@@ -2394,6 +2414,7 @@ mod tests {
             &mut deny_write_globs,
             &mut full_write,
             &mut allow_net,
+            &mut allow_host_net,
             &mut deny_net,
             &mut docker_access,
             &mut env,
@@ -3123,6 +3144,20 @@ mod tests {
     }
 
     #[test]
+    fn builder_allow_host_net_accumulates_across_calls() {
+        let s = Sandbox::command("x")
+            .allow_host_net(&["*.dev.test:443"])
+            .allow_host_net(&["dashboard.internal.test:8443"]);
+        assert_eq!(
+            s.allow_host_net,
+            vec![
+                "*.dev.test:443".to_string(),
+                "dashboard.internal.test:8443".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn builder_allow_net_all_is_empty_some() {
         let s = Sandbox::command("x").allow_net_all();
         assert_eq!(s.allow_net, Some(vec![]));
@@ -3187,6 +3222,7 @@ mod tests {
         let mut dwg = Vec::new();
         let mut fw = false;
         let mut an = None;
+        let mut ahn = Vec::new();
         let mut dn = Vec::new();
         let mut docker_access = None;
         let mut env = HashMap::new();
@@ -3206,6 +3242,7 @@ mod tests {
             &mut dwg,
             &mut fw,
             &mut an,
+            &mut ahn,
             &mut dn,
             &mut docker_access,
             &mut env,
@@ -3240,6 +3277,7 @@ mod tests {
         let mut deny_write_globs = Vec::new();
         let mut fw = false;
         let mut an = None;
+        let mut ahn = Vec::new();
         let mut dn = Vec::new();
         let mut docker_access = None;
         let mut env = HashMap::new();
@@ -3259,6 +3297,7 @@ mod tests {
             &mut deny_write_globs,
             &mut fw,
             &mut an,
+            &mut ahn,
             &mut dn,
             &mut docker_access,
             &mut env,
@@ -3291,6 +3330,7 @@ mod tests {
         let mut deny_write_globs = Vec::new();
         let mut full_write = false;
         let mut allow_net = None;
+        let mut allow_host_net = Vec::new();
         let mut deny_net = Vec::new();
         let mut docker_access = Some(DockerAccessPolicy::Disabled);
         let mut env = HashMap::new();
@@ -3311,6 +3351,7 @@ mod tests {
             &mut deny_write_globs,
             &mut full_write,
             &mut allow_net,
+            &mut allow_host_net,
             &mut deny_net,
             &mut docker_access,
             &mut env,

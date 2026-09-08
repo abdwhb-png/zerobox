@@ -455,6 +455,12 @@ if [ -f "$LOCAL_TEST_NETWORK_PATCH" ]; then
     patch --fuzz=0 -p0 < "$LOCAL_TEST_NETWORK_PATCH"
 fi
 
+HOST_DOMAIN_ROUTING_PATCH="$SCRIPT_DIR/upstream-host-domain-routing.patch"
+if [ -f "$HOST_DOMAIN_ROUTING_PATCH" ]; then
+    echo "    host-domain-routing"
+    patch --fuzz=0 -p0 < "$HOST_DOMAIN_ROUTING_PATCH"
+fi
+
 CONCURRENT_DENY_TARGETS_PATCH="$SCRIPT_DIR/upstream-concurrent-deny-targets.patch"
 if [ -f "$CONCURRENT_DENY_TARGETS_PATCH" ]; then
     echo "    concurrent-deny-targets"

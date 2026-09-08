@@ -46,6 +46,9 @@ pub struct Cli {
     pub allow_net: Option<Vec<String>>,
 
     #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub allow_host_net: Option<Vec<String>>,
+
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub deny_net: Option<Vec<String>>,
 
     /// Effective per-execution Docker policy supplied by a trusted launcher.
@@ -366,6 +369,9 @@ async fn tokio_main(
         } else {
             sandbox = sandbox.allow_net(domains);
         }
+    }
+    if let Some(ref domains) = cli.allow_host_net {
+        sandbox = sandbox.allow_host_net(domains);
     }
     if let Some(ref domains) = cli.deny_net {
         sandbox = sandbox.deny_net(domains);
@@ -902,6 +908,20 @@ mod tests {
 
         assert_eq!(cli.deny_read_glob, vec!["**/*.{pem,key}"]);
         assert_eq!(cli.deny_write_glob, vec!["build/{debug,release}/**"]);
+    }
+
+    #[test]
+    fn host_network_cli_preserves_scoped_domain_routes() {
+        let cli = Cli::try_parse_from([
+            "zerobox",
+            "--allow-host-net",
+            "*.dev.test:443",
+            "--",
+            "/bin/true",
+        ])
+        .expect("parse host network route");
+
+        assert_eq!(cli.allow_host_net, Some(vec!["*.dev.test:443".to_string()]));
     }
 
     #[test]

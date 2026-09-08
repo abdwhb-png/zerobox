@@ -41,7 +41,7 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
 
 - Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`
 - Codex rust shim baseline: `rust-v0.131.0-alpha.22` at commit `9b8cf56cdefb09f54564ccc295fd42f6647f558f`
-- Version identity for this fork: `0.3.3-fork.15` (Python: `0.3.3+fork.15`)
+- Version identity for this fork: `0.3.3-fork.16` (Python: `0.3.3+fork.16`)
 
 ## Build and usage (local Linux / WSL2 only)
 
@@ -107,6 +107,13 @@ Allow network to a specific domain:
 
 ```bash
 ./target/release/zerobox --allow-net=api.openai.com -- node agent.js
+```
+
+Route an explicitly named local development domain to the host loopback while
+preserving the original TLS SNI and HTTP `Host` value:
+
+```bash
+./target/release/zerobox --allow-host-net='*.dev.test:443' -- curl https://app.dev.test/
 ```
 
 Pass a secret to a specific host and the inner process never sees the real value:
@@ -287,6 +294,12 @@ class only when the rule names one of those three aliases and includes the
 exact destination port. This does not allow the rest of `127.0.0.0/8` or any
 other private address.
 
+`--allow-host-net` is a separate host-local route. It accepts only an exact DNS
+hostname or a scoped wildcard with an explicit port, dials `127.0.0.1` on that
+port, and preserves the requested hostname through a raw CONNECT tunnel. It
+does not enable arbitrary loopback ports, private IPs, Unix sockets, or local
+service-management interfaces. `--deny-net` still takes precedence.
+
 On Linux, `--status-fd=N` emits protocol-v1 JSONL lifecycle records to a
 writable pipe/FIFO or Unix `SOCK_STREAM`: `setup_error`, or `child_started`
 followed by `child_exit`. Writes are nonblocking, the FD is `CLOEXEC`, and the
@@ -366,6 +379,7 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 | `--deny-write <paths>`          | `--deny-write=./.git`                  | Block writing to these paths. Takes precedence over `--allow-write`.                                         |
 | `--deny-write-glob <pattern>`   | `--deny-write-glob='generated/**'`     | Dynamically block mutations matching one glob while preserving reads. Repeat for multiple patterns.         |
 | `--allow-net [domains]`         | `--allow-net=example.com`              | Allow outbound network. Without a value, allows all domains. Default: no network.                            |
+| `--allow-host-net <domains>`    | `--allow-host-net='*.dev.test:443'`    | Route exact hostnames or scoped wildcards to host loopback on an explicit port.                              |
 | `--deny-net <domains>`          | `--deny-net=evil.com`                  | Block network to these domains. Takes precedence over `--allow-net`.                                         |
 | `--env <KEY=VALUE>`             | `--env NODE_ENV=prod`                  | Set env var in the sandbox. Can be repeated.                                                                 |
 | `--allow-env [keys]`            | `--allow-env=PATH,HOME`                | Inherit parent env vars. Without a value, inherits all. Default: only PATH, HOME, USER, SHELL, TERM, LANG.   |
