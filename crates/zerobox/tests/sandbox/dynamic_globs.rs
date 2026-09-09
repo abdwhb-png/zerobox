@@ -107,6 +107,124 @@ async fn sdk_dynamic_globs_preserve_shebang_process_errors() {
 }
 
 #[tokio::test]
+async fn sdk_dynamic_globs_preserve_atomic_file_and_tree_renames() {
+    let project = temp_dir();
+
+    let output = Sandbox::command("/bin/sh")
+        .args(&[
+            "-c",
+            concat!(
+                "mkdir -p repo/.git staging/nested && ",
+                "printf first >repo/.git/config.lock && ",
+                "mv repo/.git/config.lock repo/.git/config && ",
+                "test \"$(cat repo/.git/config)\" = first && ",
+                "printf second >repo/.git/config.lock && ",
+                "mv repo/.git/config.lock repo/.git/config && ",
+                "test \"$(cat repo/.git/config)\" = second && ",
+                "printf tree >staging/nested/value.txt && ",
+                "mv staging published && ",
+                "test \"$(cat published/nested/value.txt)\" = tree && ",
+                "mkdir -p destination/nested && ",
+                "printf destination >destination/nested/value.txt && ",
+                "printf source >source.txt && ",
+                "! /usr/bin/python3 -c \"import os; os.rename('source.txt', 'destination')\" 2>/dev/null && ",
+                "test \"$(cat source.txt)\" = source && ",
+                "test \"$(cat destination/nested/value.txt)\" = destination"
+            ),
+        ])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob(".env")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run atomic renames through dynamic glob sandbox");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("repo/.git/config")).unwrap(),
+        "second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("published/nested/value.txt")).unwrap(),
+        "tree"
+    );
+}
+
+#[tokio::test]
+async fn sdk_dynamic_globs_preserve_exchange_renames() {
+    let project = temp_dir();
+    std::fs::create_dir_all(project.path().join("left/nested")).unwrap();
+    std::fs::create_dir_all(project.path().join("right/nested")).unwrap();
+    std::fs::write(project.path().join("left/nested/value.txt"), "left").unwrap();
+    std::fs::write(project.path().join("right/nested/value.txt"), "right").unwrap();
+
+    let script = concat!(
+        "import ctypes, os\n",
+        "assert open('left/nested/value.txt').read() == 'left'\n",
+        "assert open('right/nested/value.txt').read() == 'right'\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "if libc.renameat2(-100, b'left', -100, b'right', 2) != 0:\n",
+        "    raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))\n",
+        "assert open('left/nested/value.txt').read() == 'right'\n",
+        "assert open('right/nested/value.txt').read() == 'left'\n",
+    );
+    let output = Sandbox::command("/usr/bin/python3")
+        .args(&["-c", script])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob(".env")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run exchange rename through dynamic glob sandbox");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sdk_dynamic_globs_preserve_git_init_config() {
+    let project = temp_dir();
+
+    let output = Sandbox::command("/usr/bin/git")
+        .args(&["init", "-b", "dev", "repo"])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob(".env")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run git init through dynamic glob sandbox");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = project.path().join("repo/.git/config");
+    assert!(config.is_file());
+    assert!(
+        std::fs::read_to_string(config)
+            .unwrap()
+            .contains("repositoryformatversion")
+    );
+}
+
+#[tokio::test]
 async fn sdk_dynamic_globs_are_enforced_inside_bubblewrap() {
     let project = temp_dir();
     std::fs::create_dir_all(project.path().join("generated")).unwrap();

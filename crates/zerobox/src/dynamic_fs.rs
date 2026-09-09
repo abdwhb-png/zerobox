@@ -612,6 +612,10 @@ impl FuseState {
     }
 
     fn rename_path_tree(&mut self, old: &Path, new: &Path) {
+        if old == new {
+            return;
+        }
+        self.remove_path_tree(new);
         let paths = self
             .inode_by_path
             .keys()
@@ -622,17 +626,69 @@ impl FuseState {
             let Some(inode) = self.inode_by_path.remove(&old_path) else {
                 continue;
             };
-            let suffix = old_path.strip_prefix(old).unwrap_or(Path::new(""));
-            let new_path = new.join(suffix);
+            let new_path = rebase_path(&old_path, old, new);
             self.path_by_inode.insert(inode, new_path.clone());
             self.inode_by_path.insert(new_path, inode);
         }
         for handle in self.handles.values_mut() {
             if handle.path == old || handle.path.starts_with(old) {
-                let suffix = handle.path.strip_prefix(old).unwrap_or(Path::new(""));
-                handle.path = new.join(suffix);
+                handle.path = rebase_path(&handle.path, old, new);
             }
         }
+    }
+
+    fn exchange_path_trees(&mut self, old: &Path, new: &Path) {
+        if old == new {
+            return;
+        }
+
+        let old_paths = self
+            .inode_by_path
+            .iter()
+            .filter(|(candidate, _)| candidate.as_path() == old || candidate.starts_with(old))
+            .map(|(path, inode)| (path.clone(), *inode))
+            .collect::<Vec<_>>();
+        let new_paths = self
+            .inode_by_path
+            .iter()
+            .filter(|(candidate, _)| candidate.as_path() == new || candidate.starts_with(new))
+            .map(|(path, inode)| (path.clone(), *inode))
+            .collect::<Vec<_>>();
+
+        for (path, _) in old_paths.iter().chain(&new_paths) {
+            self.inode_by_path.remove(path);
+        }
+        for (path, inode) in old_paths {
+            let exchanged_path = rebase_path(&path, old, new);
+            self.path_by_inode.insert(inode, exchanged_path.clone());
+            self.inode_by_path.insert(exchanged_path, inode);
+        }
+        for (path, inode) in new_paths {
+            let exchanged_path = rebase_path(&path, new, old);
+            self.path_by_inode.insert(inode, exchanged_path.clone());
+            self.inode_by_path.insert(exchanged_path, inode);
+        }
+        for handle in self.handles.values_mut() {
+            let exchanged_path = if handle.path == old || handle.path.starts_with(old) {
+                Some(rebase_path(&handle.path, old, new))
+            } else if handle.path == new || handle.path.starts_with(new) {
+                Some(rebase_path(&handle.path, new, old))
+            } else {
+                None
+            };
+            if let Some(exchanged_path) = exchanged_path {
+                handle.path = exchanged_path;
+            }
+        }
+    }
+}
+
+fn rebase_path(path: &Path, old: &Path, new: &Path) -> PathBuf {
+    let suffix = path.strip_prefix(old).unwrap_or(Path::new(""));
+    if suffix.as_os_str().is_empty() {
+        new.to_path_buf()
+    } else {
+        new.join(suffix)
     }
 }
 
@@ -1190,7 +1246,12 @@ impl Filesystem for GuardedPassthroughFs {
                     flags.bits(),
                 ) as i32
             })?;
-            self.state().rename_path_tree(&old, &new);
+            let mut state = self.state();
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                state.exchange_path_trees(&old, &new);
+            } else {
+                state.rename_path_tree(&old, &new);
+            }
             Ok(())
         })();
         match result {
@@ -1596,6 +1657,70 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn rename_path_tree_replaces_destination_without_stale_inode_paths() {
+        let mut state = FuseState::new();
+        let source = state.inode_for_path(Path::new("config.lock"));
+        let destination = state.inode_for_path(Path::new("config"));
+
+        state.rename_path_tree(Path::new("config.lock"), Path::new("config"));
+
+        assert_eq!(
+            state.inode_by_path.get(Path::new("config")),
+            Some(&source.0)
+        );
+        assert_eq!(
+            state.path_by_inode.get(&source.0),
+            Some(&PathBuf::from("config"))
+        );
+        assert!(!state.path_by_inode.contains_key(&destination.0));
+        assert!(!state.inode_by_path.contains_key(Path::new("config.lock")));
+    }
+
+    #[test]
+    fn exchange_path_trees_swaps_cached_subtrees_and_handles() {
+        let mut state = FuseState::new();
+        let left = state.inode_for_path(Path::new("left"));
+        let left_child = state.inode_for_path(Path::new("left/child"));
+        let right = state.inode_for_path(Path::new("right"));
+        let right_child = state.inode_for_path(Path::new("right/child"));
+        let left_handle = state.insert_handle(
+            File::open("/dev/null").unwrap(),
+            PathBuf::from("left/child"),
+        );
+        let right_handle = state.insert_handle(
+            File::open("/dev/null").unwrap(),
+            PathBuf::from("right/child"),
+        );
+
+        state.exchange_path_trees(Path::new("left"), Path::new("right"));
+
+        assert_eq!(
+            state.path_by_inode.get(&left.0),
+            Some(&PathBuf::from("right"))
+        );
+        assert_eq!(
+            state.path_by_inode.get(&left_child.0),
+            Some(&PathBuf::from("right/child"))
+        );
+        assert_eq!(
+            state.path_by_inode.get(&right.0),
+            Some(&PathBuf::from("left"))
+        );
+        assert_eq!(
+            state.path_by_inode.get(&right_child.0),
+            Some(&PathBuf::from("left/child"))
+        );
+        assert_eq!(
+            state.handles.get(&left_handle.0).unwrap().path,
+            PathBuf::from("right/child")
+        );
+        assert_eq!(
+            state.handles.get(&right_handle.0).unwrap().path,
+            PathBuf::from("left/child")
+        );
+    }
 
     fn policy(root: &Path, read: &[&str], write: &[&str]) -> DynamicDenyPolicy {
         DynamicDenyPolicy::compile(
