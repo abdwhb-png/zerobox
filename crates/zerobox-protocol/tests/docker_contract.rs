@@ -64,3 +64,23 @@ fn container_name_selector_has_an_explicit_json_field() {
         policy
     );
 }
+
+#[test]
+fn ephemeral_container_selector_round_trips_an_exact_id_and_expiry() {
+    let encoded = serde_json::json!({
+        "mode": "targeted",
+        "endpoint": "unix:///var/run/docker.sock",
+        "targets": [{
+            "selector": {
+                "type": "ephemeral-container",
+                "id": "0123456789abcdef",
+                "unsafeExecExpiresAtMs": 4_102_444_800_000_u64
+            },
+            "operations": ["exec"],
+            "allowUnsafeTarget": true
+        }]
+    });
+
+    let policy = serde_json::from_value::<DockerAccessPolicy>(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(policy).unwrap(), encoded);
+}

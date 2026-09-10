@@ -99,8 +99,20 @@ impl DockerOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DockerTargetSelector {
-    ContainerName { name: String },
-    ComposeService { project: String, service: String },
+    ContainerName {
+        name: String,
+    },
+    ComposeService {
+        project: String,
+        service: String,
+    },
+    /// Runtime-only, exact-container authorization. Callers must reject this
+    /// selector in persistent authority so it cannot outlive its owning session.
+    EphemeralContainer {
+        id: String,
+        #[serde(rename = "unsafeExecExpiresAtMs")]
+        unsafe_exec_expires_at_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

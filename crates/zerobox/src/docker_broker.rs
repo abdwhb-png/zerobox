@@ -35,6 +35,9 @@ struct TargetSnapshot {
     containers: HashMap<String, AllowedContainer>,
     aliases: HashMap<String, String>,
     exec_ids: Mutex<HashMap<String, String>>,
+    inspection_exec_ids: Mutex<HashSet<String>>,
+    inspection_roots: HashMap<String, Vec<String>>,
+    exec_expiries: HashMap<String, u64>,
 }
 
 #[derive(Debug)]
@@ -201,9 +204,14 @@ impl HttpRequest {
 #[derive(Debug)]
 enum TargetedAction {
     Forward,
-    ForwardContainer { container_id: String },
+    ForwardContainer {
+        container_id: String,
+    },
     Discovery,
-    ExecCreate { container_id: String },
+    ExecCreate {
+        container_id: String,
+        inspection: bool,
+    },
     ExecStream,
 }
 
@@ -211,6 +219,8 @@ enum TargetedAction {
 enum AuthorizationError {
     NotFound,
     Forbidden,
+    ExecOption(&'static str),
+    ExecRestriction(&'static str),
 }
 
 async fn handle_targeted_connection(
@@ -247,18 +257,31 @@ async fn handle_targeted_connection_with_timeouts(
     let action = match authorize_request(snapshot, &request) {
         Ok(action) => action,
         Err(AuthorizationError::NotFound) => {
-            write_error_with_timeout(client, 404, "Docker target not found", stream_idle_timeout)
-                .await?;
+            write_error_with_timeout(
+                client,
+                404,
+                "Docker target is not authorized by this grant or no longer exists",
+                stream_idle_timeout,
+            )
+            .await?;
             return Ok(());
         }
         Err(AuthorizationError::Forbidden) => {
             write_error_with_timeout(
                 client,
                 403,
-                "Docker operation forbidden",
+                "Docker operation is not granted or route is unsupported",
                 stream_idle_timeout,
             )
             .await?;
+            return Ok(());
+        }
+        Err(AuthorizationError::ExecOption(reason)) => {
+            write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
+            return Ok(());
+        }
+        Err(AuthorizationError::ExecRestriction(reason)) => {
+            write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
             return Ok(());
         }
     };
@@ -323,15 +346,12 @@ async fn handle_targeted_connection_with_timeouts(
             };
             write_json_with_timeout(client, 200, &body, stream_idle_timeout).await
         }
-        TargetedAction::ExecCreate { container_id } => {
-            if !safe_exec_create_body(&request.body) {
-                write_error_with_timeout(
-                    client,
-                    403,
-                    "unsafe Docker exec forbidden",
-                    stream_idle_timeout,
-                )
-                .await?;
+        TargetedAction::ExecCreate {
+            container_id,
+            inspection,
+        } => {
+            if let Err(reason) = validate_exec_body(&request.body, true) {
+                write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
                 return Ok(());
             }
             request.target = rewrite_container_target(&request.target, &container_id)?;
@@ -364,6 +384,13 @@ async fn handle_targeted_connection_with_timeouts(
                     .lock()
                     .expect("Docker exec registry poisoned")
                     .insert(exec_id.to_string(), container_id);
+                if inspection {
+                    snapshot
+                        .inspection_exec_ids
+                        .lock()
+                        .expect("Docker inspection exec registry poisoned")
+                        .insert(exec_id.to_string());
+                }
             }
             write_all_with_timeout(client, &raw, stream_idle_timeout).await?;
             Ok(())
@@ -531,12 +558,25 @@ fn authorize_request(
             ("POST", "restart") => DockerOperation::Restart,
             _ => return Err(AuthorizationError::Forbidden),
         };
-        ensure_operation(snapshot, container_id, operation)?;
         if operation == DockerOperation::Exec {
+            let inspection = match ensure_operation(snapshot, container_id, operation) {
+                Ok(()) => false,
+                Err(AuthorizationError::Forbidden)
+                    if snapshot.inspection_roots.contains_key(container_id) =>
+                {
+                    let roots = &snapshot.inspection_roots[container_id];
+                    validate_inspection_exec_body(&request.body, roots)
+                        .map_err(AuthorizationError::ExecRestriction)?;
+                    true
+                }
+                Err(error) => return Err(error),
+            };
             return Ok(TargetedAction::ExecCreate {
                 container_id: container_id.clone(),
+                inspection,
             });
         }
+        ensure_operation(snapshot, container_id, operation)?;
         return Ok(TargetedAction::ForwardContainer {
             container_id: container_id.clone(),
         });
@@ -550,16 +590,23 @@ fn authorize_request(
             .get(&segments[1])
             .cloned()
             .ok_or(AuthorizationError::NotFound)?;
+        let inspection = snapshot
+            .inspection_exec_ids
+            .lock()
+            .expect("Docker inspection exec registry poisoned")
+            .contains(&segments[1]);
         let permitted = matches!(
             (request.method.as_str(), segments[2].as_str()),
             ("POST", "start" | "resize") | ("GET", "json")
-        );
+        ) && (!inspection || segments[2] != "resize");
         if !permitted {
             return Err(AuthorizationError::Forbidden);
         }
-        ensure_operation(snapshot, &container_id, DockerOperation::Exec)?;
-        if segments[2] == "start" && !safe_exec_start_body(&request.body) {
-            return Err(AuthorizationError::Forbidden);
+        if !inspection {
+            ensure_operation(snapshot, &container_id, DockerOperation::Exec)?;
+        }
+        if segments[2] == "start" {
+            validate_exec_body(&request.body, false).map_err(AuthorizationError::ExecOption)?;
         }
         return if segments[2] == "start" {
             Ok(TargetedAction::ExecStream)
@@ -659,6 +706,16 @@ fn ensure_operation(
         .get(container_id)
         .ok_or(AuthorizationError::NotFound)?;
     if container.operations.contains(&operation) {
+        if operation == DockerOperation::Exec
+            && snapshot
+                .exec_expiries
+                .get(container_id)
+                .is_some_and(|expiry| current_unix_time_ms().is_none_or(|now| now >= *expiry))
+        {
+            return Err(AuthorizationError::ExecRestriction(
+                "Docker break-glass exec expired",
+            ));
+        }
         Ok(())
     } else {
         Err(AuthorizationError::Forbidden)
@@ -677,33 +734,109 @@ fn filter_discovery_response(snapshot: &TargetSnapshot, body: &[u8]) -> Result<V
     Ok(serde_json::to_vec(&containers)?)
 }
 
-fn safe_exec_create_body(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    !value
-        .get("Privileged")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && !value
-            .get("Detach")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        && value.get("DetachKeys").is_none_or(Value::is_null)
+fn validate_exec_body(body: &[u8], creating: bool) -> std::result::Result<(), &'static str> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| "Docker exec option forbidden: invalid request body")?;
+    if !value.is_object() {
+        return Err("Docker exec option forbidden: invalid request body");
+    }
+    for (field, reason) in [
+        (
+            "Privileged",
+            "Docker exec option forbidden: privileged execution is not allowed",
+        ),
+        (
+            "Detach",
+            "Docker exec option forbidden: detached execution is not allowed",
+        ),
+    ] {
+        if value
+            .get(field)
+            .is_some_and(|option| !option.is_null() && option.as_bool() != Some(false))
+        {
+            return Err(reason);
+        }
+    }
+    if creating
+        && value
+            .get("DetachKeys")
+            .is_some_and(|keys| !keys.is_null() && keys.as_str() != Some(""))
+    {
+        return Err("Docker exec option forbidden: DetachKeys must be empty");
+    }
+    Ok(())
 }
 
-fn safe_exec_start_body(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return false;
+fn validate_inspection_exec_body(
+    body: &[u8],
+    roots: &[String],
+) -> std::result::Result<(), &'static str> {
+    const RESTRICTED: &str =
+        "Docker exec is restricted to read-only inspection for this host-access target";
+    validate_exec_body(body, true)?;
+    let value: Value = serde_json::from_slice(body).map_err(|_| RESTRICTED)?;
+    let options = value.as_object().ok_or(RESTRICTED)?;
+    const KNOWN_FIELDS: [&str; 12] = [
+        "AttachStderr",
+        "AttachStdin",
+        "AttachStdout",
+        "Cmd",
+        "ConsoleSize",
+        "Detach",
+        "DetachKeys",
+        "Env",
+        "Privileged",
+        "Tty",
+        "User",
+        "WorkingDir",
+    ];
+    if options
+        .keys()
+        .any(|field| !KNOWN_FIELDS.contains(&field.as_str()))
+        || options.get("Env").is_some_and(|env| {
+            !env.is_null() && env.as_array().is_none_or(|entries| !entries.is_empty())
+        })
+        || ["User", "WorkingDir"].iter().any(|field| {
+            options
+                .get(*field)
+                .is_some_and(|option| !option.is_null() && option.as_str() != Some(""))
+        })
+    {
+        return Err(RESTRICTED);
+    }
+    let command = value
+        .get("Cmd")
+        .and_then(Value::as_array)
+        .ok_or(RESTRICTED)?;
+    let command: Vec<&str> = command
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(RESTRICTED)?;
+    let path = match command.as_slice() {
+        ["test", "-r", path] => *path,
+        ["stat", "--", path] => *path,
+        ["ls", "-la", "--", path] => *path,
+        _ => return Err(RESTRICTED),
     };
-    !value
-        .get("Detach")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && !value
-            .get("Privileged")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    if roots.iter().any(|root| path_is_within(path, root)) {
+        Ok(())
+    } else {
+        Err(RESTRICTED)
+    }
+}
+
+fn path_is_within(path: &str, root: &str) -> bool {
+    use std::path::Component;
+
+    let path = Path::new(path);
+    let root = Path::new(root);
+    path.is_absolute()
+        && root.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        && (path == root || path.starts_with(root))
 }
 
 async fn relay_authorized(
@@ -1287,14 +1420,70 @@ async fn resolve_target_snapshot(
         if eligible_grants.is_empty() {
             continue;
         }
+        let inspection_requested = eligible_grants.iter().any(|grant| {
+            grant.allow_unsafe_target
+                && !matches!(
+                    grant.selector,
+                    DockerTargetSelector::EphemeralContainer { .. }
+                )
+                && grant
+                    .effective_operations()
+                    .contains(&DockerOperation::Exec)
+        });
+        let persistent_exec = eligible_grants.iter().any(|grant| {
+            !grant.allow_unsafe_target
+                && !matches!(
+                    grant.selector,
+                    DockerTargetSelector::EphemeralContainer { .. }
+                )
+                && grant
+                    .effective_operations()
+                    .contains(&DockerOperation::Exec)
+        });
+        let ephemeral_exec_expiry = eligible_grants
+            .iter()
+            .filter_map(|grant| match &grant.selector {
+                DockerTargetSelector::EphemeralContainer {
+                    unsafe_exec_expires_at_ms,
+                    ..
+                } if grant
+                    .effective_operations()
+                    .contains(&DockerOperation::Exec) =>
+                {
+                    Some(*unsafe_exec_expires_at_ms)
+                }
+                _ => None,
+            })
+            .max();
         let operations: HashSet<DockerOperation> = eligible_grants
             .into_iter()
-            .flat_map(|grant| grant.effective_operations().iter().copied())
+            .flat_map(|grant| {
+                grant
+                    .effective_operations()
+                    .iter()
+                    .copied()
+                    .filter(|operation| {
+                        *operation != DockerOperation::Exec
+                            || !grant.allow_unsafe_target
+                            || matches!(
+                                grant.selector,
+                                DockerTargetSelector::EphemeralContainer { .. }
+                            )
+                    })
+            })
             .collect();
 
         snapshot
             .containers
             .insert(id.to_string(), AllowedContainer { operations });
+        if inspection_requested {
+            snapshot
+                .inspection_roots
+                .insert(id.to_string(), bind_mount_destinations(&inspect));
+        }
+        if !persistent_exec && let Some(expiry) = ephemeral_exec_expiry {
+            snapshot.exec_expiries.insert(id.to_string(), expiry);
+        }
         snapshot.aliases.insert(id.to_string(), id.to_string());
         if let Some(names) = summary.get("Names").and_then(Value::as_array) {
             for name in names.iter().filter_map(Value::as_str) {
@@ -1306,6 +1495,28 @@ async fn resolve_target_snapshot(
         }
     }
     Ok(snapshot)
+}
+
+fn bind_mount_destinations(inspect: &Value) -> Vec<String> {
+    let mut destinations: Vec<String> = inspect
+        .get("Mounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|mount| mount.get("Type").and_then(Value::as_str) == Some("bind"))
+        .filter_map(|mount| mount.get("Destination").and_then(Value::as_str))
+        .filter(|destination| {
+            let path = Path::new(destination);
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    destinations.sort();
+    destinations.dedup();
+    destinations
 }
 
 fn synthetic_get(target: &str) -> HttpRequest {
@@ -1348,7 +1559,20 @@ fn grant_matches_summary(grant: &DockerTargetGrant, summary: &Value) -> bool {
                         == Some(service.as_str())
             })
         }
+        DockerTargetSelector::EphemeralContainer { id, .. } => {
+            summary.get("Id").and_then(Value::as_str) == Some(id.as_str())
+        }
     }
+}
+
+fn current_unix_time_ms() -> Option<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()
 }
 
 fn is_unsafe_target(inspect: &Value) -> bool {
@@ -2158,9 +2382,17 @@ mod tests {
             super::authorize_request(&snapshot, &create),
             Ok(super::TargetedAction::ExecCreate { .. })
         ));
-        assert!(!super::safe_exec_create_body(
-            br#"{"Cmd":["true"],"DetachKeys":"ctrl-x"}"#
-        ));
+        assert!(
+            super::validate_exec_body(br#"{"Cmd":["true"],"DetachKeys":"ctrl-x"}"#, true).is_err()
+        );
+        for body in [
+            br#"{"DetachKeys":true}"#.as_slice(),
+            br#"{"DetachKeys":[]}"#.as_slice(),
+            br#"{"Privileged":true}"#.as_slice(),
+            br#"{"Detach":true}"#.as_slice(),
+        ] {
+            assert!(super::validate_exec_body(body, true).is_err());
+        }
 
         let unknown = request("POST", "/v1.52/exec/not-ours/start", b"{}");
         assert_eq!(
@@ -2185,7 +2417,9 @@ mod tests {
         let detached = request("POST", "/v1.52/exec/ours/start", br#"{"Detach":true}"#);
         assert_eq!(
             super::authorize_request(&snapshot, &detached).unwrap_err(),
-            super::AuthorizationError::Forbidden
+            super::AuthorizationError::ExecOption(
+                "Docker exec option forbidden: detached execution is not allowed"
+            )
         );
     }
 
@@ -2339,7 +2573,7 @@ mod tests {
                     let body = if first_line.contains("/containers/json") {
                         format!(r#"[{{"Id":"{CONTAINER_ID}","Names":["/api"]}}]"#)
                     } else {
-                        r#"{"HostConfig":{"Privileged":true},"Mounts":[]}"#.to_string()
+                        r#"{"HostConfig":{"Privileged":true},"Mounts":[{"Type":"bind","Source":"/host/auths","Destination":"/auths","RW":true}]}"#.to_string()
                     };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2366,6 +2600,74 @@ mod tests {
 
         assert!(denied.containers.is_empty());
         assert!(accepted.containers.contains_key(CONTAINER_ID));
+
+        let administration = DockerTargetGrant {
+            selector: DockerTargetSelector::ContainerName {
+                name: "api".to_string(),
+            },
+            operations: Some(vec![DockerOperation::Exec]),
+            allow_unsafe_target: true,
+        };
+        let restricted = super::resolve_target_snapshot(&engine_path, &[administration])
+            .await
+            .unwrap();
+        let read_probe = request(
+            "POST",
+            "/v1.52/containers/api/exec",
+            br#"{"Cmd":["test","-r","/auths/main.log"]}"#,
+        );
+        let mutation = request(
+            "POST",
+            "/v1.52/containers/api/exec",
+            br#"{"Cmd":["chmod","0644","/auths/main.log"]}"#,
+        );
+
+        assert!(matches!(
+            super::authorize_request(&restricted, &read_probe),
+            Ok(super::TargetedAction::ExecCreate { .. })
+        ));
+        assert_eq!(
+            super::authorize_request(&restricted, &mutation).unwrap_err(),
+            super::AuthorizationError::ExecRestriction(
+                "Docker exec is restricted to read-only inspection for this host-access target"
+            )
+        );
+        for overridden in [
+            br#"{"Cmd":["test","-r","/auths/main.log"],"Env":["PATH=/auths"]}"#.as_slice(),
+            br#"{"Cmd":["test","-r","/auths/main.log"],"User":"root"}"#.as_slice(),
+            br#"{"Cmd":["test","-r","/auths/main.log"],"WorkingDir":"/auths"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                super::authorize_request(
+                    &restricted,
+                    &request("POST", "/v1.52/containers/api/exec", overridden),
+                )
+                .unwrap_err(),
+                super::AuthorizationError::ExecRestriction(
+                    "Docker exec is restricted to read-only inspection for this host-access target"
+                )
+            );
+        }
+
+        let expires_at = super::current_unix_time_ms().unwrap() + 60_000;
+        let break_glass = DockerTargetGrant {
+            selector: DockerTargetSelector::EphemeralContainer {
+                id: CONTAINER_ID.to_string(),
+                unsafe_exec_expires_at_ms: expires_at,
+            },
+            operations: Some(vec![DockerOperation::Exec]),
+            allow_unsafe_target: true,
+        };
+        let elevated = super::resolve_target_snapshot(&engine_path, &[break_glass])
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::authorize_request(&elevated, &mutation),
+            Ok(super::TargetedAction::ExecCreate {
+                inspection: false,
+                ..
+            })
+        ));
         engine_task.abort();
     }
 
@@ -2421,6 +2723,58 @@ mod tests {
             }
         });
         assert!(!super::grant_matches_summary(&grant, &other));
+    }
+
+    #[test]
+    fn ephemeral_selector_matches_only_its_exact_container() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let grant = |id: &str, expires_at| DockerTargetGrant {
+            selector: DockerTargetSelector::EphemeralContainer {
+                id: id.to_string(),
+                unsafe_exec_expires_at_ms: expires_at,
+            },
+            operations: Some(vec![DockerOperation::Exec]),
+            allow_unsafe_target: true,
+        };
+        let current = serde_json::json!({ "Id": "current" });
+        let replacement = serde_json::json!({ "Id": "replacement" });
+
+        assert!(super::grant_matches_summary(
+            &grant("current", now_ms + 60_000),
+            &current
+        ));
+        assert!(!super::grant_matches_summary(
+            &grant("current", now_ms + 60_000),
+            &replacement
+        ));
+        assert!(super::grant_matches_summary(
+            &grant("current", now_ms.saturating_sub(1)),
+            &current
+        ));
+    }
+
+    #[test]
+    fn broker_rechecks_break_glass_expiry_for_every_exec_request() {
+        let mut snapshot = super::TargetSnapshot::default();
+        snapshot.containers.insert(
+            "current".to_string(),
+            super::AllowedContainer {
+                operations: [DockerOperation::Exec].into_iter().collect(),
+            },
+        );
+        snapshot
+            .aliases
+            .insert("api".to_string(), "current".to_string());
+        snapshot.exec_expiries.insert("current".to_string(), 0);
+        let request = request("POST", "/v1.52/containers/api/exec", br#"{"Cmd":["true"]}"#);
+
+        assert_eq!(
+            super::authorize_request(&snapshot, &request).unwrap_err(),
+            super::AuthorizationError::ExecRestriction("Docker break-glass exec expired")
+        );
     }
 
     #[test]
@@ -2553,6 +2907,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_exec_accepts_standard_client_detach_keys() {
+        for body in [
+            br#"{"Cmd":["true"],"Privileged":false}"#.as_slice(),
+            br#"{"Cmd":["true"],"DetachKeys":null}"#.as_slice(),
+            br#"{"Cmd":["true"],"DetachKeys":""}"#.as_slice(),
+        ] {
+            let root = TempDir::new().unwrap();
+            let endpoint = root.path().join("engine.sock");
+            let engine = UnixListener::bind(&endpoint).unwrap();
+            let engine_task = tokio::spawn(async move {
+                let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_secs(1), engine.accept()).await
+                else {
+                    return None;
+                };
+                let request = super::read_request(&mut stream).await.unwrap();
+                let body = br#"{"Id":"exec-created"}"#;
+                stream.write_all(format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                Some(request)
+            });
+            let mut snapshot = super::TargetSnapshot::default();
+            snapshot.containers.insert(
+                "pinned-id".into(),
+                super::AllowedContainer {
+                    operations: [DockerOperation::Exec].into_iter().collect(),
+                },
+            );
+            snapshot.aliases.insert("api".into(), "pinned-id".into());
+            let (mut client, mut broker) = UnixStream::pair().unwrap();
+            let handler = tokio::spawn(async move {
+                super::handle_targeted_connection(&mut broker, &endpoint, &snapshot)
+                    .await
+                    .unwrap();
+            });
+            client.write_all(format!(
+                "POST /v1.52/containers/api/exec HTTP/1.1\r\nHost: docker\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            ).as_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            handler.await.unwrap();
+            assert!(
+                response.starts_with(b"HTTP/1.1 201"),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            let forwarded = engine_task
+                .await
+                .unwrap()
+                .expect("request must reach engine");
+            assert_eq!(forwarded.target, "/v1.52/containers/pinned-id/exec");
+            assert_eq!(forwarded.body, body);
+        }
+    }
+
+    #[tokio::test]
     async fn targeted_exec_create_rejects_detach_keys_before_engine_forwarding() {
         let root = TempDir::new().unwrap();
         let engine_path = root.path().join("engine.sock");
@@ -2609,6 +3025,7 @@ mod tests {
         handler.await.unwrap();
         let engine_bytes = engine_task.await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert!(String::from_utf8_lossy(&response).contains("Docker exec option forbidden"));
         assert!(
             engine_bytes.is_empty(),
             "DetachKeys request reached the Docker Engine"
