@@ -1,0 +1,147 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -1625,11 +1625,16 @@
+     let relays = Arc::new(TcpPublicationRelays::default());
+     let revoking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+     loop {
++        let mut revoked = false;
+         for (index, publication) in spec.publications.iter().enumerate() {
+             let listener_present = private_listener_present(publication.target);
+             if ready[index] && !listener_present {
+                 request_tcp_publication_change(&mut control, TCP_PUBLICATION_UNBIND, index)?;
+                 let (kind, received_index, errno) = read_publication_status(&mut control)?;
++                if kind == TCP_PUBLICATION_REVOKED {
++                    revoked = true;
++                    break;
++                }
+                 if kind != TCP_PUBLICATION_UNBOUND || usize::from(received_index) != index {
+                     return Err(io::Error::from_raw_os_error(errno.max(libc::EIO)));
+                 }
+@@ -1643,12 +1648,19 @@
+             } else if !ready[index] && listener_present {
+                 request_tcp_publication_change(&mut control, TCP_PUBLICATION_BIND, index)?;
+                 let (kind, received_index, errno) = read_publication_status(&mut control)?;
++                if kind == TCP_PUBLICATION_REVOKED {
++                    revoked = true;
++                    break;
++                }
+                 if kind != TCP_PUBLICATION_BOUND || usize::from(received_index) != index {
+                     return Err(io::Error::from_raw_os_error(errno.max(libc::EIO)));
+                 }
+                 ready[index] = true;
+             }
+         }
++        if revoked {
++            return drain_revoked_tcp_publications(&mut control, &active, &relays, &revoking);
++        }
+         let mut fds = [
+             libc::pollfd {
+                 fd: control.as_raw_fd(),
+@@ -1665,7 +1677,6 @@
+         if polled < 0 {
+             return Err(io::Error::last_os_error());
+         }
+-        let mut revoked = false;
+         if fds[0].revents & libc::POLLIN != 0 {
+             let mut frame = [0_u8; 1];
+             control.read_exact(&mut frame)?;
+@@ -1728,24 +1739,31 @@
+             *deadlines = pending;
+         }
+         if revoked {
+-            revoking.store(true, Ordering::Release);
+-            control.shutdown(Shutdown::Both)?;
+-            let deadline = std::time::Instant::now() + TCP_PUBLICATION_DRAIN_TIMEOUT;
+-            while active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+-                std::thread::sleep(Duration::from_millis(25));
+-            }
+-            if active.load(Ordering::Acquire) != 0 {
+-                relays.shutdown_all();
+-                let forced_deadline = std::time::Instant::now() + Duration::from_millis(250);
+-                while active.load(Ordering::Acquire) != 0
+-                    && std::time::Instant::now() < forced_deadline
+-                {
+-                    std::thread::sleep(Duration::from_millis(10));
+-                }
+-            }
+-            return Ok(());
++            return drain_revoked_tcp_publications(&mut control, &active, &relays, &revoking);
++        }
++    }
++}
++
++fn drain_revoked_tcp_publications(
++    control: &mut UnixStream,
++    active: &AtomicUsize,
++    relays: &TcpPublicationRelays,
++    revoking: &std::sync::atomic::AtomicBool,
++) -> io::Result<()> {
++    revoking.store(true, Ordering::Release);
++    control.shutdown(Shutdown::Both)?;
++    let deadline = std::time::Instant::now() + TCP_PUBLICATION_DRAIN_TIMEOUT;
++    while active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
++        std::thread::sleep(Duration::from_millis(25));
++    }
++    if active.load(Ordering::Acquire) != 0 {
++        relays.shutdown_all();
++        let forced_deadline = std::time::Instant::now() + Duration::from_millis(250);
++        while active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < forced_deadline {
++            std::thread::sleep(Duration::from_millis(10));
+         }
+     }
++    Ok(())
+ }
+ 
+ struct TcpPublicationRelay {
+@@ -1910,15 +1928,46 @@
+ }
+ 
+ fn read_publication_status(control: &mut UnixStream) -> io::Result<(u8, u8, i32)> {
+-    let mut message = [0_u8; 6];
+-    control.read_exact(&mut message)?;
++    let mut kind = [0_u8; 1];
++    control.read_exact(&mut kind)?;
++    // Revocation is an asynchronous one-byte control frame. It may arrive
++    // while the monitor is waiting for a bind or unbind acknowledgement.
++    if kind[0] == TCP_PUBLICATION_REVOKED {
++        return Ok((TCP_PUBLICATION_REVOKED, 0, 0));
++    }
++    let mut rest = [0_u8; 5];
++    control.read_exact(&mut rest)?;
+     Ok((
+-        message[0],
+-        message[1],
+-        i32::from_be_bytes(message[2..].try_into().unwrap()),
++        kind[0],
++        rest[0],
++        i32::from_be_bytes(rest[1..].try_into().unwrap()),
+     ))
+ }
+ 
++#[cfg(test)]
++mod tcp_publication_control_tests {
++    use super::{TCP_PUBLICATION_REVOKED, read_publication_status};
++    use std::io::Write;
++    use std::net::Shutdown;
++    use std::os::unix::net::UnixStream;
++
++    #[test]
++    fn revocation_frame_is_accepted_while_waiting_for_a_publication_status() {
++        let (mut writer, mut reader) = UnixStream::pair().expect("create publication control pair");
++        writer
++            .write_all(&[TCP_PUBLICATION_REVOKED])
++            .expect("send revocation frame");
++        writer
++            .shutdown(Shutdown::Write)
++            .expect("finish revocation frame");
++
++        assert_eq!(
++            read_publication_status(&mut reader).expect("parse revocation frame"),
++            (TCP_PUBLICATION_REVOKED, 0, 0)
++        );
++    }
++}
++
+ fn request_tcp_publication_change(
+     control: &mut UnixStream,
+     operation: u8,

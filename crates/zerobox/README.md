@@ -244,6 +244,23 @@ repository construct its own Docker policy.
 | `snapshot()` / `restore()` | Record / roll back filesystem changes. |
 | `run()` / `spawn()` / `status()` | Terminators (collect / stream / inherit stdio). |
 
+## Linux resource isolation
+
+Linux and WSL builds support private homes and exact Unix stream sockets:
+
+```sh
+zerobox --private-home /absolute/template-home --allow-unix-socket /absolute/service.sock -- command
+```
+
+Publish a private loopback TCP listener only after the target has started listening:
+
+```sh
+zerobox --publish-tcp 'host@127.0.0.1:3000->127.0.0.1:3001' -- command
+zerobox --publish-tcp 'lan@192.168.1.10:3000->127.0.0.1:3001' -- command
+```
+
+TCP publications accept only nonzero TCP ports and private loopback targets. UDP is not supported. A command that never listens reserves no host port. CLI lifetime follows the supervising process tree: stopping it closes host listeners and active relays. The Rust SDK also offers `SandboxChild::revoke_tcp_publications()` for an already-running child; this SDK control is not a CLI option. These behaviors are qualified on Linux/WSL; LAN reachability still requires a real peer.
+
 ## Other SDKs
 
 - [TypeScript SDK](https://github.com/afshinm/zerobox/tree/main/packages/zerobox) (npm: `zerobox`)

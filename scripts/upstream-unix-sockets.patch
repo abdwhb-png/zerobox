@@ -1,0 +1,359 @@
+--- upstream/linux-sandbox/src/landlock.rs
++++ upstream/linux-sandbox/src/landlock.rs
+@@ -90,7 +90,9 @@
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum NetworkSeccompMode {
+     Restricted,
++    UnixSocketOnly,
+     ProxyRouted,
++    ProxyRoutedWithUnixSockets,
+ }
+ 
+ fn should_install_network_seccomp(
+@@ -109,12 +111,21 @@
+ ) -> Option<NetworkSeccompMode> {
+     if !should_install_network_seccomp(network_sandbox_policy, allow_network_for_proxy) {
+         None
+-    } else if proxy_routed_network
+-        || std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1")
+-    {
+-        Some(NetworkSeccompMode::ProxyRouted)
+     } else {
+-        Some(NetworkSeccompMode::Restricted)
++        let allow_unix_sockets = std::env::var("ZEROBOX_ALLOW_UNIX_SOCKET").as_deref() == Ok("1");
++        if proxy_routed_network
++            || std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1")
++        {
++            Some(if allow_unix_sockets {
++                NetworkSeccompMode::ProxyRoutedWithUnixSockets
++            } else {
++                NetworkSeccompMode::ProxyRouted
++            })
++        } else if allow_unix_sockets {
++            Some(NetworkSeccompMode::UnixSocketOnly)
++        } else {
++            Some(NetworkSeccompMode::Restricted)
++        }
+     }
+ }
+ 
+@@ -217,13 +228,84 @@
+             rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
+             rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
+         }
+-        NetworkSeccompMode::ProxyRouted => {
++        NetworkSeccompMode::UnixSocketOnly => {
++            // Exact filesystem paths are enforced by the mounted FUSE view.
++            // Keep the transport surface to Unix stream sockets; the unshared
++            // network namespace keeps abstract host sockets out of reach while
++            // still allowing target-private abstract IPC.
++            let deny_non_unix_socket = SeccompRule::new(vec![SeccompCondition::new(
++                0,
++                SeccompCmpArgLen::Dword,
++                SeccompCmpOp::Ne,
++                libc::AF_UNIX as u64,
++            )?])?;
++            let mut deny_unix_non_stream_conditions = vec![SeccompCondition::new(
++                0,
++                SeccompCmpArgLen::Dword,
++                SeccompCmpOp::Eq,
++                libc::AF_UNIX as u64,
++            )?];
++            for flags in [
++                0,
++                libc::SOCK_CLOEXEC,
++                libc::SOCK_NONBLOCK,
++                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
++            ] {
++                deny_unix_non_stream_conditions.push(SeccompCondition::new(
++                    1,
++                    SeccompCmpArgLen::Dword,
++                    SeccompCmpOp::Ne,
++                    (libc::SOCK_STREAM | flags) as u64,
++                )?);
++            }
++            let deny_unix_non_stream = SeccompRule::new(deny_unix_non_stream_conditions)?;
++            rules.insert(
++                libc::SYS_socket,
++                vec![deny_non_unix_socket, deny_unix_non_stream],
++            );
++            rules.insert(
++                libc::SYS_socketpair,
++                vec![
++                    SeccompRule::new(vec![SeccompCondition::new(
++                        0,
++                        SeccompCmpArgLen::Dword,
++                        SeccompCmpOp::Ne,
++                        libc::AF_UNIX as u64,
++                    )?])?,
++                    SeccompRule::new(
++                        [
++                            0,
++                            libc::SOCK_CLOEXEC,
++                            libc::SOCK_NONBLOCK,
++                            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
++                        ]
++                        .into_iter()
++                        .map(|flags| {
++                            SeccompCondition::new(
++                                1,
++                                SeccompCmpArgLen::Dword,
++                                SeccompCmpOp::Ne,
++                                (libc::SOCK_STREAM | flags) as u64,
++                            )
++                        })
++                        .collect::<std::result::Result<Vec<_>, _>>()?,
++                    )?,
++                    SeccompRule::new(vec![SeccompCondition::new(
++                        2,
++                        SeccompCmpArgLen::Dword,
++                        SeccompCmpOp::Ne,
++                        0,
++                    )?])?,
++                ],
++            );
++        }
++        NetworkSeccompMode::ProxyRouted | NetworkSeccompMode::ProxyRoutedWithUnixSockets => {
++            let allow_unix_sockets = matches!(mode, NetworkSeccompMode::ProxyRoutedWithUnixSockets);
+             // In proxy-routed mode we allow IP sockets in the isolated
+             // namespace (used to reach the local TCP bridge) but deny all
+-            // other socket families, including AF_UNIX. This prevents
+-            // bypassing the routed bridge via new Unix sockets and narrows the
+-            // socket surface in proxy-only mode.
+-            let deny_non_ip_socket = SeccompRule::new(vec![
++            // other socket families. Exact Unix socket grants optionally add
++            // AF_UNIX stream sockets while preserving the proxy-only surface.
++            let mut non_ip_socket_conditions = vec![
+                 SeccompCondition::new(
+                     0,
+                     SeccompCmpArgLen::Dword,
+@@ -236,7 +318,16 @@
+                     SeccompCmpOp::Ne,
+                     libc::AF_INET6 as u64,
+                 )?,
+-            ])?;
++            ];
++            if allow_unix_sockets {
++                non_ip_socket_conditions.push(SeccompCondition::new(
++                    0,
++                    SeccompCmpArgLen::Dword,
++                    SeccompCmpOp::Ne,
++                    libc::AF_UNIX as u64,
++                )?);
++            }
++            let deny_non_ip_socket = SeccompRule::new(non_ip_socket_conditions)?;
+             // Connected stream pairs are private IPC (buffered child stdio).
+             // Datagram pairs can be reconnected to named host sockets, so
+             // permit only AF_UNIX/SOCK_STREAM/protocol 0 and known flags.
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -372,6 +372,7 @@
+             && name != PRIVATE_BIND_MOUNTS_ENV
+             && name != DOCKER_BROKER_SOCKET_ENV
+             && name != "ZEROBOX_ALLOW_LOCAL_BINDING"
++            && name != "ZEROBOX_ALLOW_UNIX_SOCKET"
+             && name != "ZEROBOX_HOST_LOOPBACK_PORTS"
+         {
+             target.insert(name, value);
+@@ -540,11 +541,23 @@
+ struct PrivateBindMount {
+     source: PathBuf,
+     destination: PathBuf,
++    #[serde(default)]
++    exact_unix_socket: Option<ExactUnixSocketIdentity>,
++    #[serde(default)]
++    source_fd: Option<i32>,
++}
++
++#[derive(Debug, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ExactUnixSocketIdentity {
++    dev: u64,
++    ino: u64,
+ }
+ 
+ struct PreparedPrivateBindMount {
+     source: File,
+     destination: PathBuf,
++    exact_unix_socket: bool,
+ }
+ 
+ fn load_private_bind_mounts() -> Vec<PrivateBindMount> {
+@@ -570,25 +583,74 @@
+                     "private bind paths must be absolute",
+                 ));
+             }
+-            let source = OpenOptions::new()
+-                .read(true)
+-                .custom_flags(
+-                    libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_PATH,
+-                )
+-                .open(&mount.source)
+-                .map_err(|error| {
+-                    std::io::Error::new(
+-                        error.kind(),
++            let exact_unix_socket = mount.exact_unix_socket.is_some();
++            let source = match (exact_unix_socket, mount.source_fd) {
++                (true, Some(fd)) if fd >= 3 => unsafe { File::from_raw_fd(fd) },
++                (true, Some(_)) => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::InvalidInput,
++                        "exact Unix socket descriptor must not use stdio",
++                    ));
++                }
++                (true, None) => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::PermissionDenied,
++                        "exact Unix socket requires a pre-opened descriptor",
++                    ));
++                }
++                (false, Some(_)) => {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::InvalidInput,
++                        "only exact Unix sockets may use a pre-opened descriptor",
++                    ));
++                }
++                (false, None) => OpenOptions::new()
++                    .read(true)
++                    .custom_flags(
++                        libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_PATH,
++                    )
++                    .open(&mount.source)
++                    .map_err(|error| {
++                        std::io::Error::new(
++                            error.kind(),
++                            format!(
++                                "open private bind source {} -> {}: {error}",
++                                mount.source.display(),
++                                mount.destination.display(),
++                            ),
++                        )
++                    })?,
++            };
++            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
++            if unsafe { libc::fstat(source.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::Other,
++                    format!(
++                        "inspect private bind source {}: {}",
++                        mount.source.display(),
++                        std::io::Error::last_os_error()
++                    ),
++                ));
++            }
++            let stat = unsafe { stat.assume_init() };
++            if let Some(expected) = mount.exact_unix_socket {
++                if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
++                    || stat.st_dev as u64 != expected.dev
++                    || stat.st_ino != expected.ino
++                {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::PermissionDenied,
+                         format!(
+-                            "open private bind source {} -> {}: {error}",
+-                            mount.source.display(),
+-                            mount.destination.display(),
++                            "exact Unix socket source changed or is invalid: {}",
++                            mount.source.display()
+                         ),
+-                    )
+-                })?;
++                    ));
++                }
++            }
+             Ok(PreparedPrivateBindMount {
+                 source,
+                 destination: mount.destination,
++                exact_unix_socket,
+             })
+         })
+         .collect()
+@@ -624,7 +688,7 @@
+     };
+     let mut mount_args = Vec::with_capacity(mounts.len() * 5);
+     for mount in mounts {
+-        if bwrap_args.used_tmpfs_root {
++        if bwrap_args.used_tmpfs_root && !mount.exact_unix_socket {
+             mount_args.extend([
+                 "--dir".to_string(),
+                 mount.destination.to_string_lossy().into_owned(),
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -5,6 +5,8 @@
+     let mounts = prepare_private_bind_mounts(vec![PrivateBindMount {
+         source: source.clone(),
+         destination: PathBuf::from("/work"),
++        exact_unix_socket: None,
++        source_fd: None,
+     }])
+     .expect("prepare private bind");
+     inject_private_bind_mounts(&mut bwrap_args, mounts).expect("inject private bind");
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -662,6 +662,15 @@
+                 ));
+             }
+             let stat = unsafe { stat.assume_init() };
++            if exact_unix_socket {
++                let source_path = std::fs::read_link(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
++                if source_path.to_string_lossy().ends_with(" (deleted)") {
++                    return Err(std::io::Error::new(
++                        std::io::ErrorKind::PermissionDenied,
++                        "exact Unix socket source changed before sandbox setup",
++                    ));
++                }
++            }
+             if let Some(expected) = mount.exact_unix_socket {
+                 if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+                     || stat.st_dev as u64 != expected.dev
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -2120,5 +2120,48 @@
+ }
+ 
+ #[cfg(test)]
++mod exact_unix_socket_tests {
++    use super::*;
++    use std::os::fd::AsRawFd;
++    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
++    use std::os::unix::net::UnixListener;
++
++    #[test]
++    fn rejects_a_deleted_preopened_exact_unix_socket() {
++        let root = tempfile::tempdir().expect("exact socket root");
++        let source = root.path().join("service.sock");
++        let original = UnixListener::bind(&source).expect("bind original socket");
++        let metadata = std::fs::symlink_metadata(&source).expect("inspect original socket");
++        let source_fd = OpenOptions::new()
++            .read(true)
++            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
++            .open(&source)
++            .expect("pre-open exact source");
++        let inherited_fd = unsafe { libc::dup(source_fd.as_raw_fd()) };
++        assert!(inherited_fd >= 3, "duplicate exact source descriptor");
++        drop(original);
++        std::fs::remove_file(&source).expect("remove original socket");
++        let _replacement = UnixListener::bind(&source).expect("bind replacement socket");
++        let result = prepare_private_bind_mounts(vec![PrivateBindMount {
++            source,
++            destination: PathBuf::from("/service.sock"),
++            exact_unix_socket: Some(ExactUnixSocketIdentity {
++                dev: metadata.dev(),
++                ino: metadata.ino(),
++            }),
++            source_fd: Some(inherited_fd),
++        }])
++        ;
++        let error = match result {
++            Ok(_) => panic!("replacement must not be mounted"),
++            Err(error) => error,
++        };
++        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++        assert!(error.to_string().contains("changed before sandbox setup"));
++        drop(source_fd);
++    }
++}
++
++#[cfg(test)]
+ #[path = "linux_run_main_tests.rs"]
+ mod tests;

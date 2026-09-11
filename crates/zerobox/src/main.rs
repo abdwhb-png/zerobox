@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use clap::{Parser, Subcommand, error::ErrorKind};
 #[cfg(target_os = "linux")]
 use zerobox::arg0;
-use zerobox::{DockerAccessPolicy, Sandbox};
+use zerobox::{DockerAccessPolicy, Sandbox, TcpPublication};
 
 #[derive(Parser, Debug)]
 #[command(name = "zerobox", version, about, long_about = None)]
@@ -71,9 +71,22 @@ pub struct Cli {
     #[arg(long)]
     pub private_tmp: Option<PathBuf>,
 
+    /// Use an owner-only session directory as the sandbox HOME.
+    #[arg(long)]
+    pub private_home: Option<PathBuf>,
+
     /// Permit local TCP servers inside the isolated network namespace.
     #[arg(long)]
     pub allow_local_binding: bool,
+
+    /// Permit connections to exact existing Unix stream sockets.
+    #[arg(long = "allow-unix-socket", value_delimiter = ',', num_args = 1..)]
+    pub allow_unix_socket: Option<Vec<PathBuf>>,
+
+    /// Publish one private TCP listener through an exact host or LAN address.
+    /// Quote values containing `->` in a shell.
+    #[arg(long = "publish-tcp", action = clap::ArgAction::Append)]
+    pub publish_tcp: Vec<String>,
 
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub set_env: Vec<String>,
@@ -310,12 +323,31 @@ async fn tokio_main(
         .linux_sandbox_exe_opt(linux_sandbox_exe)
         .setup_status(status.enabled());
     sandbox = sandbox.allow_local_binding(cli.allow_local_binding);
+    if let Some(ref paths) = cli.allow_unix_socket {
+        for path in paths {
+            sandbox = sandbox.allow_unix_socket(path);
+        }
+    }
+    for value in &cli.publish_tcp {
+        let publication = match TcpPublication::parse(value) {
+            Ok(publication) => publication,
+            Err(error) => {
+                eprintln!("error: invalid --publish-tcp value '{value}': {error:#}");
+                let _ = status.setup_error("invalid_tcp_publication", "invalid TCP publication");
+                return status.setup_exit_code();
+            }
+        };
+        sandbox = sandbox.publish_tcp(publication);
+    }
 
     if let Some(ref cwd) = cli.cwd {
         sandbox = sandbox.cwd(cwd);
     }
     if let Some(ref private_tmp) = cli.private_tmp {
         sandbox = sandbox.private_tmp(private_tmp);
+    }
+    if let Some(ref private_home) = cli.private_home {
+        sandbox = sandbox.private_home(private_home);
     }
 
     if cli.no_sandbox {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io;
@@ -17,7 +17,9 @@ use fuser::{
     ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use globset::{GlobBuilder, GlobMatcher};
-use zerobox_protocol::permissions::FileSystemSandboxPolicy;
+use zerobox_protocol::permissions::{
+    FileSystemAccessMode, FileSystemPath, FileSystemSandboxPolicy,
+};
 
 use crate::process_owner::{is_process_alive, owned_run_prefix, owner_pid};
 
@@ -29,6 +31,7 @@ const FMODE_EXEC: i32 = 0x20;
 #[derive(Debug, Clone)]
 struct CompiledPattern {
     matcher: GlobMatcher,
+    match_scope: PathBuf,
     mount_root: PathBuf,
     mount_destination: PathBuf,
 }
@@ -42,6 +45,7 @@ pub(crate) struct DynamicDenyPolicy {
     base_policy: FileSystemSandboxPolicy,
     cwd: PathBuf,
     access_cache: Arc<Mutex<HashMap<PathBuf, (bool, bool)>>>,
+    exact_unix_sockets: HashSet<PathBuf>,
 }
 
 impl DynamicDenyPolicy {
@@ -56,6 +60,7 @@ impl DynamicDenyPolicy {
             deny_read,
             deny_write,
             FileSystemSandboxPolicy::unrestricted(),
+            &[],
         )
     }
 
@@ -64,8 +69,9 @@ impl DynamicDenyPolicy {
         deny_read: &[String],
         deny_write: &[String],
         base_policy: FileSystemSandboxPolicy,
+        exact_unix_sockets: &[PathBuf],
     ) -> Result<Option<Self>> {
-        if deny_read.is_empty() && deny_write.is_empty() {
+        if deny_read.is_empty() && deny_write.is_empty() && exact_unix_sockets.is_empty() {
             return Ok(None);
         }
         if !cwd.is_absolute() {
@@ -75,14 +81,52 @@ impl DynamicDenyPolicy {
         let canonical_cwd = std::fs::canonicalize(cwd).with_context(|| {
             format!("failed to canonicalize dynamic deny root {}", cwd.display())
         })?;
+        let mut effective_roots = if base_policy.has_full_disk_read_access() {
+            vec![PathBuf::from("/")]
+        } else {
+            base_policy
+                .get_readable_roots_with_cwd(&canonical_cwd)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        };
+        effective_roots.extend(
+            base_policy
+                .get_writable_roots_with_cwd(&canonical_cwd)
+                .into_iter()
+                .map(|root| PathBuf::from(root.root)),
+        );
+        effective_roots.sort();
+        effective_roots.dedup();
         let deny_read = deny_read
             .iter()
             .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|pattern| pattern.can_affect_any(&effective_roots))
+            .collect::<Vec<_>>();
         let deny_write = deny_write
             .iter()
             .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|pattern| pattern.can_affect_any(&effective_roots))
+            .collect::<Vec<_>>();
+        if deny_read.is_empty() && deny_write.is_empty() && exact_unix_sockets.is_empty() {
+            return Ok(None);
+        }
+        let exact_unix_sockets = exact_unix_sockets
+            .iter()
+            .map(|path| {
+                if !path.is_absolute() {
+                    bail!(
+                        "exact Unix socket path must be absolute: {}",
+                        path.display()
+                    );
+                }
+                Ok(path.clone())
+            })
+            .collect::<Result<HashSet<_>>>()?;
         let mut mount_roots = deny_read
             .iter()
             .chain(&deny_write)
@@ -93,6 +137,13 @@ impl DynamicDenyPolicy {
                 )
             })
             .collect::<Vec<_>>();
+        mount_roots.extend(exact_unix_sockets.iter().map(|path| {
+            let parent = path
+                .parent()
+                .expect("absolute socket paths always have a parent")
+                .to_path_buf();
+            (parent.clone(), parent)
+        }));
         mount_roots.sort_by_key(|(path, _)| path.components().count());
         let mut minimal_roots = Vec::<(PathBuf, PathBuf)>::new();
         for (root, destination) in mount_roots {
@@ -116,6 +167,7 @@ impl DynamicDenyPolicy {
             base_policy,
             cwd: canonical_cwd,
             access_cache: Arc::new(Mutex::new(HashMap::new())),
+            exact_unix_sockets,
         }))
     }
 
@@ -131,6 +183,30 @@ impl DynamicDenyPolicy {
         self.path_access(requested).1 || resolved.is_some_and(|path| self.path_access(path).1)
     }
 
+    fn is_structural_read_ancestor(&self, path: &Path) -> bool {
+        if !self.is_read_denied(path, None) {
+            return false;
+        }
+        if self.base_policy.entries.iter().any(|entry| {
+            entry.access == FileSystemAccessMode::None
+                && matches!(
+                    &entry.path,
+                    FileSystemPath::Path { path: denied } if path.starts_with(denied.as_path())
+                )
+        }) {
+            return false;
+        }
+        self.base_policy
+            .get_readable_roots_with_cwd(&self.cwd)
+            .into_iter()
+            .map(PathBuf::from)
+            .any(|root| root != path && root.starts_with(path) && !self.is_read_denied(&root, None))
+    }
+
+    fn is_exact_unix_socket(&self, path: &Path) -> bool {
+        self.exact_unix_sockets.contains(path)
+    }
+
     fn path_access(&self, path: &Path) -> (bool, bool) {
         // Cache only the immutable policy's answer for a lexical path. Never
         // cache inode metadata, data, existence, or a symlink/FD resolution:
@@ -144,8 +220,9 @@ impl DynamicDenyPolicy {
         {
             return *access;
         }
-        let read_denied = !self.base_policy.can_read_path_with_cwd(path, &self.cwd)
-            || matches_any(&self.deny_read, path);
+        let read_denied = !self.is_exact_unix_socket(path)
+            && (!self.base_policy.can_read_path_with_cwd(path, &self.cwd)
+                || matches_any(&self.deny_read, path));
         let write_denied = read_denied
             || !self.base_policy.can_write_path_with_cwd(path, &self.cwd)
             || matches_any(&self.deny_write, path);
@@ -156,6 +233,14 @@ impl DynamicDenyPolicy {
         }
         cache.insert(path.to_path_buf(), access);
         access
+    }
+}
+
+impl CompiledPattern {
+    fn can_affect_any(&self, roots: &[PathBuf]) -> bool {
+        roots
+            .iter()
+            .any(|root| root.starts_with(&self.match_scope) || self.match_scope.starts_with(root))
     }
 }
 
@@ -222,6 +307,7 @@ fn compile_pattern(cwd: &Path, canonical_cwd: &Path, source: &str) -> Result<Com
         anchored = mount_root.join(suffix);
         (mount_root, destination)
     };
+    let match_scope = static_match_scope(&anchored);
     let pattern = anchored.to_string_lossy().into_owned();
 
     let matcher = GlobBuilder::new(&pattern)
@@ -233,9 +319,22 @@ fn compile_pattern(cwd: &Path, canonical_cwd: &Path, source: &str) -> Result<Com
 
     Ok(CompiledPattern {
         matcher,
+        match_scope,
         mount_root,
         mount_destination,
     })
+}
+
+fn static_match_scope(pattern: &Path) -> PathBuf {
+    let mut scope = PathBuf::new();
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if text.chars().any(|character| GLOB_META.contains(&character)) {
+            break;
+        }
+        scope.push(component.as_os_str());
+    }
+    scope
 }
 
 fn expand_home(source: &str) -> Result<String> {
@@ -315,6 +414,16 @@ fn matches_any(patterns: &[CompiledPattern], path: &Path) -> bool {
 pub(crate) struct DynamicBindMount {
     pub(crate) source: PathBuf,
     pub(crate) destination: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exact_unix_socket: Option<ExactUnixSocketIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_fd: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ExactUnixSocketIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
 }
 
 pub(crate) struct DynamicDenyMounts {
@@ -326,10 +435,22 @@ pub(crate) struct DynamicDenyMounts {
 }
 
 impl DynamicDenyMounts {
+    #[cfg(test)]
     pub(crate) fn prepare_in(
         cwd: &Path,
         deny_read: &[String],
         deny_write: &[String],
+        base_policy: &FileSystemSandboxPolicy,
+        parent: &Path,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with_unix_sockets_in(cwd, deny_read, deny_write, &[], base_policy, parent)
+    }
+
+    pub(crate) fn prepare_with_unix_sockets_in(
+        cwd: &Path,
+        deny_read: &[String],
+        deny_write: &[String],
+        exact_unix_sockets: &[PathBuf],
         base_policy: &FileSystemSandboxPolicy,
         parent: &Path,
     ) -> Result<Option<Self>> {
@@ -338,6 +459,7 @@ impl DynamicDenyMounts {
             deny_read,
             deny_write,
             base_policy.clone(),
+            exact_unix_sockets,
         )?
         else {
             return Ok(None);
@@ -392,6 +514,8 @@ impl DynamicDenyMounts {
             binds.push(DynamicBindMount {
                 source: mountpoint,
                 destination: destination.clone(),
+                exact_unix_socket: None,
+                source_fd: None,
             });
         }
 
@@ -815,7 +939,21 @@ impl GuardedPassthroughFs {
 
     fn stat_path(&self, path: &Path) -> io::Result<libc::stat> {
         let fd = self.open_metadata_checked(path)?;
-        fstat(fd.as_raw_fd())
+        let stat = fstat(fd.as_raw_fd())?;
+        self.check_socket(path, &stat)?;
+        Ok(stat)
+    }
+
+    fn check_socket(&self, path: &Path, stat: &libc::stat) -> io::Result<()> {
+        if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Ok(());
+        }
+        let absolute = self.absolute_path(path);
+        if self.policy.is_exact_unix_socket(&absolute) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
     }
 
     fn open_metadata_checked(&self, path: &Path) -> io::Result<OwnedFd> {
@@ -856,7 +994,38 @@ impl GuardedPassthroughFs {
     }
 
     fn attr_for_path(&self, path: &Path, inode: INodeNo) -> io::Result<FileAttr> {
-        Ok(file_attr(inode, &self.stat_path(path)?))
+        // The FUSE root is constructed from a directory. When its lower path is
+        // intentionally unreadable, bwrap still needs a directory type to bind
+        // the view and traverse to separately allowed descendants. Return only
+        // a stable synthetic directory attribute; all data and directory
+        // operations continue through their normal read-policy checks.
+        let absolute = self.absolute_path(path);
+        if path.as_os_str().is_empty() && self.policy.is_read_denied(&self.lower_root, None) {
+            return Ok(synthetic_mount_root_attr(inode));
+        }
+        if self.policy.is_structural_read_ancestor(&absolute) {
+            self.open_structural_directory(path)
+                .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
+            return Ok(synthetic_mount_root_attr(inode));
+        }
+        let stat = self.stat_path(path)?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+            && std::fs::metadata(self.absolute_path(path))
+                .is_ok_and(|metadata| metadata.file_type().is_socket())
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        Ok(file_attr(inode, &stat))
+    }
+
+    fn open_structural_directory(&self, path: &Path) -> io::Result<OwnedFd> {
+        open_path(
+            self.lower_fd.as_raw_fd(),
+            path,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
+        )
     }
 
     fn open_parent(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
@@ -879,10 +1048,10 @@ impl GuardedPassthroughFs {
     }
 
     fn reply_entry(&self, path: &Path, reply: ReplyEntry) {
-        match self.stat_path(path) {
-            Ok(stat) => {
-                let inode = self.state().inode_for_path(path);
-                reply.entry(&Duration::ZERO, &file_attr(inode, &stat), Generation(0));
+        let inode = self.state().inode_for_path(path);
+        match self.attr_for_path(path, inode) {
+            Ok(attr) => {
+                reply.entry(&Duration::ZERO, &attr, Generation(0));
             }
             Err(error) => reply.error(errno(error)),
         }
@@ -1111,6 +1280,13 @@ impl Filesystem for GuardedPassthroughFs {
                 }
                 let kind = FileType::from_std(child.file_type()?)
                     .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+                if kind == FileType::Socket
+                    && !self
+                        .policy
+                        .is_exact_unix_socket(&self.absolute_path(&child_path))
+                {
+                    continue;
+                }
                 let child_inode = self.state().inode_for_path(&child_path);
                 if reply.add(child_inode, (index + 3) as u64, kind, child.file_name()) {
                     break;
@@ -1638,6 +1814,26 @@ fn file_attr(inode: INodeNo, stat: &libc::stat) -> FileAttr {
     }
 }
 
+fn synthetic_mount_root_attr(inode: INodeNo) -> FileAttr {
+    FileAttr {
+        ino: inode,
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::Directory,
+        perm: 0o111,
+        nlink: 2,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 0,
+        flags: 0,
+    }
+}
+
 fn timespec(value: TimeOrNow) -> io::Result<libc::timespec> {
     let time = match value {
         TimeOrNow::SpecificTime(time) => time,
@@ -1813,12 +2009,74 @@ mod tests {
             &["*.pem".to_string()],
             &[],
             base,
+            &[],
         )
         .unwrap()
         .unwrap();
 
         assert!(policy.is_write_denied(&root.path().join("visible.txt"), None));
         assert!(!policy.is_read_denied(&root.path().join("visible.txt"), None));
+    }
+
+    #[test]
+    fn deny_glob_outside_effective_grants_does_not_create_a_dynamic_view() {
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(project).unwrap(),
+            },
+            access: FileSystemAccessMode::Write,
+        }]);
+
+        let policy = DynamicDenyPolicy::compile_with_base_policy(
+            root.path(),
+            &[format!("{}/.aws/**", home.display())],
+            &[],
+            base,
+            &[],
+        )
+        .unwrap();
+
+        assert!(policy.is_none());
+    }
+
+    #[test]
+    fn deny_glob_inside_an_effective_grant_keeps_its_dynamic_view() {
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(project.clone()).unwrap(),
+            },
+            access: FileSystemAccessMode::Write,
+        }]);
+
+        let policy = DynamicDenyPolicy::compile_with_base_policy(
+            root.path(),
+            &[format!("{}/*.pem", project.display())],
+            &[],
+            base,
+            &[],
+        )
+        .unwrap()
+        .expect("effective deny requires a dynamic view");
+
+        assert_eq!(policy.mount_roots(), &[project]);
     }
 
     #[test]
@@ -2164,6 +2422,211 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(mounts.root().is_dir());
+    }
+
+    #[test]
+    fn denied_mount_root_exposes_only_synthetic_directory_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let restricted = lower.path().join("restricted");
+        let allowed = restricted.join("allowed");
+        let sibling = restricted.join("sibling.txt");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(allowed.join("value.txt"), "allowed").unwrap();
+        std::fs::write(&sibling, "sibling").unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(allowed.clone()).unwrap(),
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+        let deny_read = format!("{}/*.pem", restricted.display());
+        let mounts =
+            DynamicDenyMounts::prepare_in(lower.path(), &[deny_read], &[], &base, private.path())
+                .unwrap()
+                .unwrap();
+        let view = mounts
+            .binds()
+            .iter()
+            .find(|bind| bind.destination == restricted)
+            .unwrap()
+            .source
+            .clone();
+
+        let metadata = std::fs::metadata(&view).expect("synthetic root metadata");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o111);
+        assert_eq!(metadata.modified().unwrap(), UNIX_EPOCH);
+        assert_eq!(
+            std::fs::read_to_string(view.join("allowed/value.txt")).unwrap(),
+            "allowed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.join("sibling.txt"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_dir(&view).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn denied_mount_root_allows_only_structural_traversal_to_nested_grants() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let home = lower.path().join("home");
+        let project = home.join("projects/project");
+        let sibling = home.join("sibling.txt");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("value.txt"), "allowed").unwrap();
+        std::fs::write(&sibling, "sibling").unwrap();
+
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(project.clone()).unwrap(),
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+        let deny_read = format!("{}/*.pem", home.display());
+        let mounts =
+            DynamicDenyMounts::prepare_in(lower.path(), &[deny_read], &[], &base, private.path())
+                .unwrap()
+                .unwrap();
+        let view = mounts
+            .binds()
+            .iter()
+            .find(|bind| bind.destination == home)
+            .unwrap()
+            .source
+            .clone();
+
+        assert_eq!(
+            std::fs::read_to_string(view.join("projects/project/value.txt")).unwrap(),
+            "allowed"
+        );
+        for structural in [view.clone(), view.join("projects")] {
+            let metadata = std::fs::metadata(structural).expect("structural metadata");
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.len(), 0);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o111);
+            assert_eq!(metadata.modified().unwrap(), UNIX_EPOCH);
+        }
+        assert_eq!(
+            std::fs::read_to_string(view.join("sibling.txt"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_dir(&view).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let explicitly_denied = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: AbsolutePathBuf::try_from(project.clone()).unwrap(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: AbsolutePathBuf::try_from(home.clone()).unwrap(),
+                },
+                access: FileSystemAccessMode::None,
+            },
+        ]);
+        let denied_mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &[format!("{}/*.pem", home.display())],
+            &[],
+            &explicitly_denied,
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let denied_view = denied_mounts
+            .binds()
+            .iter()
+            .find(|bind| bind.destination == home)
+            .unwrap()
+            .source
+            .clone();
+        assert_eq!(
+            std::fs::read_to_string(denied_view.join("projects/project/value.txt"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn structural_ancestor_never_masquerades_as_a_replaced_file_or_symlink() {
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let home = lower.path().join("home");
+        let project = home.join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("value.txt"), "allowed").unwrap();
+        std::fs::write(home.join("sibling.txt"), "sibling").unwrap();
+
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(project).unwrap(),
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+        let deny_read = format!("{}/*.pem", home.display());
+        let mounts =
+            DynamicDenyMounts::prepare_in(lower.path(), &[deny_read], &[], &base, private.path())
+                .unwrap()
+                .unwrap();
+        let view = mounts
+            .binds()
+            .iter()
+            .find(|bind| bind.destination == home)
+            .unwrap()
+            .source
+            .clone();
+
+        std::fs::remove_dir_all(home.join("projects")).unwrap();
+        std::fs::write(home.join("projects"), "not a directory").unwrap();
+        assert_eq!(
+            std::fs::metadata(view.join("projects")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        std::fs::remove_file(home.join("projects")).unwrap();
+        std::os::unix::fs::symlink("sibling.txt", home.join("projects")).unwrap();
+        assert_eq!(
+            std::fs::metadata(view.join("projects")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

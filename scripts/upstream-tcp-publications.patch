@@ -1,0 +1,1368 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -134,6 +134,13 @@
+     #[arg(long = "proxy-root", hide = true)]
+     pub proxy_root: Option<PathBuf>,
+ 
++    /// Internal exact TCP publication declarations serialized by the trusted launcher.
++    #[arg(long = "tcp-publication-spec", hide = true)]
++    pub tcp_publication_spec: Option<String>,
++
++    #[arg(long = "tcp-publication-revoke-fd", hide = true)]
++    pub tcp_publication_revoke_fd: Option<i32>,
++
+     #[arg(long = "setup-status-fd", hide = true)]
+     pub setup_status_fd: Option<i32>,
+ 
+@@ -165,6 +172,8 @@
+         allow_network_for_proxy,
+         proxy_route_spec,
+         proxy_root,
++        tcp_publication_spec,
++        tcp_publication_revoke_fd,
+         setup_status_fd,
+         no_proc,
+         command,
+@@ -202,6 +211,10 @@
+             crate::proxy_routing::prepare_private_loopback(proxy_route_spec.as_deref())
+                 .unwrap_or_else(|err| panic!("failed to prepare private loopback: {err}"));
+         }
++        if let Some(spec) = tcp_publication_spec.as_deref() {
++            crate::proxy_routing::start_tcp_publication_monitor(spec)
++                .unwrap_or_else(|err| panic!("failed to start TCP publication monitor: {err}"));
++        }
+         let proxy_routing_active = allow_network_for_proxy;
+         if let Err(e) = apply_permission_profile_to_current_thread(
+             &permission_profile,
+@@ -257,12 +270,26 @@
+         } else {
+             None
+         };
++        let tcp_publication_host = tcp_publication_spec.as_deref().map(|spec| {
++            let proxy_root = proxy_root.as_deref().unwrap_or_else(|| {
++                panic!("TCP publication requires an explicit private proxy root")
++            });
++            let revoke_fd = tcp_publication_revoke_fd
++                .unwrap_or_else(|| panic!("TCP publication requires a private revocation FD"));
++            crate::proxy_routing::prepare_tcp_publication_host(proxy_root, spec, revoke_fd)
++                .unwrap_or_else(|err| {
++                    panic!("failed to prepare TCP publication host bridge: {err}")
++                })
++        });
+         let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
+             sandbox_policy_cwd: &sandbox_policy_cwd,
+             command_cwd: command_cwd.as_deref(),
+             permission_profile: &permission_profile,
+             allow_network_for_proxy,
+             proxy_route_spec,
++            tcp_publication_spec: tcp_publication_host
++                .as_ref()
++                .map(|host| host.inner_spec.clone()),
+             setup_status_fd,
+             command,
+         });
+@@ -276,6 +303,7 @@
+             allow_network_for_proxy,
+             private_proxy_source,
+             private_bind_mounts,
++            tcp_publication_host.is_some(),
+         );
+     }
+ 
+@@ -452,6 +480,7 @@
+     allow_network_for_proxy: bool,
+     proxy_root: Option<&Path>,
+     private_bind_mounts: Vec<PreparedPrivateBindMount>,
++    keep_parent_for_tcp_publication: bool,
+ ) -> ! {
+     let network_mode = bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy);
+     let mut mount_proc = mount_proc;
+@@ -491,7 +520,7 @@
+             .unwrap_or_else(|err| panic!("invalid private proxy mount: {err}"));
+     }
+     apply_inner_command_argv0(&mut bwrap_args.args);
+-    run_or_exec_bwrap(bwrap_args);
++    run_or_exec_bwrap(bwrap_args, keep_parent_for_tcp_publication);
+ }
+ 
+ fn bwrap_network_mode(
+@@ -672,10 +702,16 @@
+     if mounts.is_empty() {
+         return Ok(());
+     }
+-    let separator = bwrap_args.args
++    let separator = bwrap_args
++        .args
+         .iter()
+         .position(|argument| argument == "--")
+-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing command separator"))?;
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "missing command separator",
++            )
++        })?;
+     let mount_index = if bwrap_args.used_tmpfs_root {
+         bwrap_args.args[..separator]
+             .windows(2)
+@@ -832,9 +868,13 @@
+     "true".to_string()
+ }
+ 
+-fn run_or_exec_bwrap(bwrap_args: crate::bwrap::BwrapArgs) -> ! {
++fn run_or_exec_bwrap(
++    bwrap_args: crate::bwrap::BwrapArgs,
++    keep_parent_for_tcp_publication: bool,
++) -> ! {
+     if bwrap_args.synthetic_mount_targets.is_empty()
+         && bwrap_args.protected_create_targets.is_empty()
++        && !keep_parent_for_tcp_publication
+     {
+         exec_bwrap(bwrap_args.args, bwrap_args.preserved_files);
+     }
+@@ -1248,12 +1288,18 @@
+             return false;
+         }
+         fs::create_dir_all(&marker_dir).unwrap_or_else(|err| {
+-            panic!("failed to create synthetic mount marker {}: {err}", marker_dir.display())
++            panic!(
++                "failed to create synthetic mount marker {}: {err}",
++                marker_dir.display()
++            )
+         });
+         // Retain ownership across argv construction and later registration,
+         // under the same lock used by concurrent cleanup.
+-        fs::write(marker_dir.join(std::process::id().to_string()), SYNTHETIC_MOUNT_MARKER_SYNTHETIC)
+-            .unwrap_or_else(|err| panic!("failed to claim synthetic mount {}: {err}", path.display()));
++        fs::write(
++            marker_dir.join(std::process::id().to_string()),
++            SYNTHETIC_MOUNT_MARKER_SYNTHETIC,
++        )
++        .unwrap_or_else(|err| panic!("failed to claim synthetic mount {}: {err}", path.display()));
+         true
+     })
+ }
+@@ -1781,6 +1827,7 @@
+     permission_profile: &'a PermissionProfile,
+     allow_network_for_proxy: bool,
+     proxy_route_spec: Option<String>,
++    tcp_publication_spec: Option<String>,
+     setup_status_fd: Option<i32>,
+     command: Vec<String>,
+ }
+@@ -1793,6 +1840,7 @@
+         permission_profile,
+         allow_network_for_proxy,
+         proxy_route_spec,
++        tcp_publication_spec,
+         setup_status_fd,
+         command,
+     } = args;
+@@ -1819,6 +1867,10 @@
+         permission_profile_json,
+         "--apply-seccomp-then-exec".to_string(),
+     ]);
++    if let Some(tcp_publication_spec) = tcp_publication_spec {
++        inner.push("--tcp-publication-spec".to_string());
++        inner.push(tcp_publication_spec);
++    }
+     if allow_network_for_proxy {
+         inner.push("--allow-network-for-proxy".to_string());
+         let proxy_route_spec = proxy_route_spec
+@@ -1925,15 +1977,25 @@
+         if let Err(error) = preparation {
+             let error = error.raw_os_error().unwrap_or(libc::EPERM);
+             let _ = write_exec_error(exec_error_pipe[1], error);
+-            unsafe { libc::_exit(127); }
++            unsafe {
++                libc::_exit(127);
++            }
++        }
++        unsafe {
++            libc::close(status_fd);
+         }
+-        unsafe { libc::close(status_fd); }
+         exec();
+-        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
++        let error = std::io::Error::last_os_error()
++            .raw_os_error()
++            .unwrap_or(libc::ENOENT);
+         let _ = write_exec_error(exec_error_pipe[1], error);
+-        unsafe { libc::_exit(127); }
++        unsafe {
++            libc::_exit(127);
++        }
++    }
++    unsafe {
++        libc::close(exec_error_pipe[1]);
+     }
+-    unsafe { libc::close(exec_error_pipe[1]); }
+     let (exec_error, signal_forwarders) = confirm_exec_before_enabling_signal_forwarding(
+         || read_exec_error(exec_error_pipe[0]),
+         || {
+@@ -1942,11 +2004,19 @@
+             signal_forwarders
+         },
+     );
+-    unsafe { libc::close(exec_error_pipe[0]); }
++    unsafe {
++        libc::close(exec_error_pipe[0]);
++    }
+     let started = matches!(exec_error, Ok(None));
+-    let frame = if started { "STARTED" } else { "ERR:exec_failed" };
++    let frame = if started {
++        "STARTED"
++    } else {
++        "ERR:exec_failed"
++    };
+     let frame_written = write_setup_frame(status_fd, frame).is_ok();
+-    unsafe { libc::close(status_fd); }
++    unsafe {
++        libc::close(status_fd);
++    }
+     if !frame_written {
+         send_signal_to_bwrap_child(child, libc::SIGKILL);
+     }
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -10,12 +10,10 @@
+ use std::io::Write;
+ use std::net::IpAddr;
+ use std::net::Ipv4Addr;
++use std::net::Shutdown;
+ use std::net::SocketAddr;
+ use std::net::TcpListener;
+ use std::net::TcpStream;
+-use std::sync::Arc;
+-use std::sync::atomic::AtomicUsize;
+-use std::sync::atomic::Ordering;
+ use std::os::fd::AsRawFd;
+ use std::os::fd::FromRawFd;
+ use std::os::unix::fs::DirBuilderExt;
+@@ -26,6 +24,10 @@
+ use std::os::unix::net::UnixStream;
+ use std::path::Path;
+ use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use url::Url;
+ 
+@@ -54,6 +56,14 @@
+ const BROKER_OPEN_REQUEST: u8 = 1;
+ const BROKER_OPEN_OK: u8 = 1;
+ const BROKER_OPEN_ERROR: u8 = 0;
++const TCP_PUBLICATION_BIND: u8 = 1;
++const TCP_PUBLICATION_UNBIND: u8 = 2;
++const TCP_PUBLICATION_BOUND: u8 = 1;
++const TCP_PUBLICATION_BIND_ERROR: u8 = 2;
++const TCP_PUBLICATION_UNBOUND: u8 = 3;
++const TCP_PUBLICATION_REVOKED: u8 = 4;
++const MAX_TCP_PUBLICATIONS: usize = 64;
++const TCP_PUBLICATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+ pub(crate) const PRIVATE_PROXY_MOUNT_ROOT: &str = "/dev/.zerobox-proxy";
+ const MAX_LOCAL_BROKER_CONNECTIONS: usize = 64;
+ const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+@@ -950,16 +957,21 @@
+ pub(crate) fn prepare_private_loopback(spec: Option<&str>) -> io::Result<()> {
+     ensure_loopback_interface_up()?;
+     let ports: Vec<u16> = serde_json::from_str(
+-        &std::env::var("ZEROBOX_HOST_LOOPBACK_PORTS").unwrap_or_else(|_| "[]".into())
+-    ).map_err(io::Error::other)?;
++        &std::env::var("ZEROBOX_HOST_LOOPBACK_PORTS").unwrap_or_else(|_| "[]".into()),
++    )
++    .map_err(io::Error::other)?;
+     if ports.len() > 64 || ports.contains(&0) {
+         return Err(io::Error::other("invalid host loopback forwarding ports"));
+     }
+     if !ports.is_empty() {
+-        let routes: ProxyRouteSpec = serde_json::from_str(
+-            spec.ok_or_else(|| io::Error::other("host loopback forwarding requires a managed proxy"))?
+-        ).map_err(io::Error::other)?;
+-        let route = routes.routes.iter().find(|route| route.env_key == "HTTP_PROXY")
++        let routes: ProxyRouteSpec = serde_json::from_str(spec.ok_or_else(|| {
++            io::Error::other("host loopback forwarding requires a managed proxy")
++        })?)
++        .map_err(io::Error::other)?;
++        let route = routes
++            .routes
++            .iter()
++            .find(|route| route.env_key == "HTTP_PROXY")
+             .ok_or_else(|| io::Error::other("host loopback forwarding requires the HTTP proxy"))?;
+         for port in ports {
+             for ip in ["127.0.0.1", "::1"] {
+@@ -1026,7 +1038,9 @@
+     let mut ready = [0];
+     unsafe { File::from_raw_fd(read_fd) }.read_exact(&mut ready)?;
+     if ready[0] != HOST_BRIDGE_READY {
+-        return Err(io::Error::other("private loopback bridge did not become ready"));
++        return Err(io::Error::other(
++            "private loopback bridge did not become ready",
++        ));
+     }
+     Ok(())
+ }
+@@ -1035,7 +1049,10 @@
+     let mut stream = UnixStream::connect(path)?;
+     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+-    write!(stream, "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")?;
++    write!(
++        stream,
++        "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
++    )?;
+     let mut response = Vec::new();
+     while !response.ends_with(b"\r\n\r\n") {
+         if response.len() >= 8192 {
+@@ -1046,7 +1063,10 @@
+         response.push(byte[0]);
+     }
+     if !response.starts_with(b"HTTP/1.1 200 ") && !response.starts_with(b"HTTP/1.0 200 ") {
+-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "loopback proxy refused CONNECT"));
++        return Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            "loopback proxy refused CONNECT",
++        ));
+     }
+     Ok(stream)
+ }
+@@ -1177,10 +1197,780 @@
+     Ok(())
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize)]
++struct TcpPublication {
++    scope: String,
++    listen: SocketAddr,
++    target: SocketAddr,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++struct TcpPublicationMonitorSpec {
++    publications: Vec<TcpPublication>,
++    control_path: PathBuf,
++    connection_path: PathBuf,
++}
++
++pub(crate) struct TcpPublicationHost {
++    pub(crate) inner_spec: String,
++}
++
++const TCP_PUBLICATION_SETUP_READY: u8 = 1;
++
++pub(crate) fn prepare_tcp_publication_host(
++    proxy_root: &Path,
++    raw_spec: &str,
++    revoke_fd: libc::c_int,
++) -> io::Result<TcpPublicationHost> {
++    let publications: Vec<TcpPublication> =
++        serde_json::from_str(raw_spec).map_err(io::Error::other)?;
++    validate_tcp_publications(&publications)?;
++    if revoke_fd < 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "invalid TCP publication revocation FD",
++        ));
++    }
++    ensure_private_proxy_root(proxy_root)?;
++    let control_dir = create_proxy_socket_dir(proxy_root)?;
++    let control_path = control_dir.join("tcp-publication-control.sock");
++    let connection_path = control_dir.join("tcp-publication-connection.sock");
++    let control_listener = UnixListener::bind(&control_path)?;
++    let connection_listener = match UnixListener::bind(&connection_path) {
++        Ok(listener) => listener,
++        Err(error) => {
++            let _ = std::fs::remove_file(&control_path);
++            return Err(error);
++        }
++    };
++    std::fs::set_permissions(&control_path, Permissions::from_mode(0o600))?;
++    std::fs::set_permissions(&connection_path, Permissions::from_mode(0o600))?;
++    let parent_pid = unsafe { libc::getpid() };
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if pid == 0 {
++        let result = (|| {
++            harden_bridge_process_for_parent(parent_pid)?;
++            run_tcp_publication_host(
++                control_listener,
++                connection_listener,
++                unsafe { File::from_raw_fd(revoke_fd) },
++                &control_path,
++                &connection_path,
++                &publications,
++            )
++        })();
++        let _ = cleanup_proxy_socket_dir(&control_dir);
++        if let Err(error) = result {
++            eprintln!("TCP publication host bridge failed: {error}");
++            unsafe { libc::_exit(1) };
++        }
++        unsafe { libc::_exit(0) };
++    }
++    drop(control_listener);
++    drop(connection_listener);
++    close_fd(revoke_fd)?;
++    let control_relative = control_path.strip_prefix(proxy_root).map_err(|_| {
++        io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "TCP publication control escapes proxy root",
++        )
++    })?;
++    let connection_relative = connection_path.strip_prefix(proxy_root).map_err(|_| {
++        io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "TCP publication connection escapes proxy root",
++        )
++    })?;
++    let inner_spec = serde_json::to_string(&TcpPublicationMonitorSpec {
++        publications,
++        control_path: Path::new(PRIVATE_PROXY_MOUNT_ROOT).join(control_relative),
++        connection_path: Path::new(PRIVATE_PROXY_MOUNT_ROOT).join(connection_relative),
++    })
++    .map_err(io::Error::other)?;
++    Ok(TcpPublicationHost { inner_spec })
++}
++
++pub(crate) fn start_tcp_publication_monitor(spec: &str) -> io::Result<()> {
++    let spec: TcpPublicationMonitorSpec = serde_json::from_str(spec).map_err(io::Error::other)?;
++    validate_tcp_publications(&spec.publications)?;
++    let parent_pid = unsafe { libc::getpid() };
++    let parent_pidfd = open_parent_pidfd(parent_pid)?;
++    let (read_fd, write_fd) = match create_ready_pipe() {
++        Ok(pipe) => pipe,
++        Err(error) => {
++            let _ = close_fd(parent_pidfd);
++            return Err(error);
++        }
++    };
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        let _ = close_fd(read_fd);
++        let _ = close_fd(write_fd);
++        let _ = close_fd(parent_pidfd);
++        return Err(io::Error::last_os_error());
++    }
++    if pid == 0 {
++        let _ = close_fd(read_fd);
++        let result = (|| {
++            harden_bridge_process_for_parent(parent_pid)?;
++            run_tcp_publication_monitor(spec, write_fd)
++        })();
++        if let Err(error) = result {
++            eprintln!("TCP publication monitor failed: {error}");
++            let _ = signal_parent_pidfd(parent_pidfd);
++            let _ = close_fd(parent_pidfd);
++            unsafe { libc::_exit(1) };
++        }
++        let _ = close_fd(parent_pidfd);
++        unsafe { libc::_exit(0) };
++    }
++    close_fd(write_fd)?;
++    close_fd(parent_pidfd)?;
++    let mut ready = [0_u8; 1];
++    let result = unsafe { File::from_raw_fd(read_fd) }.read_exact(&mut ready);
++    match result {
++        Ok(()) if ready[0] == TCP_PUBLICATION_SETUP_READY => Ok(()),
++        Ok(()) => Err(io::Error::other(
++            "invalid TCP publication monitor setup response",
++        )),
++        Err(error) => Err(io::Error::new(
++            error.kind(),
++            format!("TCP publication monitor setup failed: {error}"),
++        )),
++    }
++}
++
++fn harden_bridge_process_for_parent(parent_pid: libc::pid_t) -> io::Result<()> {
++    if unsafe { libc::getppid() } != parent_pid {
++        return Err(io::Error::other(
++            "TCP publication bridge parent changed before setup",
++        ));
++    }
++    set_parent_death_signal()?;
++    if unsafe { libc::getppid() } != parent_pid {
++        return Err(io::Error::other(
++            "TCP publication bridge parent changed during setup",
++        ));
++    }
++    zerobox_process_hardening::disable_process_dumping()
++}
++
++fn open_parent_pidfd(parent_pid: libc::pid_t) -> io::Result<libc::c_int> {
++    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0) };
++    if fd < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(fd as libc::c_int)
++    }
++}
++
++fn signal_parent_pidfd(parent_pidfd: libc::c_int) -> io::Result<()> {
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_pidfd_send_signal,
++            parent_pidfd,
++            libc::SIGTERM,
++            std::ptr::null::<libc::siginfo_t>(),
++            0,
++        )
++    };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(())
++    }
++}
++
++fn validate_tcp_publications(publications: &[TcpPublication]) -> io::Result<()> {
++    if publications.is_empty() || publications.len() > MAX_TCP_PUBLICATIONS {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "invalid TCP publication count",
++        ));
++    }
++    let mut listens = std::collections::BTreeSet::new();
++    for publication in publications {
++        if publication.listen.port() == 0
++            || publication.target.port() == 0
++            || !publication.target.ip().is_loopback()
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "invalid TCP publication address",
++            ));
++        }
++        match publication.scope.as_str() {
++            "host" if publication.listen.ip().is_loopback() => {}
++            "lan" if !publication.listen.ip().is_unspecified() => {}
++            _ => {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "invalid TCP publication scope",
++                ));
++            }
++        }
++        if !listens.insert(publication.listen) {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "duplicate TCP publication listener",
++            ));
++        }
++    }
++    Ok(())
++}
++
++fn run_tcp_publication_host(
++    control_listener: UnixListener,
++    connection_listener: UnixListener,
++    mut revocation: File,
++    control_path: &Path,
++    connection_path: &Path,
++    publications: &[TcpPublication],
++) -> io::Result<()> {
++    let (mut control, _) = control_listener.accept()?;
++    std::fs::remove_file(control_path)?;
++    drop(control_listener);
++    let (mut connection, _) = connection_listener.accept()?;
++    std::fs::remove_file(connection_path)?;
++    drop(connection_listener);
++    control.write_all(&[TCP_PUBLICATION_SETUP_READY])?;
++    control.set_nonblocking(true)?;
++    let mut listeners: Vec<Option<TcpListener>> = (0..publications.len()).map(|_| None).collect();
++    loop {
++        let mut fds = Vec::with_capacity(listeners.len() + 2);
++        fds.push(libc::pollfd {
++            fd: control.as_raw_fd(),
++            events: libc::POLLIN,
++            revents: 0,
++        });
++        fds.push(libc::pollfd {
++            fd: revocation.as_raw_fd(),
++            events: libc::POLLIN,
++            revents: 0,
++        });
++        for listener in &listeners {
++            fds.push(libc::pollfd {
++                fd: listener.as_ref().map_or(-1, AsRawFd::as_raw_fd),
++                events: libc::POLLIN,
++                revents: 0,
++            });
++        }
++        let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) };
++        if polled < 0 {
++            let error = io::Error::last_os_error();
++            if error.kind() == io::ErrorKind::Interrupted {
++                continue;
++            }
++            return Err(error);
++        }
++        if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
++            return Ok(());
++        }
++        if fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
++            return Ok(());
++        }
++        if fds[1].revents & libc::POLLIN != 0 {
++            let mut revoke = [0_u8; 1];
++            revocation.read_exact(&mut revoke)?;
++            control.write_all(&[TCP_PUBLICATION_REVOKED])?;
++            return Ok(());
++        }
++        if fds[0].revents & libc::POLLIN != 0 {
++            let mut request = [0_u8; 1];
++            match control.read_exact(&mut request) {
++                Ok(()) => {}
++                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
++                Err(error) => return Err(error),
++            }
++            let operation = if request[0] & 0x80 == 0 {
++                TCP_PUBLICATION_BIND
++            } else {
++                TCP_PUBLICATION_UNBIND
++            };
++            let index = request[0] & 0x7f;
++            let position = usize::from(index);
++            if position >= publications.len() {
++                send_publication_status(
++                    &mut control,
++                    TCP_PUBLICATION_BIND_ERROR,
++                    index,
++                    libc::EINVAL,
++                )?;
++                continue;
++            }
++            match operation {
++                TCP_PUBLICATION_BIND if listeners[position].is_none() => {
++                    match TcpListener::bind(publications[position].listen) {
++                        Ok(listener) => {
++                            listener.set_nonblocking(true)?;
++                            listeners[position] = Some(listener);
++                            send_publication_status(&mut control, TCP_PUBLICATION_BOUND, index, 0)?;
++                        }
++                        Err(error) => send_publication_status(
++                            &mut control,
++                            TCP_PUBLICATION_BIND_ERROR,
++                            index,
++                            error.raw_os_error().unwrap_or(libc::EIO),
++                        )?,
++                    }
++                }
++                TCP_PUBLICATION_UNBIND => {
++                    listeners[position].take();
++                    send_publication_status(&mut control, TCP_PUBLICATION_UNBOUND, index, 0)?;
++                }
++                _ => send_publication_status(
++                    &mut control,
++                    TCP_PUBLICATION_BIND_ERROR,
++                    index,
++                    libc::EINVAL,
++                )?,
++            }
++        }
++        for (index, listener) in listeners.iter().enumerate() {
++            if fds[index + 2].revents & libc::POLLIN == 0 {
++                continue;
++            }
++            let Some(listener) = listener else {
++                continue;
++            };
++            match listener.accept() {
++                Ok((stream, _)) => {
++                    send_tcp_publication_stream(&mut connection, index as u8, &stream)?
++                }
++                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
++                Err(error) => return Err(error),
++            }
++        }
++    }
++}
++
++fn send_publication_status(
++    control: &mut UnixStream,
++    kind: u8,
++    index: u8,
++    errno: i32,
++) -> io::Result<()> {
++    let mut message = [0_u8; 6];
++    message[0] = kind;
++    message[1] = index;
++    message[2..].copy_from_slice(&errno.to_be_bytes());
++    control.write_all(&message)
++}
++
++fn send_tcp_publication_stream(
++    connection: &mut UnixStream,
++    index: u8,
++    stream: &TcpStream,
++) -> io::Result<()> {
++    let mut marker = [index];
++    let mut iovec = libc::iovec {
++        iov_base: marker.as_mut_ptr().cast(),
++        iov_len: marker.len(),
++    };
++    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
++    let mut ancillary = vec![0_u8; control_len];
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut iovec;
++    message.msg_iovlen = 1;
++    message.msg_control = ancillary.as_mut_ptr().cast();
++    message.msg_controllen = ancillary.len();
++    unsafe {
++        let header = libc::CMSG_FIRSTHDR(&message);
++        if header.is_null() {
++            return Err(io::Error::other("missing TCP publication control header"));
++        }
++        (*header).cmsg_level = libc::SOL_SOCKET;
++        (*header).cmsg_type = libc::SCM_RIGHTS;
++        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as usize;
++        std::ptr::write(
++            libc::CMSG_DATA(header).cast::<libc::c_int>(),
++            stream.as_raw_fd(),
++        );
++        if libc::sendmsg(connection.as_raw_fd(), &message, libc::MSG_NOSIGNAL) != 1 {
++            return Err(io::Error::last_os_error());
++        }
++    }
++    Ok(())
++}
++
++fn run_tcp_publication_monitor(
++    spec: TcpPublicationMonitorSpec,
++    ready_fd: libc::c_int,
++) -> io::Result<()> {
++    let mut control = UnixStream::connect(&spec.control_path)?;
++    let connection = UnixStream::connect(&spec.connection_path)?;
++    let mut setup = [0_u8; 1];
++    control.read_exact(&mut setup)?;
++    if setup[0] != TCP_PUBLICATION_SETUP_READY {
++        return Err(io::Error::other(
++            "invalid TCP publication host setup response",
++        ));
++    }
++    let mut ready_file = unsafe { File::from_raw_fd(ready_fd) };
++    ready_file.write_all(&[TCP_PUBLICATION_SETUP_READY])?;
++    drop(ready_file);
++
++    let mut ready = vec![false; spec.publications.len()];
++    let mut generations = vec![0_u64; spec.publications.len()];
++    let mut drain_deadlines = vec![Vec::new(); spec.publications.len()];
++    let active = Arc::new(AtomicUsize::new(0));
++    let relays = Arc::new(TcpPublicationRelays::default());
++    let revoking = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    loop {
++        for (index, publication) in spec.publications.iter().enumerate() {
++            let listener_present = private_listener_present(publication.target);
++            if ready[index] && !listener_present {
++                request_tcp_publication_change(&mut control, TCP_PUBLICATION_UNBIND, index)?;
++                let (kind, received_index, errno) = read_publication_status(&mut control)?;
++                if kind != TCP_PUBLICATION_UNBOUND || usize::from(received_index) != index {
++                    return Err(io::Error::from_raw_os_error(errno.max(libc::EIO)));
++                }
++                ready[index] = false;
++                let retired_generation = generations[index];
++                generations[index] = generations[index].wrapping_add(1);
++                drain_deadlines[index].push((
++                    retired_generation,
++                    std::time::Instant::now() + TCP_PUBLICATION_DRAIN_TIMEOUT,
++                ));
++            } else if !ready[index] && listener_present {
++                request_tcp_publication_change(&mut control, TCP_PUBLICATION_BIND, index)?;
++                let (kind, received_index, errno) = read_publication_status(&mut control)?;
++                if kind != TCP_PUBLICATION_BOUND || usize::from(received_index) != index {
++                    return Err(io::Error::from_raw_os_error(errno.max(libc::EIO)));
++                }
++                ready[index] = true;
++            }
++        }
++        let mut fds = [
++            libc::pollfd {
++                fd: control.as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            },
++            libc::pollfd {
++                fd: connection.as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            },
++        ];
++        let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) };
++        if polled < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        let mut revoked = false;
++        if fds[0].revents & libc::POLLIN != 0 {
++            let mut frame = [0_u8; 1];
++            control.read_exact(&mut frame)?;
++            revoked = frame[0] == TCP_PUBLICATION_REVOKED;
++            if !revoked {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "unexpected TCP publication control frame",
++                ));
++            }
++        }
++        if fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 && !revoked {
++            return Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "TCP publication host bridge closed",
++            ));
++        }
++        if fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 && !revoked {
++            return Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "TCP publication connection bridge closed",
++            ));
++        }
++        if fds[1].revents & libc::POLLIN != 0 && !revoked {
++            let (index, host_stream) = receive_tcp_publication_stream(&connection)?;
++            let Some(publication) = spec.publications.get(index) else {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "invalid TCP publication index",
++                ));
++            };
++            if !ready[index] {
++                drop(host_stream);
++            } else if let Some(permit) =
++                try_acquire_bridge_connection(Arc::clone(&active), MAX_LOCAL_BROKER_CONNECTIONS)
++            {
++                spawn_tcp_publication_relay(
++                    host_stream,
++                    publication.target,
++                    index,
++                    generations[index],
++                    permit,
++                    Arc::clone(&relays),
++                    Arc::clone(&revoking),
++                );
++            } else {
++                drop(host_stream);
++            }
++        }
++        let now = std::time::Instant::now();
++        for (index, deadlines) in drain_deadlines.iter_mut().enumerate() {
++            let mut pending = Vec::new();
++            for (generation, expires_at) in std::mem::take(deadlines) {
++                if now >= expires_at {
++                    relays.shutdown_generation(index, generation);
++                } else {
++                    pending.push((generation, expires_at));
++                }
++            }
++            *deadlines = pending;
++        }
++        if revoked {
++            revoking.store(true, Ordering::Release);
++            control.shutdown(Shutdown::Both)?;
++            let deadline = std::time::Instant::now() + TCP_PUBLICATION_DRAIN_TIMEOUT;
++            while active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
++                std::thread::sleep(Duration::from_millis(25));
++            }
++            if active.load(Ordering::Acquire) != 0 {
++                relays.shutdown_all();
++                let forced_deadline = std::time::Instant::now() + Duration::from_millis(250);
++                while active.load(Ordering::Acquire) != 0
++                    && std::time::Instant::now() < forced_deadline
++                {
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++            }
++            return Ok(());
++        }
++    }
++}
++
++struct TcpPublicationRelay {
++    index: usize,
++    generation: u64,
++    left: TcpStream,
++    right: TcpStream,
++}
++
++#[derive(Default)]
++struct TcpPublicationRelays {
++    next_id: AtomicUsize,
++    streams: Mutex<HashMap<usize, TcpPublicationRelay>>,
++}
++
++impl TcpPublicationRelays {
++    fn insert(
++        &self,
++        index: usize,
++        generation: u64,
++        left: TcpStream,
++        right: TcpStream,
++    ) -> usize {
++        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
++        self.streams
++            .lock()
++            .expect("TCP relay lock poisoned")
++            .insert(
++                id,
++                TcpPublicationRelay {
++                    index,
++                    generation,
++                    left,
++                    right,
++                },
++            );
++        id
++    }
++
++    fn remove(&self, id: usize) {
++        self.streams
++            .lock()
++            .expect("TCP relay lock poisoned")
++            .remove(&id);
++    }
++
++    fn shutdown_matching(&self, mut matches: impl FnMut(&TcpPublicationRelay) -> bool) {
++        for relay in self
++            .streams
++            .lock()
++            .expect("TCP relay lock poisoned")
++            .values()
++        {
++            if matches(relay) {
++                let _ = relay.left.shutdown(Shutdown::Both);
++                let _ = relay.right.shutdown(Shutdown::Both);
++            }
++        }
++    }
++
++    fn shutdown_generation(&self, index: usize, generation: u64) {
++        self.shutdown_matching(|relay| relay.index == index && relay.generation == generation);
++    }
++
++    fn shutdown_all(&self) {
++        self.shutdown_matching(|_| true);
++    }
++}
++
++fn spawn_tcp_publication_relay(
++    host_stream: TcpStream,
++    target: SocketAddr,
++    index: usize,
++    generation: u64,
++    permit: BridgeConnectionPermit,
++    relays: Arc<TcpPublicationRelays>,
++    revoking: Arc<std::sync::atomic::AtomicBool>,
++) {
++    std::thread::spawn(move || {
++        let _permit = permit;
++        if revoking.load(Ordering::Acquire) {
++            return;
++        }
++        let Ok(target_stream) = TcpStream::connect(target) else {
++            return;
++        };
++        let Ok(host_shutdown) = host_stream.try_clone() else {
++            return;
++        };
++        let Ok(target_shutdown) = target_stream.try_clone() else {
++            return;
++        };
++        let id = relays.insert(index, generation, host_shutdown, target_shutdown);
++        if revoking.load(Ordering::Acquire) {
++            relays.shutdown_all();
++        }
++        let _ = proxy_tcp_tcp(host_stream, target_stream);
++        relays.remove(id);
++    });
++}
++
++fn read_publication_status(control: &mut UnixStream) -> io::Result<(u8, u8, i32)> {
++    let mut message = [0_u8; 6];
++    control.read_exact(&mut message)?;
++    Ok((
++        message[0],
++        message[1],
++        i32::from_be_bytes(message[2..].try_into().unwrap()),
++    ))
++}
++
++fn request_tcp_publication_change(
++    control: &mut UnixStream,
++    operation: u8,
++    index: usize,
++) -> io::Result<()> {
++    let index = u8::try_from(index)
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "TCP publication index overflow"))?;
++    let request = match operation {
++        TCP_PUBLICATION_BIND => index,
++        TCP_PUBLICATION_UNBIND => index | 0x80,
++        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid TCP publication operation")),
++    };
++    control.write_all(&[request])
++}
++
++fn receive_tcp_publication_stream(connection: &UnixStream) -> io::Result<(usize, TcpStream)> {
++    let mut index = [0_u8; 1];
++    let mut iovec = libc::iovec {
++        iov_base: index.as_mut_ptr().cast(),
++        iov_len: index.len(),
++    };
++    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
++    let mut ancillary = vec![0_u8; control_len];
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut iovec;
++    message.msg_iovlen = 1;
++    message.msg_control = ancillary.as_mut_ptr().cast();
++    message.msg_controllen = ancillary.len();
++    if unsafe { libc::recvmsg(connection.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) } != 1 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "invalid TCP publication descriptor",
++        ));
++    }
++    let descriptor = unsafe {
++        let header = libc::CMSG_FIRSTHDR(&message);
++        if header.is_null()
++            || (*header).cmsg_level != libc::SOL_SOCKET
++            || (*header).cmsg_type != libc::SCM_RIGHTS
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "missing TCP publication descriptor",
++            ));
++        }
++        std::ptr::read(libc::CMSG_DATA(header).cast::<libc::c_int>())
++    };
++    Ok((usize::from(index[0]), unsafe {
++        TcpStream::from_raw_fd(descriptor)
++    }))
++}
++
++fn proxy_tcp_tcp(left: TcpStream, right: TcpStream) -> io::Result<()> {
++    left.set_read_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
++    left.set_write_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
++    right.set_read_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
++    right.set_write_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
++    let left_to_right_reader = left.try_clone()?;
++    let left_to_right_writer = right.try_clone()?;
++    let left_to_right = std::thread::spawn(move || {
++        let mut reader = left_to_right_reader;
++        let mut writer = left_to_right_writer;
++        std::io::copy(&mut reader, &mut writer)?;
++        writer.shutdown(Shutdown::Write)
++    });
++    let mut right_to_left_reader = right;
++    let mut right_to_left_writer = left;
++    let right_to_left = (|| {
++        std::io::copy(&mut right_to_left_reader, &mut right_to_left_writer)?;
++        right_to_left_writer.shutdown(Shutdown::Write)
++    })();
++    let left_to_right = left_to_right
++        .join()
++        .map_err(|_| io::Error::other("TCP publication bridge thread panicked"))?;
++    left_to_right?;
++    right_to_left?;
++    Ok(())
++}
++
++fn private_listener_present(target: SocketAddr) -> bool {
++    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|path| {
++        std::fs::read_to_string(path).ok().is_some_and(|table| {
++            table.lines().skip(1).any(|line| {
++                let fields = line.split_whitespace().collect::<Vec<_>>();
++                if fields.len() < 4 || fields[3] != "0A" {
++                    return false;
++                }
++                let Some((address, port)) = fields[1].split_once(':') else {
++                    return false;
++                };
++                let Ok(port) = u16::from_str_radix(port, 16) else {
++                    return false;
++                };
++                port == target.port()
++                    && parse_proc_ip(address, path.ends_with("tcp6")) == Some(target.ip())
++            })
++        })
++    })
++}
++
++fn parse_proc_ip(value: &str, v6: bool) -> Option<IpAddr> {
++    if !v6 {
++        let raw = u32::from_str_radix(value, 16).ok()?;
++        return Some(IpAddr::V4(Ipv4Addr::from(raw.to_le_bytes())));
++    }
++    if value.len() != 32 {
++        return None;
++    }
++    let mut bytes = [0_u8; 16];
++    for (index, chunk) in value.as_bytes().chunks(8).enumerate() {
++        let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
++        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
++    }
++    Some(IpAddr::V6(std::net::Ipv6Addr::from(bytes)))
++}
++
+ #[cfg(test)]
+ mod tests {
+-    use super::try_acquire_bridge_connection;
+-    use std::sync::Arc;
+     use super::PROXY_SOCKET_DIR_PREFIX;
+     use super::ProxyRouteEntry;
+     use super::ProxyRouteSpec;
+@@ -1190,13 +1885,15 @@
+     use super::parse_loopback_proxy_endpoint;
+     use super::parse_proxy_socket_dir_owner_pid;
+     use super::plan_proxy_routes;
+-    use super::proc_status_is_zombie;
+     use super::private_docker_route;
++    use super::proc_status_is_zombie;
+     use super::rewrite_proxy_env_value;
++    use super::try_acquire_bridge_connection;
+     use pretty_assertions::assert_eq;
+     use std::collections::HashMap;
+     use std::net::SocketAddr;
+     use std::path::PathBuf;
++    use std::sync::Arc;
+     use std::sync::atomic::AtomicUsize;
+ 
+     #[test]
+@@ -1341,21 +2038,21 @@
+             ("DOCKER_HOST".to_string(), "tcp://127.0.0.1:1".to_string()),
+         ]);
+ 
+-        assert_eq!(private_docker_route(&env).unwrap().unwrap().uds_path, socket);
+-        env.insert("DOCKER_HOST".to_string(), "unix:///var/run/docker.sock".to_string());
++        assert_eq!(
++            private_docker_route(&env).unwrap().unwrap().uds_path,
++            socket
++        );
++        env.insert(
++            "DOCKER_HOST".to_string(),
++            "unix:///var/run/docker.sock".to_string(),
++        );
+         assert!(private_docker_route(&env).is_err());
+     }
+ 
+     #[test]
+     fn parse_proxy_socket_dir_owner_pid_reads_owner_pid() {
+-        assert_eq!(
+-            parse_proxy_socket_dir_owner_pid("p-1234-0"),
+-            Some(1234)
+-        );
+-        assert_eq!(
+-            parse_proxy_socket_dir_owner_pid("p-x"),
+-            None
+-        );
++        assert_eq!(parse_proxy_socket_dir_owner_pid("p-1234-0"), Some(1234));
++        assert_eq!(parse_proxy_socket_dir_owner_pid("p-x"), None);
+         assert_eq!(parse_proxy_socket_dir_owner_pid("not-a-proxy-dir"), None);
+     }
+ 
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -531,6 +531,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: true,
+         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
++        tcp_publication_spec: None,
+         setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+@@ -548,6 +549,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         proxy_route_spec: None,
++        tcp_publication_spec: None,
+         setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+@@ -568,6 +570,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         proxy_route_spec: None,
++        tcp_publication_spec: None,
+         setup_status_fd: None,
+         command: vec!["/bin/true".to_string()],
+     });
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -588,6 +588,7 @@
+             permission_profile: &permission_profile,
+             allow_network_for_proxy: true,
+             proxy_route_spec: None,
++            tcp_publication_spec: None,
+             setup_status_fd: None,
+             command: vec!["/bin/true".to_string()],
+         })
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -64,6 +64,7 @@
+ const TCP_PUBLICATION_REVOKED: u8 = 4;
+ const MAX_TCP_PUBLICATIONS: usize = 64;
+ const TCP_PUBLICATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
++const TCP_PUBLICATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+ pub(crate) const PRIVATE_PROXY_MOUNT_ROOT: &str = "/dev/.zerobox-proxy";
+ const MAX_LOCAL_BROKER_CONNECTIONS: usize = 64;
+ const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+@@ -1755,9 +1756,18 @@
+ }
+ 
+ #[derive(Default)]
++struct TcpPublicationRelayState {
++    streams: HashMap<usize, TcpPublicationRelay>,
++    // Each publication generation is monotonically increasing. Keeping only
++    // the latest retired generation bounds this state while rejecting every
++    // late relay from an already-expired generation.
++    closed_through: HashMap<usize, u64>,
++}
++
++#[derive(Default)]
+ struct TcpPublicationRelays {
+     next_id: AtomicUsize,
+-    streams: Mutex<HashMap<usize, TcpPublicationRelay>>,
++    state: Mutex<TcpPublicationRelayState>,
+ }
+ 
+ impl TcpPublicationRelays {
+@@ -1767,35 +1777,44 @@
+         generation: u64,
+         left: TcpStream,
+         right: TcpStream,
+-    ) -> usize {
++    ) -> Option<usize> {
++        let mut state = self.state.lock().expect("TCP relay lock poisoned");
++        if state
++            .closed_through
++            .get(&index)
++            .is_some_and(|closed| generation <= *closed)
++        {
++            let _ = left.shutdown(Shutdown::Both);
++            let _ = right.shutdown(Shutdown::Both);
++            return None;
++        }
+         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+-        self.streams
+-            .lock()
+-            .expect("TCP relay lock poisoned")
+-            .insert(
+-                id,
+-                TcpPublicationRelay {
+-                    index,
+-                    generation,
+-                    left,
+-                    right,
+-                },
+-            );
+-        id
++        state.streams.insert(
++            id,
++            TcpPublicationRelay {
++                index,
++                generation,
++                left,
++                right,
++            },
++        );
++        Some(id)
+     }
+ 
+     fn remove(&self, id: usize) {
+-        self.streams
++        self.state
+             .lock()
+             .expect("TCP relay lock poisoned")
++            .streams
+             .remove(&id);
+     }
+ 
+     fn shutdown_matching(&self, mut matches: impl FnMut(&TcpPublicationRelay) -> bool) {
+         for relay in self
+-            .streams
++            .state
+             .lock()
+             .expect("TCP relay lock poisoned")
++            .streams
+             .values()
+         {
+             if matches(relay) {
+@@ -1806,7 +1825,20 @@
+     }
+ 
+     fn shutdown_generation(&self, index: usize, generation: u64) {
+-        self.shutdown_matching(|relay| relay.index == index && relay.generation == generation);
++        let mut state = self.state.lock().expect("TCP relay lock poisoned");
++        state
++            .closed_through
++            .entry(index)
++            .and_modify(|closed| *closed = (*closed).max(generation))
++            .or_insert(generation);
++        for relay in state
++            .streams
++            .values()
++            .filter(|relay| relay.index == index && relay.generation == generation)
++        {
++            let _ = relay.left.shutdown(Shutdown::Both);
++            let _ = relay.right.shutdown(Shutdown::Both);
++        }
+     }
+ 
+     fn shutdown_all(&self) {
+@@ -1814,6 +1846,33 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod tcp_publication_relay_tests {
++    use super::TcpPublicationRelays;
++    use std::net::{Ipv4Addr, TcpListener, TcpStream};
++
++    #[test]
++    fn closed_generation_rejects_late_relay_registration() {
++        let relays = TcpPublicationRelays::default();
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind relay fixture");
++        let client = TcpStream::connect(listener.local_addr().expect("relay listener address"))
++            .expect("connect relay fixture");
++        let (server, _) = listener.accept().expect("accept relay fixture");
++
++        relays.shutdown_generation(3, 9);
++        assert!(relays.insert(3, 9, client, server).is_none());
++        assert!(
++            relays
++                .state
++                .lock()
++                .expect("TCP relay lock poisoned")
++                .streams
++                .is_empty(),
++            "a relay that finishes connecting after its generation expires must not register"
++        );
++    }
++}
++
+ fn spawn_tcp_publication_relay(
+     host_stream: TcpStream,
+     target: SocketAddr,
+@@ -1828,7 +1887,10 @@
+         if revoking.load(Ordering::Acquire) {
+             return;
+         }
+-        let Ok(target_stream) = TcpStream::connect(target) else {
++        let Ok(target_stream) = TcpStream::connect_timeout(
++            &target,
++            TCP_PUBLICATION_CONNECT_TIMEOUT,
++        ) else {
+             return;
+         };
+         let Ok(host_shutdown) = host_stream.try_clone() else {
+@@ -1837,7 +1899,9 @@
+         let Ok(target_shutdown) = target_stream.try_clone() else {
+             return;
+         };
+-        let id = relays.insert(index, generation, host_shutdown, target_shutdown);
++        let Some(id) = relays.insert(index, generation, host_shutdown, target_shutdown) else {
++            return;
++        };
+         if revoking.load(Ordering::Acquire) {
+             relays.shutdown_all();
+         }

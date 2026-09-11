@@ -16,16 +16,59 @@ pub fn zerobox_exec() -> PathBuf {
     }
 }
 
+fn declared_readable_cwd(args: &[&str]) -> PathBuf {
+    let mut values = args.iter().copied();
+    while let Some(value) = values.next() {
+        let read_roots = value
+            .strip_prefix("--allow-read=")
+            .or_else(|| (value == "--allow-read").then(|| values.next()).flatten());
+        if let Some(read_roots) = read_roots {
+            if let Some(root) = read_roots
+                .split(',')
+                .map(PathBuf::from)
+                .find(|root| root.is_absolute() && root.is_dir())
+            {
+                // The Linux sandbox deliberately ignores a system bwrap located
+                // beneath its current directory. /usr would therefore hide
+                // /usr/bin/bwrap even though it is an allowed working tree.
+                // Use an equally readable descendant outside that executable
+                // path for the fixtures that grant only /usr.
+                if root == PathBuf::from("/usr") {
+                    let share = root.join("share");
+                    if share.is_dir() {
+                        return share;
+                    }
+                }
+                return root;
+            }
+        }
+    }
+    PathBuf::from("/tmp")
+}
+
+fn command_with_declared_readable_cwd(args: &[&str]) -> Command {
+    let mut command = Command::new(zerobox_exec());
+    command.current_dir(declared_readable_cwd(args)).args(args);
+    command
+}
+
+fn zerobox_home_for_test() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("zerobox-integration-home-")
+        .tempdir_in("/var/tmp")
+        .expect("create test-local Zerobox home")
+}
+
 pub fn run(args: &[&str]) -> Output {
-    Command::new(zerobox_exec())
-        .args(args)
+    let zerobox_home = zerobox_home_for_test();
+    command_with_declared_readable_cwd(args)
+        .env("ZEROBOX_HOME", zerobox_home.path())
         .output()
         .expect("failed to spawn zerobox")
 }
 
 pub fn run_with_home(home: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(zerobox_exec())
-        .args(args)
+    command_with_declared_readable_cwd(args)
         .env("ZEROBOX_HOME", home)
         .output()
         .expect("failed to spawn zerobox")

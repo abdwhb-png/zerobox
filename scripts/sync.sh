@@ -467,6 +467,30 @@ if [ -f "$CONCURRENT_DENY_TARGETS_PATCH" ]; then
     patch --fuzz=0 -p0 < "$CONCURRENT_DENY_TARGETS_PATCH"
 fi
 
+PRIVATE_BIND_FD_PATCH="$SCRIPT_DIR/upstream-private-bind-fd.patch"
+if [ -f "$PRIVATE_BIND_FD_PATCH" ]; then
+    echo "    private-bind-fd"
+    patch --fuzz=0 -p0 < "$PRIVATE_BIND_FD_PATCH"
+fi
+
+UNIX_SOCKETS_PATCH="$SCRIPT_DIR/upstream-unix-sockets.patch"
+if [ -f "$UNIX_SOCKETS_PATCH" ]; then
+    echo "    unix-sockets"
+    patch --fuzz=0 -p0 < "$UNIX_SOCKETS_PATCH"
+fi
+
+COMMAND_CWD_PATCH="$SCRIPT_DIR/upstream-command-cwd.patch"
+if [ -f "$COMMAND_CWD_PATCH" ]; then
+    echo "    command-cwd"
+    patch --fuzz=0 -p0 < "$COMMAND_CWD_PATCH"
+fi
+
+TCP_PUBLICATIONS_PATCH="$SCRIPT_DIR/upstream-tcp-publications.patch"
+if [ -f "$TCP_PUBLICATIONS_PATCH" ]; then
+    echo "    tcp-publications"
+    patch --fuzz=0 -p0 < "$TCP_PUBLICATIONS_PATCH"
+fi
+
 # Keep generated Rust sources canonical after all local patches have landed.
 if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
     cargo fmt -- \
@@ -474,6 +498,18 @@ if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
         upstream/linux-sandbox/src/landlock.rs \
         upstream/linux-sandbox/src/proxy_routing.rs \
         upstream/network-proxy/src/config.rs
+fi
+
+# This patch deliberately applies after the historical generated-source format.
+# Its control-frame hunks use that canonical context, then the source is formatted
+# again so a replay remains deterministic.
+TCP_PUBLICATION_REVOCATION_RACE_PATCH="$SCRIPT_DIR/upstream-tcp-publication-revocation-race.patch"
+if [ -f "$TCP_PUBLICATION_REVOCATION_RACE_PATCH" ]; then
+    echo "    tcp-publication-revocation-race"
+    patch --fuzz=0 -p0 < "$TCP_PUBLICATION_REVOCATION_RACE_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- upstream/linux-sandbox/src/proxy_routing.rs
+    fi
 fi
 
 cd -

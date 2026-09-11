@@ -1,0 +1,34 @@
+--- upstream/linux-sandbox/src/bwrap.rs
++++ upstream/linux-sandbox/src/bwrap.rs
+@@ -344,14 +344,12 @@
+         args.push("--remount-ro".to_string());
+         args.push("/".to_string());
+     }
+-    if normalized_command_cwd.as_path() != command_cwd {
+-        // Bubblewrap otherwise inherits the helper's logical cwd, which can be
+-        // a symlink alias that disappears once the sandbox only mounts
+-        // canonical roots. Enter the canonical command cwd explicitly so
+-        // relative paths stay aligned with the mounted filesystem view.
+-        args.push("--chdir".to_string());
+-        args.push(path_to_string(normalized_command_cwd.as_path()));
+-    }
++    // Bubblewrap otherwise starts the target at / after constructing the
++    // restricted root. Always enter the canonical command cwd explicitly so
++    // relative paths stay aligned with the mounted filesystem view. If that
++    // cwd is unavailable, bubblewrap fails before the target can run.
++    args.push("--chdir".to_string());
++    args.push(path_to_string(normalized_command_cwd.as_path()));
+     args.push("--".to_string());
+     args.extend(command);
+     Ok(BwrapArgs {
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -84,6 +84,8 @@
+             "--unshare-pid".to_string(),
+             "--proc".to_string(),
+             "/proc".to_string(),
++            "--chdir".to_string(),
++            "/".to_string(),
+             "--argv0".to_string(),
+             "zerobox-linux-sandbox".to_string(),
+             "--".to_string(),

@@ -35,7 +35,7 @@ sys.exit(37)
     );
     let output = run(&[
         "--profile=analysis-strict",
-        "--allow-read=/",
+        "--allow-read=/usr",
         "--allow-local-binding",
         &format!("--allow-net=localhost:{port}"),
         &format!("--deny-net=localhost:{port}"),
@@ -66,7 +66,7 @@ fn local_test_listeners_preserve_explicit_host_loopback_grants() {
     let (port, host) = local_http_server(std::net::Ipv4Addr::LOCALHOST.into());
     let output = run(&[
         "--profile=analysis-strict",
-        "--allow-read=/",
+        "--allow-read=/usr",
         "--allow-local-binding",
         &format!("--allow-net=localhost:{port}"),
         "--",
@@ -105,7 +105,7 @@ print('private-listener-ok')
     for outbound in [false, true] {
         let mut args = vec![
             "--profile=analysis-strict",
-            "--allow-read=/",
+            "--allow-read=/usr",
             "--allow-local-binding",
         ];
         if outbound {
@@ -223,6 +223,7 @@ fn loopback_ip(host: &str) -> std::net::IpAddr {
 #[cfg(target_os = "linux")]
 fn curl_local(rule: &str, destination: &str) -> Output {
     Command::new(zerobox_exec())
+        .current_dir("/tmp")
         .args([
             "--debug".to_string(),
             format!("--allow-net={rule}"),

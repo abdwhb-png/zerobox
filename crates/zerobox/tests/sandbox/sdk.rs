@@ -1,5 +1,5 @@
 use crate::support::zerobox_exec;
-use zerobox::Sandbox;
+use zerobox::{Sandbox, TcpPublication, TcpPublicationScope};
 
 fn missing_target() -> Sandbox {
     Sandbox::command("/definitely/missing/zerobox-target")
@@ -153,4 +153,257 @@ async fn rust_sdk_explicit_strict_path_matches_cli_contract() {
 
     assert!(output.status.success());
     assert_eq!(output.stdout, b"/opt/sdk/bin:/usr/bin");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sdk_tcp_publication_revocation_closes_listener_without_killing_target() {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    fn unused_loopback_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback test port")
+            .local_addr()
+            .expect("read loopback test port")
+            .port()
+    }
+
+    let workspace = tempfile::tempdir().expect("create revocation fixture");
+    let host = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let publication = TcpPublication {
+        scope: TcpPublicationScope::Host,
+        listen: host,
+        target,
+    };
+    let script = format!(
+        r#"import socket, time
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(({ip:?}, {port}))
+server.listen(1)
+connection, _ = server.accept()
+connection.sendall(b"ready")
+assert connection.recv(4) == b"ping"
+connection.sendall(b"pong")
+time.sleep(10)
+"#,
+        ip = target.ip().to_string(),
+        port = target.port(),
+    );
+    let mut child = Sandbox::command("/usr/bin/python3")
+        .args(&["-c", script.as_str()])
+        .cwd(workspace.path())
+        .no_profile()
+        .allow_read("/usr")
+        .allow_read(workspace.path())
+        .publish_tcp(publication)
+        .linux_sandbox_exe(zerobox_exec())
+        .spawn()
+        .await
+        .expect("spawn revocable TCP publication");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut admitted = loop {
+        match TcpStream::connect_timeout(&host, Duration::from_millis(100)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => panic!("host publication never became reachable: {error}"),
+        }
+    };
+    let mut ready = [0_u8; 5];
+    admitted
+        .read_exact(&mut ready)
+        .expect("confirm admitted connection reached the target");
+    assert_eq!(&ready, b"ready");
+    child
+        .revoke_tcp_publications()
+        .expect("revoke host TCP publication");
+    admitted.write_all(b"ping").expect("write admitted request");
+    let mut response = [0_u8; 4];
+    admitted
+        .read_exact(&mut response)
+        .expect("drain admitted connection");
+    assert_eq!(&response, b"pong");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&host, Duration::from_millis(100)) {
+            Err(_) => break,
+            Ok(stream) if Instant::now() < deadline => {
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(stream) => {
+                drop(stream);
+                panic!("revoked host publication remained reachable");
+            }
+        }
+    }
+    let status = child.kill_and_wait().await.expect("stop retained target");
+    assert!(
+        !status.success(),
+        "test cleanup should terminate the retained target"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sdk_tcp_publication_revocation_forces_a_stalled_relay_to_close_within_bound() {
+    use std::io::Read;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    fn unused_loopback_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback test port")
+            .local_addr()
+            .expect("read loopback test port")
+            .port()
+    }
+
+    let workspace = tempfile::tempdir().expect("create stalled revocation fixture");
+    let host = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let script = format!(
+        r#"import socket, time
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(({ip:?}, {port}))
+server.listen(1)
+connection, _ = server.accept()
+connection.sendall(b"ready")
+time.sleep(30)
+"#,
+        ip = target.ip().to_string(),
+        port = target.port(),
+    );
+    let mut child = Sandbox::command("/usr/bin/python3")
+        .args(&["-c", script.as_str()])
+        .cwd(workspace.path())
+        .no_profile()
+        .allow_read("/usr")
+        .allow_read(workspace.path())
+        .publish_tcp(TcpPublication {
+            scope: TcpPublicationScope::Host,
+            listen: host,
+            target,
+        })
+        .linux_sandbox_exe(zerobox_exec())
+        .spawn()
+        .await
+        .expect("spawn revocable TCP publication");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut admitted = loop {
+        match TcpStream::connect_timeout(&host, Duration::from_millis(100)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => panic!("host publication never became reachable: {error}"),
+        }
+    };
+    let mut ready = [0_u8; 5];
+    admitted
+        .read_exact(&mut ready)
+        .expect("confirm stalled relay reached the target");
+    assert_eq!(&ready, b"ready");
+    admitted
+        .set_read_timeout(Some(Duration::from_secs(7)))
+        .expect("set bounded read timeout");
+    let started = Instant::now();
+    child
+        .revoke_tcp_publications()
+        .expect("revoke host TCP publication");
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        admitted.read(&mut byte).expect("stalled relay must close"),
+        0,
+        "revocation must close the stalled host stream"
+    );
+    assert!(
+        started.elapsed() <= Duration::from_secs(6),
+        "stalled relay exceeded drain bound: {:?}",
+        started.elapsed()
+    );
+    let status = child.kill_and_wait().await.expect("stop retained target");
+    assert!(!status.success(), "test cleanup should terminate target");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sdk_tcp_publication_closes_host_listener_when_supervisor_is_killed() {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    fn unused_loopback_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve loopback test port")
+            .local_addr()
+            .expect("read loopback test port")
+            .port()
+    }
+
+    let workspace = tempfile::tempdir().expect("create supervisor cleanup fixture");
+    let host = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()));
+    let script = format!(
+        r#"import socket, time
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(({ip:?}, {port}))
+server.listen(1)
+time.sleep(30)
+"#,
+        ip = target.ip().to_string(),
+        port = target.port(),
+    );
+    let child = Sandbox::command("/usr/bin/python3")
+        .args(&["-c", script.as_str()])
+        .cwd(workspace.path())
+        .no_profile()
+        .allow_read("/usr")
+        .allow_read(workspace.path())
+        .publish_tcp(TcpPublication {
+            scope: TcpPublicationScope::Host,
+            listen: host,
+            target,
+        })
+        .linux_sandbox_exe(zerobox_exec())
+        .spawn()
+        .await
+        .expect("spawn TCP publication");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&host, Duration::from_millis(100)) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => panic!("host publication never became reachable: {error}"),
+        }
+    }
+    let status = child
+        .kill_and_wait()
+        .await
+        .expect("kill supervisor process");
+    assert!(!status.success(), "kill must end target process");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&host, Duration::from_millis(100)) {
+            Err(_) => break,
+            Ok(stream) if Instant::now() < deadline => {
+                drop(stream);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(stream) => {
+                drop(stream);
+                panic!("killed supervisor left host publication reachable");
+            }
+        }
+    }
 }

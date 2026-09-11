@@ -1,0 +1,229 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -9,6 +9,7 @@
+ use std::os::fd::AsRawFd;
+ use std::os::fd::FromRawFd;
+ use std::os::unix::ffi::OsStrExt;
++use std::os::unix::fs::OpenOptionsExt;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -215,7 +216,8 @@
+         exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+     }
+ 
+-    let private_bind_mounts = load_private_bind_mounts();
++    let private_bind_mounts = prepare_private_bind_mounts(load_private_bind_mounts())
++        .unwrap_or_else(|err| panic!("invalid private bind mount: {err}"));
+     if file_system_sandbox_policy.has_full_disk_write_access()
+         && !allow_network_for_proxy
+         && std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() != Ok("1")
+@@ -273,7 +275,7 @@
+             !no_proc,
+             allow_network_for_proxy,
+             private_proxy_source,
+-            &private_bind_mounts,
++            private_bind_mounts,
+         );
+     }
+ 
+@@ -448,7 +450,7 @@
+     mount_proc: bool,
+     allow_network_for_proxy: bool,
+     proxy_root: Option<&Path>,
+-    private_bind_mounts: &[PrivateBindMount],
++    private_bind_mounts: Vec<PreparedPrivateBindMount>,
+ ) -> ! {
+     let network_mode = bwrap_network_mode(network_sandbox_policy, allow_network_for_proxy);
+     let mut mount_proc = mount_proc;
+@@ -481,7 +483,7 @@
+         options,
+     )
+     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
+-    inject_private_bind_mounts(&mut bwrap_args.args, private_bind_mounts)
++    inject_private_bind_mounts(&mut bwrap_args, private_bind_mounts)
+         .unwrap_or_else(|err| panic!("invalid private bind mount: {err}"));
+     if let Some(proxy_root) = proxy_root {
+         inject_private_proxy_mount(&mut bwrap_args.args, proxy_root)
+@@ -540,6 +542,11 @@
+     destination: PathBuf,
+ }
+ 
++struct PreparedPrivateBindMount {
++    source: File,
++    destination: PathBuf,
++}
++
+ fn load_private_bind_mounts() -> Vec<PrivateBindMount> {
+     let Some(serialized) = std::env::var_os(PRIVATE_BIND_MOUNTS_ENV) else {
+         return Vec::new();
+@@ -551,39 +558,83 @@
+         .unwrap_or_else(|error| panic!("invalid {PRIVATE_BIND_MOUNTS_ENV}: {error}"))
+ }
+ 
++fn prepare_private_bind_mounts(
++    mounts: Vec<PrivateBindMount>,
++) -> std::io::Result<Vec<PreparedPrivateBindMount>> {
++    mounts
++        .into_iter()
++        .map(|mount| {
++            if !mount.source.is_absolute() || !mount.destination.is_absolute() {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "private bind paths must be absolute",
++                ));
++            }
++            let source = OpenOptions::new()
++                .read(true)
++                .custom_flags(
++                    libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_PATH,
++                )
++                .open(&mount.source)
++                .map_err(|error| {
++                    std::io::Error::new(
++                        error.kind(),
++                        format!(
++                            "open private bind source {} -> {}: {error}",
++                            mount.source.display(),
++                            mount.destination.display(),
++                        ),
++                    )
++                })?;
++            Ok(PreparedPrivateBindMount {
++                source,
++                destination: mount.destination,
++            })
++        })
++        .collect()
++}
++
+ fn inject_private_bind_mounts(
+-    args: &mut Vec<String>,
+-    mounts: &[PrivateBindMount],
++    bwrap_args: &mut crate::bwrap::BwrapArgs,
++    mounts: Vec<PreparedPrivateBindMount>,
+ ) -> std::io::Result<()> {
+     if mounts.is_empty() {
+         return Ok(());
+     }
+-    let separator = args
++    let separator = bwrap_args.args
+         .iter()
+         .position(|argument| argument == "--")
+         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing command separator"))?;
+-    let mut bind_args = Vec::with_capacity(mounts.len() * 3);
++    let mount_index = if bwrap_args.used_tmpfs_root {
++        bwrap_args.args[..separator]
++            .windows(2)
++            .rposition(|window| window == ["--remount-ro", "/"])
++            .ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "missing root read-only remount",
++                )
++            })?
++    } else {
++        separator
++    };
++    let mut mount_args = Vec::with_capacity(mounts.len() * 5);
+     for mount in mounts {
+-        if !mount.source.is_absolute() || !mount.destination.is_absolute() {
+-            return Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                "private bind paths must be absolute",
+-            ));
+-        }
+-        let metadata = fs::symlink_metadata(&mount.source)?;
+-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+-            return Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                "private bind source must be a non-symlink directory",
+-            ));
++        if bwrap_args.used_tmpfs_root {
++            mount_args.extend([
++                "--dir".to_string(),
++                mount.destination.to_string_lossy().into_owned(),
++            ]);
+         }
+-        bind_args.extend([
+-            "--bind".to_string(),
+-            mount.source.to_string_lossy().into_owned(),
++        let source_fd = mount.source.as_raw_fd().to_string();
++        mount_args.extend([
++            "--bind-fd".to_string(),
++            source_fd,
+             mount.destination.to_string_lossy().into_owned(),
+         ]);
++        bwrap_args.preserved_files.push(mount.source);
+     }
+-    args.splice(separator..separator, bind_args);
++    bwrap_args.args.splice(mount_index..mount_index, mount_args);
+     Ok(())
+ }
+ 
+
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -709,30 +709,45 @@
+ 
+ #[test]
+ fn private_bind_mounts_are_inserted_before_the_target_command() {
++    use std::os::fd::AsRawFd;
++
+     let root = tempfile::tempdir().expect("private bind root");
+     let source = root.path().join("view");
+     std::fs::create_dir(&source).expect("private bind source");
+-    let mut args = vec![
+-        "bwrap".to_string(),
+-        "--new-session".to_string(),
+-        "--".to_string(),
+-        "/bin/true".to_string(),
+-    ];
++    let mut bwrap_args = crate::bwrap::BwrapArgs {
++        args: vec![
++            "bwrap".to_string(),
++            "--new-session".to_string(),
++            "--remount-ro".to_string(),
++            "/".to_string(),
++            "--".to_string(),
++            "/bin/true".to_string(),
++        ],
++        preserved_files: Vec::new(),
++        synthetic_mount_targets: Vec::new(),
++        protected_create_targets: Vec::new(),
++        used_tmpfs_root: true,
++    };
+ 
+-    inject_private_bind_mounts(
+-        &mut args,
+-        &[PrivateBindMount {
+-            source: source.clone(),
+-            destination: PathBuf::from("/work"),
+-        }],
+-    )
+-    .expect("inject private bind");
++    let mounts = prepare_private_bind_mounts(vec![PrivateBindMount {
++        source: source.clone(),
++        destination: PathBuf::from("/work"),
++    }])
++    .expect("prepare private bind");
++    inject_private_bind_mounts(&mut bwrap_args, mounts).expect("inject private bind");
+ 
++    let source_fd = bwrap_args.preserved_files[0].as_raw_fd().to_string();
++    assert_eq!(bwrap_args.preserved_files.len(), 1);
++    let source_path = source.to_string_lossy().into_owned();
++    assert!(!bwrap_args.args.iter().any(|argument| argument == &source_path));
+     assert_eq!(
+-        args,
++        bwrap_args.args,
+         vec![
+-            "bwrap", "--new-session", "--bind", source.to_str().unwrap(), "/work", "--",
+-            "/bin/true",
++            "bwrap".to_string(), "--new-session".to_string(),
++            "--dir".to_string(), "/work".to_string(),
++            "--bind-fd".to_string(), source_fd, "/work".to_string(),
++            "--remount-ro".to_string(), "/".to_string(),
++            "--".to_string(), "/bin/true".to_string(),
+         ]
+     );
+ }

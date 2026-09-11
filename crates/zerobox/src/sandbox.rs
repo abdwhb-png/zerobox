@@ -1,8 +1,15 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{io::Write, os::unix::net::UnixStream};
 
 use anyhow::{Context, Result};
 use tokio::process::Child;
@@ -23,7 +30,9 @@ use zerobox_utils_absolute_path::AbsolutePathBuf;
 #[cfg(unix)]
 use crate::docker_broker::DockerBroker;
 #[cfg(target_os = "linux")]
-use crate::dynamic_fs::{DynamicBindMount, DynamicDenyMounts, dynamic_deny_mount_roots};
+use crate::dynamic_fs::{
+    DynamicBindMount, DynamicDenyMounts, ExactUnixSocketIdentity, dynamic_deny_mount_roots,
+};
 #[cfg(target_os = "linux")]
 use crate::linux_runtime::LinuxRuntime;
 use crate::proxy;
@@ -34,9 +43,69 @@ const STRICT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
 const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
 const ALLOW_LOCAL_BINDING_ENV: &str = "ZEROBOX_ALLOW_LOCAL_BINDING";
+const ALLOW_UNIX_SOCKET_ENV: &str = "ZEROBOX_ALLOW_UNIX_SOCKET";
 const HOST_LOOPBACK_PORTS_ENV: &str = "ZEROBOX_HOST_LOOPBACK_PORTS";
 const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
 const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TcpPublicationScope {
+    Host,
+    Lan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TcpPublication {
+    pub scope: TcpPublicationScope,
+    pub listen: SocketAddr,
+    pub target: SocketAddr,
+}
+
+impl TcpPublication {
+    pub fn parse(value: &str) -> Result<Self> {
+        let (scope, addresses) = value
+            .split_once('@')
+            .context("TCP publication must use scope@listen->target")?;
+        let (listen, target) = addresses
+            .split_once("->")
+            .context("TCP publication must use scope@listen->target")?;
+        if addresses.matches("->").count() != 1 {
+            anyhow::bail!("TCP publication must contain exactly one -> separator");
+        }
+        let scope = match scope {
+            "host" => TcpPublicationScope::Host,
+            "lan" => TcpPublicationScope::Lan,
+            _ => anyhow::bail!("TCP publication scope must be host or lan"),
+        };
+        let listen = listen
+            .parse::<SocketAddr>()
+            .context("TCP publication listen address must be an exact SocketAddr")?;
+        let target = target
+            .parse::<SocketAddr>()
+            .context("TCP publication target address must be an exact SocketAddr")?;
+        if listen.port() == 0 || target.port() == 0 {
+            anyhow::bail!("TCP publication ports must be non-zero");
+        }
+        if !target.ip().is_loopback() {
+            anyhow::bail!("TCP publication target must be private loopback");
+        }
+        match scope {
+            TcpPublicationScope::Host if !listen.ip().is_loopback() => {
+                anyhow::bail!("host TCP publication listen address must be loopback");
+            }
+            TcpPublicationScope::Lan if listen.ip().is_unspecified() => {
+                anyhow::bail!("LAN TCP publication listen address must be exact, not wildcard");
+            }
+            _ => {}
+        }
+        Ok(Self {
+            scope,
+            listen,
+            target,
+        })
+    }
+}
 const DOCKER_CONNECTION_ENV_KEYS: &[&str] = &[
     DOCKER_HOST_ENV,
     "DOCKER_CONTEXT",
@@ -48,6 +117,7 @@ const RESERVED_CHILD_ENV_KEYS: &[&str] = &[
     "CODEX_HOME",
     PRIVATE_BIND_MOUNTS_ENV,
     ALLOW_LOCAL_BINDING_ENV,
+    ALLOW_UNIX_SOCKET_ENV,
     HOST_LOOPBACK_PORTS_ENV,
     DOCKER_BROKER_SOCKET_ENV,
 ];
@@ -131,6 +201,14 @@ impl SandboxChild {
         }
         Ok(self.inner.wait().await?)
     }
+
+    /// Revoke only host TCP publications while leaving the target command
+    /// running. The control endpoint is retained by the supervising process
+    /// and is closed before the target command is exec'd.
+    #[cfg(target_os = "linux")]
+    pub fn revoke_tcp_publications(&mut self) -> Result<()> {
+        self._resources.revoke_tcp_publications()
+    }
 }
 
 pub struct Sandbox {
@@ -162,7 +240,105 @@ pub struct Sandbox {
     linux_sandbox_exe: Option<PathBuf>,
     setup_status: bool,
     private_tmp: Option<PathBuf>,
+    private_home: Option<PathBuf>,
     allow_local_binding: bool,
+    allow_unix_sockets: Vec<PathBuf>,
+    tcp_publications: Vec<TcpPublication>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ExactUnixSocket {
+    source: PathBuf,
+    identity: ExactUnixSocketIdentity,
+    source_fd: File,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_exact_unix_sockets(
+    paths: &[PathBuf],
+    disabled: bool,
+    full_access: bool,
+) -> Result<Vec<ExactUnixSocket>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    if disabled || full_access {
+        anyhow::bail!("exact Unix sockets require the Linux sandbox");
+    }
+    let mut seen = HashSet::new();
+    paths
+        .iter()
+        .map(|path| {
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "exact Unix socket path must be absolute: {}",
+                    path.display()
+                );
+            }
+            let parent = path
+                .parent()
+                .context("exact Unix socket path must have a parent")?;
+            if std::fs::canonicalize(parent)
+                .with_context(|| format!("resolve exact Unix socket parent {}", parent.display()))?
+                != parent
+            {
+                anyhow::bail!(
+                    "exact Unix socket parent must be an absolute non-symlink path: {}",
+                    parent.display()
+                );
+            }
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect exact Unix socket {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+                anyhow::bail!(
+                    "exact Unix socket must be an existing non-symlink socket: {}",
+                    path.display()
+                );
+            }
+            if !seen.insert(path.clone()) {
+                anyhow::bail!("duplicate exact Unix socket: {}", path.display());
+            }
+            let source_fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .with_context(|| format!("open exact Unix socket {}", path.display()))?;
+            let source_metadata = source_fd.metadata().with_context(|| {
+                format!("inspect exact Unix socket descriptor {}", path.display())
+            })?;
+            if !source_metadata.file_type().is_socket() {
+                anyhow::bail!(
+                    "exact Unix socket changed while opening: {}",
+                    path.display()
+                );
+            }
+            let flags = unsafe { libc::fcntl(source_fd.as_raw_fd(), libc::F_GETFD) };
+            if flags < 0
+                || unsafe {
+                    libc::fcntl(
+                        source_fd.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags & !libc::FD_CLOEXEC,
+                    )
+                } < 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("preserve exact Unix socket descriptor for sandbox setup");
+            }
+            Ok(ExactUnixSocket {
+                source: path.clone(),
+                identity: ExactUnixSocketIdentity {
+                    dev: source_metadata.dev(),
+                    ino: source_metadata.ino(),
+                },
+                source_fd,
+            })
+        })
+        .collect()
 }
 
 impl Sandbox {
@@ -196,7 +372,10 @@ impl Sandbox {
             linux_sandbox_exe: None,
             setup_status: false,
             private_tmp: None,
+            private_home: None,
             allow_local_binding: false,
+            allow_unix_sockets: Vec::new(),
+            tcp_publications: Vec::new(),
         }
     }
 
@@ -281,9 +460,25 @@ impl Sandbox {
         self
     }
 
+    pub fn private_home(mut self, path: impl Into<PathBuf>) -> Self {
+        self.private_home = Some(path.into());
+        self
+    }
+
     /// Permit TCP listeners inside the private network namespace only.
     pub fn allow_local_binding(mut self, enabled: bool) -> Self {
         self.allow_local_binding = enabled;
+        self
+    }
+
+    /// Grant access to one existing Unix stream socket without granting its directory.
+    pub fn allow_unix_socket(mut self, path: impl Into<PathBuf>) -> Self {
+        self.allow_unix_sockets.push(path.into());
+        self
+    }
+
+    pub fn publish_tcp(mut self, publication: TcpPublication) -> Self {
+        self.tcp_publications.push(publication);
         self
     }
 
@@ -518,7 +713,10 @@ impl Sandbox {
             linux_sandbox_exe,
             setup_status,
             private_tmp,
+            private_home,
             allow_local_binding,
+            allow_unix_sockets,
+            tcp_publications,
         } = self;
 
         let cwd = match cwd {
@@ -589,6 +787,25 @@ impl Sandbox {
         if allow_local_binding && (disabled || full_access || !cfg!(target_os = "linux")) {
             return Err(anyhow::anyhow!("local binding requires the Linux sandbox").into());
         }
+        if !tcp_publications.is_empty() {
+            if disabled || full_access || !cfg!(target_os = "linux") {
+                return Err(anyhow::anyhow!("TCP publication requires the Linux sandbox").into());
+            }
+            let mut listens = HashSet::new();
+            if tcp_publications
+                .iter()
+                .any(|publication| !listens.insert(publication.listen))
+            {
+                return Err(anyhow::anyhow!("duplicate TCP publication listen address").into());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let exact_unix_sockets =
+            validate_exact_unix_sockets(&allow_unix_sockets, disabled, full_access)?;
+        #[cfg(not(target_os = "linux"))]
+        if !allow_unix_sockets.is_empty() {
+            return Err(anyhow::anyhow!("exact Unix sockets require the Linux sandbox").into());
+        }
         if let Some(path) = &private_tmp {
             if disabled || full_access || !cfg!(target_os = "linux") {
                 return Err(anyhow::anyhow!("private /tmp requires the Linux sandbox").into());
@@ -606,6 +823,32 @@ impl Sandbox {
                 ensure_private_proxy_directory(path)?;
             }
             env.insert("TMPDIR".to_string(), "/tmp".to_string());
+        }
+        if let Some(path) = &private_home {
+            if disabled || full_access || !cfg!(target_os = "linux") {
+                return Err(anyhow::anyhow!("private HOME requires the Linux sandbox").into());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if !path.is_absolute()
+                    || std::fs::canonicalize(path).context("resolve private HOME source")? != *path
+                {
+                    return Err(anyhow::anyhow!(
+                        "private HOME source must be an absolute non-symlink path"
+                    )
+                    .into());
+                }
+                let metadata =
+                    std::fs::symlink_metadata(path).context("inspect private HOME source")?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(anyhow::anyhow!(
+                        "private HOME source must be a non-symlink directory"
+                    )
+                    .into());
+                }
+                ensure_private_proxy_directory(path)?;
+            }
+            env.insert("HOME".to_string(), "/home/sandbox".to_string());
         }
 
         let secret_store = Arc::new(
@@ -751,10 +994,14 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         let dynamic_fs = if sandbox_type == SandboxType::LinuxSeccomp {
-            DynamicDenyMounts::prepare_in(
+            DynamicDenyMounts::prepare_with_unix_sockets_in(
                 &cwd,
                 &deny_read_globs,
                 &deny_write_globs,
+                &exact_unix_sockets
+                    .iter()
+                    .map(|socket| socket.source.clone())
+                    .collect::<Vec<_>>(),
                 &fs_policy,
                 linux_runtime
                     .as_ref()
@@ -807,7 +1054,9 @@ impl Sandbox {
         };
 
         let managed_network = proxy.is_some() || docker_broker.is_some();
-        let proxy_root = if managed_network && sandbox_type == SandboxType::LinuxSeccomp {
+        let proxy_root = if (managed_network || !tcp_publications.is_empty())
+            && sandbox_type == SandboxType::LinuxSeccomp
+        {
             Some(PrivateProxyRoot::create_in(
                 linux_runtime
                     .as_ref()
@@ -817,13 +1066,19 @@ impl Sandbox {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let tcp_publication_revocation = if tcp_publications.is_empty() {
+            None
+        } else {
+            Some(TcpPublicationRevocation::create()?)
+        };
 
         let cwd_abs = AbsolutePathBuf::from_absolute_path(&cwd)
             .context("working directory must be absolute")?;
 
         let permissions = PermissionProfile::from_runtime_permissions(&fs_policy, net_policy);
         let manager = SandboxManager::new();
-        let exec_request = manager
+        let mut exec_request = manager
             .transform(SandboxTransformRequest {
                 command: SandboxCommand {
                     program: program.into(),
@@ -845,6 +1100,35 @@ impl Sandbox {
                 windows_sandbox_private_desktop: false,
             })
             .map_err(|e| anyhow::anyhow!("sandbox transform failed: {e}"))?;
+
+        if !tcp_publications.is_empty() {
+            let proxy_root = proxy_root
+                .as_ref()
+                .expect("TCP publication requires a private proxy root");
+            let separator = exec_request
+                .command
+                .iter()
+                .position(|argument| argument == "--")
+                .expect("Linux sandbox command must have a separator");
+            let publication_spec =
+                serde_json::to_string(&tcp_publications).context("serialize TCP publications")?;
+            #[cfg(target_os = "linux")]
+            let revocation_fd = tcp_publication_revocation
+                .as_ref()
+                .expect("TCP publication revocation control is available")
+                .helper_fd();
+            exec_request.command.splice(
+                separator..separator,
+                [
+                    "--proxy-root".to_string(),
+                    proxy_root.path().to_string_lossy().into_owned(),
+                    "--tcp-publication-spec".to_string(),
+                    publication_spec,
+                    "--tcp-publication-revoke-fd".to_string(),
+                    revocation_fd.to_string(),
+                ],
+            );
+        }
 
         let mut cmd = tokio::process::Command::new(&exec_request.command[0]);
         cmd.args(&exec_request.command[1..]);
@@ -922,9 +1206,17 @@ impl Sandbox {
                 serde_json::to_string(&ports).context("serialize host loopback ports")?,
             );
         }
+        if !tcp_publications.is_empty() {
+            cmd.env(ALLOW_LOCAL_BINDING_ENV, "1");
+        }
+        if !exact_unix_sockets.is_empty() {
+            cmd.env(ALLOW_UNIX_SOCKET_ENV, "1");
+        }
 
         #[cfg(target_os = "linux")]
         {
+            use std::os::fd::AsRawFd;
+
             let mut binds = dynamic_fs
                 .as_ref()
                 .map(|fs| fs.binds().to_vec())
@@ -933,8 +1225,24 @@ impl Sandbox {
                 binds.push(DynamicBindMount {
                     source,
                     destination: PathBuf::from("/tmp"),
+                    exact_unix_socket: None,
+                    source_fd: None,
                 });
             }
+            if let Some(source) = private_home {
+                binds.push(DynamicBindMount {
+                    source,
+                    destination: PathBuf::from("/home/sandbox"),
+                    exact_unix_socket: None,
+                    source_fd: None,
+                });
+            }
+            binds.extend(exact_unix_sockets.iter().map(|socket| DynamicBindMount {
+                source: socket.source.clone(),
+                destination: socket.source.clone(),
+                exact_unix_socket: Some(socket.identity),
+                source_fd: Some(socket.source_fd.as_raw_fd()),
+            }));
             if !binds.is_empty() {
                 let serialized = serde_json::to_string(&binds)
                     .context("failed to serialize private bind mounts")?;
@@ -959,8 +1267,51 @@ impl Sandbox {
                 _dynamic_fs: dynamic_fs,
                 _docker_broker: docker_broker,
                 _linux_runtime: linux_runtime,
+                _exact_unix_socket_fds: exact_unix_sockets
+                    .into_iter()
+                    .map(|socket| socket.source_fd)
+                    .collect(),
+                #[cfg(target_os = "linux")]
+                tcp_publication_revocation,
             },
         })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct TcpPublicationRevocation {
+    supervisor: UnixStream,
+    helper: Option<UnixStream>,
+}
+
+#[cfg(target_os = "linux")]
+impl TcpPublicationRevocation {
+    fn create() -> Result<Self> {
+        let (supervisor, helper) =
+            UnixStream::pair().context("create TCP publication revocation control")?;
+        Ok(Self {
+            supervisor,
+            helper: Some(helper),
+        })
+    }
+
+    fn helper_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+
+        self.helper
+            .as_ref()
+            .expect("TCP publication helper control is available before spawn")
+            .as_raw_fd()
+    }
+
+    fn close_parent_helper_fd(&mut self) {
+        self.helper.take();
+    }
+
+    fn revoke(&mut self) -> Result<()> {
+        self.supervisor
+            .write_all(&[1])
+            .context("send TCP publication revocation")
     }
 }
 
@@ -980,11 +1331,32 @@ struct ManagedExecutionResources {
     _docker_broker: Option<()>,
     #[cfg(target_os = "linux")]
     _linux_runtime: Option<LinuxRuntime>,
+    #[cfg(target_os = "linux")]
+    _exact_unix_socket_fds: Vec<File>,
+    #[cfg(target_os = "linux")]
+    tcp_publication_revocation: Option<TcpPublicationRevocation>,
+    #[cfg(not(target_os = "linux"))]
+    tcp_publication_revocation: Option<()>,
     #[cfg(not(target_os = "linux"))]
     _linux_runtime: Option<()>,
 }
 
 impl ManagedExecutionResources {
+    #[cfg(target_os = "linux")]
+    fn revoke_tcp_publications(&mut self) -> Result<()> {
+        let Some(control) = self.tcp_publication_revocation.as_mut() else {
+            anyhow::bail!("this command has no TCP publications to revoke");
+        };
+        control.revoke()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_parent_tcp_publication_helper_fd(&mut self) {
+        if let Some(control) = self.tcp_publication_revocation.as_mut() {
+            control.close_parent_helper_fd();
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self._proxy_handle.is_none()
             && self._proxy.is_none()
@@ -994,6 +1366,8 @@ impl ManagedExecutionResources {
             && self._dynamic_fs.is_none()
             && self._docker_broker.is_none()
             && self._linux_runtime.is_none()
+            && self._exact_unix_socket_fds.is_empty()
+            && self.tcp_publication_revocation.is_none()
     }
 }
 
@@ -1052,10 +1426,38 @@ impl PreparedCommand {
 
     async fn spawn_checked(&mut self) -> std::result::Result<(Child, u32), SandboxSetupError> {
         #[cfg(target_os = "linux")]
-        if let Some(channel) = self.resources.setup_channel.as_ref() {
-            let fd = channel.write_fd();
+        {
+            use std::os::fd::AsRawFd;
+
+            let setup_fd = self
+                .resources
+                .setup_channel
+                .as_ref()
+                .map(PrivateSetupChannel::write_fd);
+            let exact_unix_socket_fds = self
+                .resources
+                ._exact_unix_socket_fds
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>();
+            let tcp_publication_revoke_fd = self
+                .resources
+                .tcp_publication_revocation
+                .as_ref()
+                .map(TcpPublicationRevocation::helper_fd);
             unsafe {
-                self.cmd.pre_exec(move || clear_cloexec(fd));
+                self.cmd.pre_exec(move || {
+                    if let Some(fd) = setup_fd {
+                        clear_cloexec(fd)?;
+                    }
+                    for fd in &exact_unix_socket_fds {
+                        clear_cloexec(*fd)?;
+                    }
+                    if let Some(fd) = tcp_publication_revoke_fd {
+                        clear_cloexec(fd)?;
+                    }
+                    Ok(())
+                });
             }
         }
         let mut child = {
@@ -1071,6 +1473,8 @@ impl PreparedCommand {
                 })
                 .map_err(SandboxSetupError::Spawn)?
         };
+        #[cfg(target_os = "linux")]
+        self.resources.close_parent_tcp_publication_helper_fd();
         let host_pid = child.id();
         if let Some(channel) = self.resources.setup_channel.as_mut() {
             channel.close_parent_write();
@@ -1652,15 +2056,54 @@ fn build_fs_policy(
         }
     }
 
+    // A write denial only downgrades a path that the policy already permits
+    // reading. Adding a read entry for an otherwise ungranted path would turn
+    // `--deny-write` into an unintended read grant in a restricted sandbox.
+    let policy_before_write_denies = FileSystemSandboxPolicy::restricted(entries.clone());
+    let readable_roots = policy_before_write_denies.get_readable_roots_with_cwd(cwd);
+    let writable_roots = policy_before_write_denies.get_writable_roots_with_cwd(cwd);
+    let mut write_denied_readable_roots = Vec::new();
     for path in deny_write {
         if let Ok(abs) = resolve_path(cwd, path) {
-            entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: abs },
-                access: FileSystemAccessMode::Read,
-            });
+            if policy_before_write_denies.can_read_path_with_cwd(abs.as_path(), cwd) {
+                write_denied_readable_roots.push(abs.clone());
+            }
+            write_denied_readable_roots.extend(
+                readable_roots
+                    .iter()
+                    .filter(|root| root.as_path().starts_with(abs.as_path()))
+                    .cloned(),
+            );
+            write_denied_readable_roots.extend(
+                writable_roots
+                    .iter()
+                    .map(|root| &root.root)
+                    .filter(|root| root.as_path().starts_with(abs.as_path()))
+                    .cloned(),
+            );
         }
     }
+    write_denied_readable_roots.sort();
+    write_denied_readable_roots.dedup();
+    entries.retain(|entry| {
+        entry.access != FileSystemAccessMode::Write
+            || !matches!(
+                &entry.path,
+                FileSystemPath::Path { path }
+                    if write_denied_readable_roots.iter().any(|root| root == path)
+            )
+    });
+    entries.extend(
+        write_denied_readable_roots
+            .into_iter()
+            .map(|path| FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path },
+                access: FileSystemAccessMode::Read,
+            }),
+    );
 
+    // A dynamic write denial preserves reads through the FUSE view. The
+    // glob entry takes precedence over the enclosing root write grant.
     for pattern in deny_write_globs {
         entries.push(FileSystemSandboxEntry {
             path: FileSystemPath::GlobPattern {
@@ -3070,6 +3513,8 @@ mod tests {
                 _dynamic_fs: None,
                 _docker_broker: None,
                 _linux_runtime: None,
+                _exact_unix_socket_fds: Vec::new(),
+                tcp_publication_revocation: None,
             },
         };
         let command = prepared.into_command().expect("unmanaged raw command");
@@ -3092,6 +3537,8 @@ mod tests {
                 _dynamic_fs: None,
                 _docker_broker: None,
                 _linux_runtime: None,
+                _exact_unix_socket_fds: Vec::new(),
+                tcp_publication_revocation: None,
             },
         };
 
@@ -3121,6 +3568,8 @@ mod tests {
                 _dynamic_fs: None,
                 _docker_broker: None,
                 _linux_runtime: None,
+                _exact_unix_socket_fds: Vec::new(),
+                tcp_publication_revocation: None,
             },
         };
 
