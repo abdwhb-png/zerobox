@@ -2434,23 +2434,20 @@ fn private_tmp_keeps_project_readable_and_writable_with_exact_policy_and_dynamic
 
 #[cfg(target_os = "linux")]
 #[test]
-fn private_tmp_keeps_project_writable_when_a_wsl_home_dynamic_view_is_present() {
-    let wsl_home = std::path::Path::new("/mnt/c/Users/winne");
-    let linux_home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .expect("Linux home must be set for the Pi profile fixture");
+fn private_tmp_keeps_project_writable_when_dynamic_home_views_are_present() {
     let bun_install = std::env::var_os("BUN_INSTALL")
         .map(std::path::PathBuf::from)
         .expect("BUN_INSTALL must be set for the Pi Bun fixture");
     let bun_bin = bun_install.join("bin");
-    assert!(
-        wsl_home.is_dir(),
-        "this WSL fixture requires /mnt/c/Users/winne"
-    );
     let workspace = tempfile::Builder::new()
         .prefix("private-tmp-wsl-dynamic-policy-")
         .tempdir_in(env!("CARGO_MANIFEST_DIR"))
         .expect("create workspace fixture");
+    let linux_home = workspace.path().join("home/fixture");
+    let windows_mount = workspace.path().join("mnt/c");
+    let wsl_home = windows_mount.join("Users/fixture");
+    std::fs::create_dir_all(&linux_home).expect("create Linux home fixture");
+    std::fs::create_dir_all(&wsl_home).expect("create Windows home fixture");
     let project = workspace.path().join("project");
     let private = workspace.path().join("lease/tmp");
     std::fs::create_dir_all(&project).expect("create project");
@@ -2490,7 +2487,7 @@ fn private_tmp_keeps_project_writable_when_a_wsl_home_dynamic_view_is_present() 
             "deny_read": [workspace.path().join("lease"), linux_home.join(".ssh"), wsl_home.join(".aws"), "/proc/1/root"],
             "deny_read_globs": [format!("{}/.aws", linux_home.display()), format!("{}/.gnupg", linux_home.display())],
             "allow_write": [project],
-            "deny_write": [workspace.path().join("lease"), "/mnt/c", "/proc/1/root"],
+            "deny_write": [workspace.path().join("lease"), windows_mount, "/proc/1/root"],
             "deny_write_globs": [format!("{}/.env", project.display())],
             "set_env": { "PATH": format!("{}:/usr/bin:/bin", bun_bin.display()), "HOME": linux_home, "TMPDIR": "/tmp" },
         }).to_string(),
