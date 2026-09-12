@@ -48,4 +48,6 @@ jobs:
       - name: Exercise the native kernel boundary
         env:
           ZEROBOX_EXEC: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/zerobox
-        run: cargo test --offline --locked -p zerobox --test integration
+        # Legacy root-readable fixtures observe other tests' transient FUSE
+        # mounts. Serialize fixtures while retaining their explicit concurrency tests.
+        run: cargo test --offline --locked -p zerobox --test integration -- --test-threads=1
