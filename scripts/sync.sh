@@ -512,6 +512,42 @@ if [ -f "$TCP_PUBLICATION_REVOCATION_RACE_PATCH" ]; then
     fi
 fi
 
+STREAM_HALF_CLOSE_PATCH="$SCRIPT_DIR/upstream-stream-half-close.patch"
+if [ -f "$STREAM_HALF_CLOSE_PATCH" ]; then
+    echo "    stream-half-close"
+    patch --fuzz=0 -p0 < "$STREAM_HALF_CLOSE_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- upstream/linux-sandbox/src/proxy_routing.rs
+    fi
+fi
+
+GIT_WRITE_POLICY_PATCH="$SCRIPT_DIR/upstream-git-write-policy.patch"
+if [ -f "$GIT_WRITE_POLICY_PATCH" ]; then
+    echo "    git-write-policy"
+    patch --fuzz=0 -p0 < "$GIT_WRITE_POLICY_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- upstream/linux-sandbox/src/bwrap.rs
+    fi
+fi
+
+LOOPBACK_STREAM_DIAGNOSTICS_PATCH="$SCRIPT_DIR/upstream-loopback-stream-diagnostics.patch"
+if [ -f "$LOOPBACK_STREAM_DIAGNOSTICS_PATCH" ]; then
+    echo "    loopback-stream-diagnostics"
+    patch --fuzz=0 -p0 < "$LOOPBACK_STREAM_DIAGNOSTICS_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- upstream/linux-sandbox/src/proxy_routing.rs
+    fi
+fi
+
+RUNTIME_BUNDLE_PATCH="$SCRIPT_DIR/upstream-runtime-bundle.patch"
+if [ -f "$RUNTIME_BUNDLE_PATCH" ]; then
+    echo "    runtime-bundle"
+    patch --fuzz=0 -p0 < "$RUNTIME_BUNDLE_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- upstream/linux-sandbox/src/linux_run_main.rs
+    fi
+fi
+
 cd -
 
 {

@@ -3,6 +3,8 @@ mod docker;
 #[cfg(target_os = "linux")]
 mod dynamic_globs;
 mod env;
+#[cfg(target_os = "linux")]
+mod git;
 mod misc;
 mod net;
 mod read;

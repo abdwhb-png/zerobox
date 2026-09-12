@@ -35,6 +35,8 @@ mod linux_runtime;
 mod process_owner;
 pub mod profile_core;
 pub mod proxy;
+#[cfg(target_os = "linux")]
+mod runtime_bundle;
 mod sandbox;
 pub mod secret;
 

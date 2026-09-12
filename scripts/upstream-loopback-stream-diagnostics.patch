@@ -1,0 +1,329 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -1023,8 +1023,14 @@
+                     // No direct host route exists if the proxy rejects CONNECT.
+                     match granted_loopback_tunnel(&path, port) {
+                         Ok(unix) => {
+-                            if let Err(error) = proxy_tcp_unix(tcp, unix) {
+-                                eprintln!("private loopback connection failed: {error}");
++                            if let Err(error) = proxy_loopback_stream(tcp, unix) {
++                                // CONNECT succeeded. A peer reset can follow a completed
++                                // application exchange, but the relay cannot infer that.
++                                // Keep transport diagnostics distinct from connection setup
++                                // failures and leave the target exit status unchanged.
++                                eprintln!(
++                                    "zerobox: private loopback stream interrupted (localhost:{port}, after CONNECT): {error}"
++                                );
+                             }
+                         }
+                         Err(error) => eprintln!("private loopback connection failed: {error}"),
+@@ -1179,18 +1185,148 @@
+     }
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum BridgeSide {
++    Left,
++    Right,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum BridgeOperation {
++    Read,
++    Write,
++    Shutdown,
++}
++
++#[derive(Debug)]
++struct BridgeIoFailure {
++    side: BridgeSide,
++    operation: BridgeOperation,
++    source: io::Error,
++}
++
++impl std::fmt::Display for BridgeIoFailure {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        self.source.fmt(f)
++    }
++}
++
++impl std::error::Error for BridgeIoFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.source)
++    }
++}
++
++fn bridge_io_error(side: BridgeSide, operation: BridgeOperation, source: io::Error) -> io::Error {
++    io::Error::new(
++        source.kind(),
++        BridgeIoFailure {
++            side,
++            operation,
++            source,
++        },
++    )
++}
++
++struct BridgeIo<T> {
++    stream: T,
++    side: BridgeSide,
++}
++
++impl<T: Read> Read for BridgeIo<T> {
++    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
++        self.stream
++            .read(buffer)
++            .map_err(|error| bridge_io_error(self.side, BridgeOperation::Read, error))
++    }
++}
++
++impl<T: Write> Write for BridgeIo<T> {
++    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
++        self.stream
++            .write(buffer)
++            .map_err(|error| bridge_io_error(self.side, BridgeOperation::Write, error))
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        self.stream
++            .flush()
++            .map_err(|error| bridge_io_error(self.side, BridgeOperation::Write, error))
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum LoopbackStreamEnd {
++    Closed,
++    ClientDisconnected,
++}
++
++fn proxy_loopback_stream(tcp: TcpStream, unix: UnixStream) -> io::Result<LoopbackStreamEnd> {
++    match proxy_tcp_unix(tcp, unix) {
++        Ok(()) => Ok(LoopbackStreamEnd::Closed),
++        Err(error) => {
++            let client_closed = error
++                .get_ref()
++                .and_then(|cause| cause.downcast_ref::<BridgeIoFailure>())
++                .is_some_and(|cause| {
++                    cause.side == BridgeSide::Left
++                        && matches!(
++                            cause.operation,
++                            BridgeOperation::Read | BridgeOperation::Write
++                        )
++                        && matches!(
++                            cause.source.kind(),
++                            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
++                        )
++                });
++            if client_closed {
++                // The local caller disconnected. Some clients intentionally use
++                // abortive TCP close even after a complete application exchange.
++                // This is a cancellation, not a verdict on command success. Keep
++                // proxy-side errors and timeouts as errors, with their origin.
++                Ok(LoopbackStreamEnd::ClientDisconnected)
++            } else {
++                Err(error)
++            }
++        }
++    }
++}
++
+ fn copy_bridge_direction<Reader: BridgeStream, Writer: BridgeStream>(
+     mut reader: Reader,
+     mut writer: Writer,
+-) -> io::Result<()> {
+-    let result =
+-        std::io::copy(&mut reader, &mut writer).and_then(|_| writer.shutdown(Shutdown::Write));
+-    if result.is_err() {
+-        // Wake the other direction on errors, including idle timeouts.
++    source: BridgeSide,
++    destination: BridgeSide,
++    first_error: &Mutex<Option<io::Error>>,
++) {
++    let result = std::io::copy(
++        &mut BridgeIo {
++            stream: &mut reader,
++            side: source,
++        },
++        &mut BridgeIo {
++            stream: &mut writer,
++            side: destination,
++        },
++    )
++    .and_then(|_| {
++        writer
++            .shutdown(Shutdown::Write)
++            .map_err(|error| bridge_io_error(destination, BridgeOperation::Shutdown, error))
++    });
++    if let Err(error) = result {
++        // Record the cause before waking the other direction. Errors caused by
++        // that shutdown must not replace a real upstream failure with a client
++        // disconnect merely because the client-to-proxy thread is joined first.
++        {
++            let mut cause = first_error.lock().expect("bridge error state poisoned");
++            if cause.is_none() {
++                *cause = Some(error);
++            }
++        }
+         let _ = reader.shutdown(Shutdown::Both);
+         let _ = writer.shutdown(Shutdown::Both);
+     }
+-    result
+ }
+ 
+ fn proxy_bidirectional<Left: BridgeStream, Right: BridgeStream>(
+@@ -1199,15 +1335,35 @@
+     left_reader: Left,
+     right_writer: Right,
+ ) -> io::Result<()> {
+-    let left_to_right =
+-        std::thread::spawn(move || copy_bridge_direction(left_reader, right_writer));
+-    let right_to_left = copy_bridge_direction(right, left);
+-    let left_to_right = left_to_right
++    let first_error = Arc::new(Mutex::new(None));
++    let left_error = Arc::clone(&first_error);
++    let left_to_right = std::thread::spawn(move || {
++        copy_bridge_direction(
++            left_reader,
++            right_writer,
++            BridgeSide::Left,
++            BridgeSide::Right,
++            &left_error,
++        )
++    });
++    copy_bridge_direction(
++        right,
++        left,
++        BridgeSide::Right,
++        BridgeSide::Left,
++        &first_error,
++    );
++    left_to_right
+         .join()
+         .map_err(|_| io::Error::other("bridge thread panicked"))?;
+-    left_to_right?;
+-    right_to_left?;
+-    Ok(())
++    let error = first_error
++        .lock()
++        .map_err(|_| io::Error::other("bridge error state poisoned"))?
++        .take();
++    match error {
++        Some(error) => Err(error),
++        None => Ok(()),
++    }
+ }
+ 
+ fn create_ready_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
+@@ -2307,3 +2463,111 @@
+         assert_eq!(unrelated_dir.exists(), true);
+     }
+ }
++
++#[cfg(test)]
++mod loopback_stream_tests {
++    use super::*;
++
++    fn connected_streams() -> (TcpStream, TcpStream, UnixStream, UnixStream) {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (tcp, _) = listener.accept().unwrap();
++        let (unix, proxy) = UnixStream::pair().unwrap();
++        client
++            .set_read_timeout(Some(Duration::from_secs(2)))
++            .unwrap();
++        proxy
++            .set_read_timeout(Some(Duration::from_secs(2)))
++            .unwrap();
++        (client, tcp, unix, proxy)
++    }
++
++    #[test]
++    fn local_client_abort_is_cancellation_and_releases_the_proxy_stream() {
++        let (mut client, tcp, unix, mut proxy) = connected_streams();
++        let relay = std::thread::spawn(move || proxy_loopback_stream(tcp, unix));
++        proxy.write_all(b"response").unwrap();
++        let mut response = [0; 8];
++        client.read_exact(&mut response).unwrap();
++        assert_eq!(&response, b"response");
++        let linger = libc::linger {
++            l_onoff: 1,
++            l_linger: 0,
++        };
++        let result = unsafe {
++            libc::setsockopt(
++                client.as_raw_fd(),
++                libc::SOL_SOCKET,
++                libc::SO_LINGER,
++                std::ptr::from_ref(&linger).cast(),
++                std::mem::size_of_val(&linger) as libc::socklen_t,
++            )
++        };
++        assert_eq!(result, 0);
++        drop(client);
++        assert_eq!(
++            relay.join().unwrap().unwrap(),
++            LoopbackStreamEnd::ClientDisconnected
++        );
++        assert_eq!(proxy.read(&mut [0]).unwrap(), 0);
++    }
++
++    #[test]
++    fn proxy_reset_is_not_reclassified_as_client_cancellation() {
++        let (mut client, tcp, unix, proxy) = connected_streams();
++        let relay = std::thread::spawn(move || proxy_loopback_stream(tcp, unix));
++        client.write_all(b"unread request").unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(2);
++        loop {
++            let mut queued: libc::c_int = 0;
++            assert_eq!(
++                unsafe { libc::ioctl(proxy.as_raw_fd(), libc::FIONREAD, &mut queued) },
++                0
++            );
++            if queued > 0 {
++                break;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "request did not reach proxy"
++            );
++            std::thread::yield_now();
++        }
++        // Closing an AF_UNIX stream with unread data resets its peer.
++        drop(proxy);
++        let error = relay
++            .join()
++            .unwrap()
++            .expect_err("upstream reset must remain an error");
++        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
++        let cause = error
++            .get_ref()
++            .unwrap()
++            .downcast_ref::<BridgeIoFailure>()
++            .unwrap();
++        assert_eq!(cause.side, BridgeSide::Right);
++        assert_eq!(cause.operation, BridgeOperation::Read);
++    }
++
++    #[test]
++    fn idle_timeout_retains_its_origin_and_wakes_the_other_direction() {
++        let (left, _client) = UnixStream::pair().unwrap();
++        let (right, _proxy) = UnixStream::pair().unwrap();
++        left.set_read_timeout(Some(Duration::from_millis(30)))
++            .unwrap();
++        let left_reader = left.try_clone().unwrap();
++        let right_writer = right.try_clone().unwrap();
++        let error = proxy_bidirectional(left, right, left_reader, right_writer).unwrap_err();
++        assert!(matches!(
++            error.kind(),
++            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
++        ));
++        let cause = error
++            .get_ref()
++            .unwrap()
++            .downcast_ref::<BridgeIoFailure>()
++            .unwrap();
++        assert_eq!(cause.side, BridgeSide::Left);
++        assert_eq!(cause.operation, BridgeOperation::Read);
++    }
++}

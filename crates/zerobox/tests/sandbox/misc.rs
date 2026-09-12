@@ -79,6 +79,7 @@ fn runtime_artifacts_survive_workspace_mounts_and_dynamic_denies() {
     );
     assert!(!workspace.path().join("secret.pem").exists());
 
+    assert!(output.stdout.is_empty());
     let events: Vec<serde_json::Value> = status
         .lines()
         .map(|line| serde_json::from_str(line).expect("JSONL lifecycle event"))
@@ -145,7 +146,8 @@ fn invalid_cli_arguments_emit_setup_error_when_status_is_enabled() {
         "--status-fd=3",
         "--definitely-not-a-valid-option",
         "--",
-        "true",
+        "/__zerobox/runtime/bin/probe",
+        "--version",
     ]);
     assert_eq!(out.status.code(), Some(125), "stderr: {}", stderr(&out));
     let event: serde_json::Value = serde_json::from_str(status.trim()).expect("JSONL setup event");
@@ -345,6 +347,237 @@ fn status_fd_reports_setup_error_as_jsonl_and_exit_125() {
     let event: serde_json::Value = serde_json::from_str(status.trim()).expect("JSONL setup event");
     assert_eq!(event["version"], 1);
     assert_eq!(event["event"], "setup_error");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_v2_keeps_the_child_lifecycle_protocol_and_uses_version_two() {
+    let (out, status) = run_with_status_fd(&[
+        "--status-fd=3",
+        "--status-version=2",
+        "--allow-all",
+        "--",
+        "true",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let events: Vec<serde_json::Value> = status
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSONL lifecycle event"))
+        .collect();
+    assert_eq!(events[0]["version"], 2);
+    assert_eq!(events[0]["event"], "child_started");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_record_is_closed_and_advertised_before_a_child_can_start() {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+
+    let bundle = tempfile::tempdir().unwrap();
+    let shell = bundle.path().join("components/shell/bin");
+    let helper = bundle.path().join("helper");
+    std::fs::create_dir_all(&shell).unwrap();
+    std::fs::create_dir_all(bundle.path().join("components/shell/libexec")).unwrap();
+    std::fs::create_dir(&helper).unwrap();
+    std::fs::write(shell.join("bash"), b"bash").unwrap();
+    std::fs::write(shell.join("env"), b"env").unwrap();
+    std::fs::set_permissions(shell.join("bash"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::set_permissions(shell.join("env"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let static_helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-linux-gnu/release/zerobox");
+    assert!(
+        static_helper.is_file(),
+        "missing static helper: {}",
+        static_helper.display()
+    );
+    std::fs::copy(&static_helper, helper.join("zerobox-linux-sandbox")).unwrap();
+    std::fs::copy(&static_helper, shell.join("probe")).unwrap();
+    std::fs::copy(
+        &static_helper,
+        bundle
+            .path()
+            .join("components/shell/libexec/zerobox-linux-sandbox"),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        helper.join("zerobox-linux-sandbox"),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+    std::fs::set_permissions(shell.join("probe"), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    std::fs::write(
+        bundle.path().join("manifest.json"),
+        format!(
+            r#"{{"schema":1,"target":"x86_64-unknown-linux-gnu","version":"test","components":{{"shell":{{"root":"components/shell","files":[{{"path":"bin/bash","sha256":"{}"}},{{"path":"bin/env","sha256":"{}"}},{{"path":"bin/probe","sha256":"{}"}},{{"path":"libexec/zerobox-linux-sandbox","sha256":"{}"}}]}},"analysis":{{"root":"components/analysis","files":[]}}}},"helper":{{"path":"helper/zerobox-linux-sandbox","sha256":"{}"}}}}"#,
+            digest(b"bash"),
+            digest(b"env"),
+            digest(&std::fs::read(&static_helper).unwrap()),
+            digest(&std::fs::read(&static_helper).unwrap()),
+            digest(&std::fs::read(&static_helper).unwrap())
+        ),
+    )
+    .unwrap();
+
+    let run = |accept: bool| {
+        use std::io::Write;
+        let mut status_fds = [0; 2];
+        let mut admission_fds = [0; 2];
+        let mut ack_fds = [0; 2];
+        for pipe in [&mut status_fds, &mut admission_fds, &mut ack_fds] {
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+        }
+        let mut command = Command::new(zerobox_exec());
+        command
+            .current_dir("/tmp")
+            .args([
+                "--status-fd=3",
+                "--status-version=2",
+                "--admission-fd=4",
+                "--admission-ack-fd=5",
+                "--runtime-bundle",
+                bundle.path().to_str().unwrap(),
+                "--runtime-component=shell",
+                "--",
+                "/__zerobox/runtime/bin/probe",
+                "--version",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let status_write = status_fds[1];
+        let admission_write = admission_fds[1];
+        let ack_read = ack_fds[0];
+        // Move the inherited inputs above the destination slots before dup2.
+        // Otherwise assigning FD 3/4 can clobber the original FD 5 source.
+        unsafe {
+            command.pre_exec(move || {
+                let inputs = [status_write, admission_write, ack_read]
+                    .map(|fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10));
+                if inputs.iter().any(|fd| *fd < 0) {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for (source, target) in inputs.into_iter().zip([3, 4, 5]) {
+                    if libc::dup2(source, target) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::close(source);
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        unsafe {
+            libc::close(status_write);
+            libc::close(admission_write);
+            libc::close(ack_read);
+        }
+        let mut admission = Vec::new();
+        unsafe { std::fs::File::from_raw_fd(admission_fds[0]) }
+            .read_to_end(&mut admission)
+            .unwrap();
+        assert!(
+            !admission.is_empty(),
+            "engine must emit admission before waiting for acknowledgement"
+        );
+        let expected = if accept {
+            format!("{:x}", Sha256::digest(&admission))
+        } else {
+            "0".repeat(64)
+        };
+        let mut ack = unsafe { std::fs::File::from_raw_fd(ack_fds[1]) };
+        ack.write_all(format!("ACK:{expected}\n").as_bytes())
+            .unwrap();
+        drop(ack);
+        let output = child.wait_with_output().unwrap();
+        let mut status = String::new();
+        unsafe { std::fs::File::from_raw_fd(status_fds[0]) }
+            .read_to_string(&mut status)
+            .unwrap();
+        (output, status, admission)
+    };
+    let (rejected, rejection_status, _) = run(false);
+    assert_eq!(rejected.status.code(), Some(125));
+    assert!(
+        rejected.stdout.is_empty(),
+        "target ran before admission acknowledgement"
+    );
+    assert!(!rejection_status.contains("child_started"));
+    let (output, status, admission) = run(true);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        format!("zerobox {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let events: Vec<serde_json::Value> = status
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events[0]["event"],
+        "sandbox_admitted",
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        events[0]["report_sha256"],
+        format!("{:x}", Sha256::digest(&admission))
+    );
+    assert_eq!(events[1]["event"], "child_started");
+    let receipt: serde_json::Value = serde_json::from_slice(&admission).unwrap();
+    assert_eq!(receipt["runtime"]["component"], "shell");
+    let observed = receipt["kernelMounts"]
+        .as_array()
+        .expect("kernel mount evidence");
+    assert!(
+        observed
+            .iter()
+            .any(|mount| mount["destination"] == "/__zerobox/runtime" && mount["access"] == "ro")
+    );
+    assert!(
+        !observed
+            .iter()
+            .any(|mount| mount["destination"] == "/__zerobox/analysis")
+    );
+    assert_eq!(
+        receipt["home"],
+        serde_json::json!({"path":"/home/sandbox","namespace":"lease-private"})
+    );
+    assert_eq!(
+        receipt["tmp"],
+        serde_json::json!({"path":"/tmp","namespace":"lease-private"})
+    );
+    assert_eq!(receipt["environment"]["inherit"], serde_json::json!([]));
+    assert_eq!(
+        receipt["path"],
+        serde_json::json!(["/__zerobox/runtime/bin"])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_bundle_missing_manifest_fails_before_host_command_fallback() {
+    let missing = tempfile::tempdir().unwrap();
+    let output = run(&[
+        "--runtime-bundle",
+        missing.path().to_str().unwrap(),
+        "--runtime-component=shell",
+        "--",
+        "true",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("runtime manifest"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[cfg(target_os = "linux")]

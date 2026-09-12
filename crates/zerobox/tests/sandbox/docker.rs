@@ -126,6 +126,150 @@ async fn sdk_real_docker_cli_sees_no_containers_without_target_grants() {
     assert!(output.stdout.is_empty());
 }
 
+#[tokio::test]
+async fn sdk_docker_bridge_propagates_stdin_eof_and_preserves_the_response() {
+    assert_docker_bridge_half_close(false).await;
+}
+
+#[tokio::test]
+async fn sdk_docker_bridge_propagates_server_eof_without_truncating_client_input() {
+    assert_docker_bridge_half_close(true).await;
+}
+
+async fn assert_docker_bridge_half_close(server_first: bool) {
+    let root = temp_dir();
+    let engine_path = root.path().join("eof-engine.sock");
+    let engine = UnixListener::bind(&engine_path).unwrap();
+    std::fs::set_permissions(&engine_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let engine_task = tokio::spawn(async move {
+        let (mut stream, _) = engine.accept().await.unwrap();
+        if server_first {
+            stream.write_all(b"response-after-eof").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        let mut request = Vec::new();
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.read_to_end(&mut request),
+        )
+        .await;
+        if matches!(eof, Ok(Ok(_))) && !server_first {
+            stream.write_all(b"response-after-eof").await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        (matches!(eof, Ok(Ok(_))), request)
+    });
+    let output = Sandbox::command("/usr/bin/python3")
+        .args(&[
+            "-c",
+            r#"
+import os, socket, sys
+host, port = os.environ['DOCKER_HOST'].removeprefix('tcp://').rsplit(':', 1)
+with socket.create_connection((host, int(port)), timeout=3) as stream:
+    if sys.argv[1] == 'client-first':
+        stream.sendall(b'request')
+        stream.shutdown(socket.SHUT_WR)
+    response = b''
+    while chunk := stream.recv(1024):
+        response += chunk
+    assert response == b'response-after-eof', repr(response)
+    if sys.argv[1] == 'server-first':
+        stream.sendall(b'request')
+        stream.shutdown(socket.SHUT_WR)
+"#,
+            if server_first {
+                "server-first"
+            } else {
+                "client-first"
+            },
+        ])
+        .cwd(root.path())
+        .no_profile()
+        .allow_read("/")
+        .docker_access(DockerAccessPolicy::Full {
+            endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
+        })
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run EOF bridge fixture");
+    let (received_eof, request) = engine_task.await.unwrap();
+    assert_eq!(request, b"request");
+    assert!(
+        received_eof,
+        "the private Docker bridge did not forward client EOF"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sdk_docker_bridge_closes_the_transport_when_the_launcher_is_killed() {
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    std::fs::create_dir(root.path().join("home")).unwrap();
+    let engine_path = root.path().join("cancel-engine.sock");
+    let engine = UnixListener::bind(&engine_path).unwrap();
+    std::fs::set_permissions(&engine_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let policy = serde_json::to_string(&DockerAccessPolicy::Full {
+        endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
+    })
+    .unwrap();
+    let mut child = std::process::Command::new(zerobox_exec())
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("ZEROBOX_HOME", root.path().join("zerobox"))
+        .args([
+            "--allow-read",
+            "/",
+            "--docker-policy",
+            &policy,
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            r#"
+import os, socket
+host, port = os.environ['DOCKER_HOST'].removeprefix('tcp://').rsplit(':', 1)
+with socket.create_connection((host, int(port))) as stream:
+    stream.sendall(b'ready')
+    stream.recv(1)
+"#,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let connected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut stream, _) = engine.accept().await?;
+        let mut request = [0_u8; 5];
+        stream.read_exact(&mut request).await?;
+        Ok::<_, std::io::Error>((stream, request))
+    })
+    .await;
+    // Always reap the owned process before asserting on fixture setup.
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let (mut stream, request) = connected
+        .unwrap_or_else(|error| {
+            panic!(
+                "bridge connection failed: {error}; {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .unwrap();
+    assert_eq!(&request, b"ready");
+    let mut remaining = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("engine transport closed after launcher cancellation")
+    .unwrap();
+}
+
 struct DisposableContainers {
     names: Vec<String>,
 }

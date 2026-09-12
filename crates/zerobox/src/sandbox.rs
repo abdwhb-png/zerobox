@@ -12,6 +12,8 @@ use std::time::Duration;
 use std::{io::Write, os::unix::net::UnixStream};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use tokio::process::Child;
 use zerobox_protocol::config_types::WindowsSandboxLevel;
 use zerobox_protocol::docker::DockerAccessPolicy;
@@ -36,6 +38,10 @@ use crate::dynamic_fs::{
 #[cfg(target_os = "linux")]
 use crate::linux_runtime::LinuxRuntime;
 use crate::proxy;
+#[cfg(target_os = "linux")]
+use crate::runtime_bundle::{
+    ANALYSIS_ROOT, INNER_HELPER_PATH, RUNTIME_ROOT, RuntimeBundle, RuntimeComponent, SHELL_PATH,
+};
 use crate::secret;
 
 pub(crate) const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "LANG"];
@@ -47,6 +53,12 @@ const ALLOW_UNIX_SOCKET_ENV: &str = "ZEROBOX_ALLOW_UNIX_SOCKET";
 const HOST_LOOPBACK_PORTS_ENV: &str = "ZEROBOX_HOST_LOOPBACK_PORTS";
 const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
 const DOCKER_HOST_ENV: &str = "DOCKER_HOST";
+#[cfg(target_os = "linux")]
+const RUNTIME_INNER_HELPER_ENV: &str = "ZEROBOX_RUNTIME_INNER_HELPER";
+#[cfg(target_os = "linux")]
+const RUNTIME_ADMISSION_RECEIPT_ENV: &str = "ZEROBOX_RUNTIME_ADMISSION_RECEIPT";
+#[cfg(target_os = "linux")]
+const RUNTIME_PATH_ALIASES_ENV: &str = "ZEROBOX_RUNTIME_PATH_ALIASES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -120,6 +132,9 @@ const RESERVED_CHILD_ENV_KEYS: &[&str] = &[
     ALLOW_UNIX_SOCKET_ENV,
     HOST_LOOPBACK_PORTS_ENV,
     DOCKER_BROKER_SOCKET_ENV,
+    RUNTIME_INNER_HELPER_ENV,
+    RUNTIME_ADMISSION_RECEIPT_ENV,
+    RUNTIME_PATH_ALIASES_ENV,
 ];
 
 pub struct SandboxOutput {
@@ -238,12 +253,23 @@ pub struct Sandbox {
     profile_names: Vec<String>,
     use_profile: bool,
     linux_sandbox_exe: Option<PathBuf>,
+    runtime_bundle: Option<RuntimeBundleRequest>,
+    admission_fd: Option<i32>,
+    admission_ack_fd: Option<i32>,
     setup_status: bool,
     private_tmp: Option<PathBuf>,
+    host_tmp: bool,
     private_home: Option<PathBuf>,
     allow_local_binding: bool,
     allow_unix_sockets: Vec<PathBuf>,
     tcp_publications: Vec<TcpPublication>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct RuntimeBundleRequest {
+    root: PathBuf,
+    component: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -370,8 +396,12 @@ impl Sandbox {
             profile_names: Vec::new(),
             use_profile: true,
             linux_sandbox_exe: None,
+            runtime_bundle: None,
+            admission_fd: None,
+            admission_ack_fd: None,
             setup_status: false,
             private_tmp: None,
+            host_tmp: false,
             private_home: None,
             allow_local_binding: false,
             allow_unix_sockets: Vec::new(),
@@ -457,6 +487,11 @@ impl Sandbox {
     /// The caller owns the directory lifetime; commands can share it explicitly.
     pub fn private_tmp(mut self, path: impl Into<PathBuf>) -> Self {
         self.private_tmp = Some(path.into());
+        self
+    }
+
+    pub fn host_tmp(mut self) -> Self {
+        self.host_tmp = true;
         self
     }
 
@@ -582,6 +617,36 @@ impl Sandbox {
         self
     }
 
+    /// Use a verified, private runtime component instead of host system tools.
+    ///
+    /// The release root must contain a schema-1 `manifest.json`; the component
+    /// is `shell` or `analysis`. Validation happens before the sandbox helper
+    /// is started, and a malformed bundle never falls back to host paths.
+    #[cfg(target_os = "linux")]
+    pub fn runtime_bundle(
+        mut self,
+        root: impl Into<PathBuf>,
+        component: impl Into<String>,
+    ) -> Self {
+        self.runtime_bundle = Some(RuntimeBundleRequest {
+            root: root.into(),
+            component: component.into(),
+        });
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn admission_fd(mut self, fd: i32) -> Self {
+        self.admission_fd = Some(fd);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn admission_ack_fd(mut self, fd: i32) -> Self {
+        self.admission_ack_fd = Some(fd);
+        self
+    }
+
     #[doc(hidden)]
     pub fn setup_status(mut self, enabled: bool) -> Self {
         self.setup_status = enabled;
@@ -593,7 +658,7 @@ impl Sandbox {
         prepared.cmd.stdin(std::process::Stdio::null());
         prepared.cmd.stdout(std::process::Stdio::piped());
         prepared.cmd.stderr(std::process::Stdio::piped());
-        let (child, _) = prepared.spawn_checked().await?;
+        let (child, _) = prepared.spawn_checked_without_admission().await?;
         let output = child
             .wait_with_output()
             .await
@@ -611,7 +676,7 @@ impl Sandbox {
         prepared.cmd.stdout(std::process::Stdio::piped());
         prepared.cmd.stderr(std::process::Stdio::piped());
         prepared.cmd.stdin(std::process::Stdio::null());
-        let (child, started_pid) = prepared.spawn_checked().await?;
+        let (child, started_pid) = prepared.spawn_checked_without_admission().await?;
         Ok(SandboxChild {
             inner: child,
             started_pid,
@@ -625,7 +690,7 @@ impl Sandbox {
         let mut prepared = self.prepare().await?;
         prepared.cmd.stdout(std::process::Stdio::piped());
         prepared.cmd.stderr(std::process::Stdio::piped());
-        let (child, started_pid) = prepared.spawn_checked().await?;
+        let (child, started_pid) = prepared.spawn_checked_without_admission().await?;
         Ok(SandboxChild {
             inner: child,
             started_pid,
@@ -638,7 +703,7 @@ impl Sandbox {
     #[doc(hidden)]
     pub async fn spawn_inherited(self) -> std::result::Result<SandboxChild, SandboxSetupError> {
         let mut prepared = self.prepare().await?;
-        let (child, started_pid) = prepared.spawn_checked().await?;
+        let (child, started_pid) = prepared.spawn_checked_without_admission().await?;
         Ok(SandboxChild {
             inner: child,
             started_pid,
@@ -648,7 +713,7 @@ impl Sandbox {
 
     pub async fn status(self) -> std::result::Result<ExitStatus, SandboxSetupError> {
         let mut prepared = self.setup_status(true).prepare().await?;
-        let (mut child, _) = prepared.spawn_checked().await?;
+        let (mut child, _) = prepared.spawn_checked_without_admission().await?;
         child
             .wait()
             .await
@@ -711,9 +776,13 @@ impl Sandbox {
             profile_names,
             use_profile,
             linux_sandbox_exe,
+            runtime_bundle,
+            admission_fd,
+            admission_ack_fd,
             setup_status,
-            private_tmp,
-            private_home,
+            mut private_tmp,
+            host_tmp,
+            mut private_home,
             allow_local_binding,
             allow_unix_sockets,
             tcp_publications,
@@ -726,7 +795,21 @@ impl Sandbox {
 
         let mut effective_strict = strict;
 
-        if use_profile {
+        // Runtime bundles provide their own shell and ELF closure. Do not
+        // silently compose the legacy default profile, whose host system-read
+        // grants would reopen the private root. Explicit named profiles remain
+        // policy input and are handled below like other explicit grants.
+        let apply_implicit_default_profile = {
+            #[cfg(target_os = "linux")]
+            {
+                runtime_bundle.is_none() || !profile_names.is_empty()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        };
+        if use_profile && apply_implicit_default_profile {
             let profile = if profile_names.is_empty() {
                 crate::profile_core::load_profile("default", &cwd)?
             } else {
@@ -768,6 +851,82 @@ impl Sandbox {
         }
 
         validate_sandbox_configuration(effective_strict, disabled, full_access)?;
+
+        #[cfg(target_os = "linux")]
+        let runtime_bundle = match runtime_bundle {
+            Some(request) => {
+                if disabled || full_access {
+                    return Err(anyhow::anyhow!(
+                        "runtime bundles require the Linux bubblewrap sandbox"
+                    )
+                    .into());
+                }
+                let component = match request.component.as_str() {
+                    "shell" => RuntimeComponent::Shell,
+                    "analysis" => RuntimeComponent::Analysis,
+                    _ => {
+                        return Err(
+                            anyhow::anyhow!("runtime component must be shell or analysis").into(),
+                        );
+                    }
+                };
+                reject_reserved_runtime_overlays(
+                    &allow_read,
+                    &deny_read,
+                    &allow_write,
+                    &deny_write,
+                )?;
+                let bundle = RuntimeBundle::load(&request.root, component)?;
+                protect_runtime_bundle_writes(&mut deny_write, &bundle);
+                Some(bundle)
+            }
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        let host_deny_write_globs = if runtime_bundle.is_some() {
+            host_dynamic_deny_write_globs(&deny_write_globs)
+        } else {
+            deny_write_globs.clone()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let host_deny_write_globs = deny_write_globs.clone();
+
+        #[cfg(target_os = "linux")]
+        if admission_fd.is_some() && runtime_bundle.is_none() {
+            return Err(anyhow::anyhow!("admission requires a verified runtime bundle").into());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = admission_fd {
+            if fd != 4 {
+                return Err(anyhow::anyhow!("runtime admission descriptor must be 4").into());
+            }
+            // Only the outer supervisor owns the report channel. A target-side
+            // copy would keep its EOF pending while Pi waits to deliver stdin.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+            {
+                return Err(anyhow::Error::from(std::io::Error::last_os_error()).into());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let admission_ack_channel = if let Some(fd) = admission_ack_fd {
+            use std::os::fd::FromRawFd;
+            if fd != 5 || admission_fd.is_none() {
+                return Err(anyhow::anyhow!(
+                    "admission acknowledgement requires FD 5 and a report channel"
+                )
+                .into());
+            }
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+            {
+                return Err(anyhow::Error::from(std::io::Error::last_os_error()).into());
+            }
+            Some(unsafe { File::from_raw_fd(fd) })
+        } else {
+            None
+        };
 
         #[cfg(unix)]
         if use_profile
@@ -864,10 +1023,18 @@ impl Sandbox {
         let strict_path =
             select_strict_path(effective_strict, env.get("PATH").map(String::as_str))?;
         let mut child_env = finalize_child_env(
-            build_env(inherit_env, allow_env.as_deref(), &deny_env, &env),
+            if runtime_bundle.is_some() {
+                build_private_runtime_env(inherit_env, allow_env.as_deref(), &deny_env, &env)
+            } else {
+                build_env(inherit_env, allow_env.as_deref(), &deny_env, &env)
+            },
             secret_store.get_env_overrides(),
             strict_path.as_deref(),
         );
+        #[cfg(target_os = "linux")]
+        if runtime_bundle.is_some() && !env.contains_key("PATH") {
+            child_env.insert("PATH".to_string(), SHELL_PATH.to_string());
+        }
 
         if !disabled {
             remove_docker_connection_env(&mut child_env);
@@ -876,7 +1043,7 @@ impl Sandbox {
         let net_enabled =
             allow_net.is_some() || !allow_host_net.is_empty() || !secret_store.is_empty();
         let docker_enabled = !disabled && !matches!(docker_access, DockerAccessPolicy::Disabled);
-        let has_dynamic_denies = !deny_read_globs.is_empty() || !deny_write_globs.is_empty();
+        let has_dynamic_denies = !deny_read_globs.is_empty() || !host_deny_write_globs.is_empty();
         let (sandbox_type, use_legacy_landlock) =
             if disabled || (full_access && !has_dynamic_denies) {
                 (SandboxType::None, false)
@@ -892,13 +1059,18 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         let linux_runtime = if sandbox_type == SandboxType::LinuxSeccomp {
-            let helper_source = linux_sandbox_exe
-                .as_deref()
-                .map(Path::to_path_buf)
+            let helper_source = runtime_bundle
+                .as_ref()
+                .map(|bundle| bundle.helper.clone())
+                .or_else(|| linux_sandbox_exe.as_deref().map(Path::to_path_buf))
                 .or_else(|| std::env::current_exe().ok())
                 .ok_or_else(|| anyhow::anyhow!("cannot determine Linux sandbox helper"))?;
-            let runtime_exclusions =
-                linux_runtime_exclusions(&cwd, &allow_write, &deny_read_globs, &deny_write_globs)?;
+            let runtime_exclusions = linux_runtime_exclusions(
+                &cwd,
+                &allow_write,
+                &deny_read_globs,
+                &host_deny_write_globs,
+            )?;
             let runtime = LinuxRuntime::create(&cwd, &runtime_exclusions, &helper_source)?;
             deny_read.push(runtime.parent().to_path_buf());
             deny_write.push(runtime.parent().to_path_buf());
@@ -906,6 +1078,23 @@ impl Sandbox {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        if runtime_bundle.is_some()
+            && private_tmp.is_none()
+            && !host_tmp
+            && let Some(runtime) = linux_runtime.as_ref()
+        {
+            private_tmp = Some(runtime.private_tmp().to_path_buf());
+            child_env.insert("TMPDIR".to_string(), "/tmp".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        if runtime_bundle.is_some()
+            && private_home.is_none()
+            && let Some(runtime) = linux_runtime.as_ref()
+        {
+            private_home = Some(runtime.private_home().to_path_buf());
+            child_env.insert("HOME".to_string(), "/home/sandbox".to_string());
+        }
         #[cfg(not(target_os = "linux"))]
         let linux_runtime: Option<()> = None;
 
@@ -947,6 +1136,23 @@ impl Sandbox {
             child_env.insert(DOCKER_HOST_ENV.to_string(), "tcp://127.0.0.1:1".to_string());
         }
 
+        let admission_home = private_home
+            .as_ref()
+            .map(|_| serde_json::json!({"path":"/home/sandbox","namespace":"lease-private"}))
+            .unwrap_or_else(|| serde_json::json!({"path":null,"namespace":"host"}));
+        let admission_tmp = private_tmp
+            .as_ref()
+            .map(|_| serde_json::json!({"path":"/tmp","namespace":"lease-private"}))
+            .unwrap_or_else(|| serde_json::json!({"path":"/tmp","namespace":"host"}));
+
+        #[cfg(target_os = "linux")]
+        let admission_target_env = child_env.clone();
+        #[cfg(target_os = "linux")]
+        let runtime_path_aliases = if runtime_bundle.is_some() {
+            collect_runtime_path_aliases(&allow_read, &allow_write, &cwd)?
+        } else {
+            Vec::new()
+        };
         #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
             let file = PrivateTargetEnvironment::create_in(
@@ -963,6 +1169,10 @@ impl Sandbox {
         };
         #[cfg(not(target_os = "linux"))]
         let target_env_file: Option<PrivateTargetEnvironment> = None;
+        #[cfg(target_os = "linux")]
+        let internal_target_env_root = target_env_file
+            .as_ref()
+            .map(|file| file.read_root().to_path_buf());
 
         let command_env = target_env_file
             .as_ref()
@@ -970,7 +1180,9 @@ impl Sandbox {
             .unwrap_or(child_env);
 
         #[cfg(target_os = "linux")]
-        let setup_channel = if setup_status && sandbox_type == SandboxType::LinuxSeccomp {
+        let setup_channel = if (setup_status || admission_fd.is_some())
+            && sandbox_type == SandboxType::LinuxSeccomp
+        {
             Some(PrivateSetupChannel::create()?)
         } else {
             None
@@ -978,26 +1190,45 @@ impl Sandbox {
         #[cfg(not(target_os = "linux"))]
         let setup_channel: Option<PrivateSetupChannel> = None;
 
-        let fs_policy = build_fs_policy(
-            &allow_read,
-            &deny_read,
-            &deny_read_globs,
-            &allow_write,
-            &deny_write,
-            &deny_write_globs,
-            full_write,
-            full_access,
-            net_enabled,
-            &cwd,
-        );
-        let fs_policy = with_linux_helper_read_root(fs_policy, linux_sandbox_exe.as_deref(), &cwd);
+        let fs_policy = if runtime_bundle.is_some() {
+            build_runtime_fs_policy(
+                &allow_read,
+                &deny_read,
+                &deny_read_globs,
+                &allow_write,
+                &deny_write,
+                &deny_write_globs,
+                full_write,
+                full_access,
+                net_enabled,
+                &cwd,
+            )
+        } else {
+            build_fs_policy(
+                &allow_read,
+                &deny_read,
+                &deny_read_globs,
+                &allow_write,
+                &deny_write,
+                &deny_write_globs,
+                full_write,
+                full_access,
+                net_enabled,
+                &cwd,
+            )
+        };
+        let fs_policy = if runtime_bundle.is_some() {
+            fs_policy
+        } else {
+            with_linux_helper_read_root(fs_policy, linux_sandbox_exe.as_deref(), &cwd)
+        };
 
         #[cfg(target_os = "linux")]
         let dynamic_fs = if sandbox_type == SandboxType::LinuxSeccomp {
             DynamicDenyMounts::prepare_with_unix_sockets_in(
                 &cwd,
                 &deny_read_globs,
-                &deny_write_globs,
+                &host_deny_write_globs,
                 &exact_unix_sockets
                     .iter()
                     .map(|socket| socket.source.clone())
@@ -1008,7 +1239,7 @@ impl Sandbox {
                     .expect("Linux sandbox requires a private runtime")
                     .views_root(),
             )?
-        } else if disabled || (deny_read_globs.is_empty() && deny_write_globs.is_empty()) {
+        } else if disabled || (deny_read_globs.is_empty() && host_deny_write_globs.is_empty()) {
             None
         } else {
             return Err(
@@ -1026,6 +1257,21 @@ impl Sandbox {
             NetworkSandboxPolicy::Enabled
         } else {
             NetworkSandboxPolicy::Restricted
+        };
+
+        #[cfg(target_os = "linux")]
+        let admission_control = if admission_fd.is_some() {
+            Some(RuntimeAdmissionControl::create(
+                linux_runtime
+                    .as_ref()
+                    .expect("runtime admission requires a Linux runtime"),
+                runtime_bundle
+                    .as_ref()
+                    .expect("bundle for admission")
+                    .component,
+            )?)
+        } else {
+            None
         };
 
         zerobox_utils_rustls_provider::ensure_rustls_crypto_provider();
@@ -1075,6 +1321,16 @@ impl Sandbox {
 
         let cwd_abs = AbsolutePathBuf::from_absolute_path(&cwd)
             .context("working directory must be absolute")?;
+        #[cfg(target_os = "linux")]
+        let outer_cwd = runtime_bundle
+            .as_ref()
+            .filter(|bundle| {
+                bundle.component == RuntimeComponent::Analysis && cwd == Path::new(ANALYSIS_ROOT)
+            })
+            .map(|bundle| bundle.component_root.as_path())
+            .unwrap_or(cwd.as_path());
+        #[cfg(not(target_os = "linux"))]
+        let outer_cwd = cwd.as_path();
 
         let permissions = PermissionProfile::from_runtime_permissions(&fs_policy, net_policy);
         let manager = SandboxManager::new();
@@ -1100,6 +1356,20 @@ impl Sandbox {
                 windows_sandbox_private_desktop: false,
             })
             .map_err(|e| anyhow::anyhow!("sandbox transform failed: {e}"))?;
+
+        #[cfg(target_os = "linux")]
+        if runtime_bundle
+            .as_ref()
+            .is_some_and(|bundle| bundle.component == RuntimeComponent::Analysis)
+            && cwd == Path::new(ANALYSIS_ROOT)
+        {
+            let index = exec_request
+                .command
+                .iter()
+                .position(|argument| argument == "--command-cwd")
+                .expect("Linux sandbox command must preserve its logical cwd");
+            exec_request.command[index + 1] = ANALYSIS_ROOT.to_string();
+        }
 
         if !tcp_publications.is_empty() {
             let proxy_root = proxy_root
@@ -1132,7 +1402,7 @@ impl Sandbox {
 
         let mut cmd = tokio::process::Command::new(&exec_request.command[0]);
         cmd.args(&exec_request.command[1..]);
-        cmd.current_dir(&cwd);
+        cmd.current_dir(outer_cwd);
         cmd.env_clear();
         cmd.kill_on_drop(true);
 
@@ -1175,7 +1445,19 @@ impl Sandbox {
             }
         }
         remove_reserved_child_env(&mut final_env);
+        if runtime_bundle.is_some() {
+            validate_runtime_environment_denials(&admission_target_env, &final_env, &deny_env)?;
+        }
         cmd.envs(&final_env);
+        #[cfg(target_os = "linux")]
+        if runtime_bundle.is_some() {
+            cmd.env(RUNTIME_INNER_HELPER_ENV, INNER_HELPER_PATH);
+            cmd.env(
+                RUNTIME_PATH_ALIASES_ENV,
+                serde_json::to_string(&runtime_path_aliases)
+                    .context("serialize runtime path aliases")?,
+            );
+        }
         if allow_local_binding {
             cmd.env(ALLOW_LOCAL_BINDING_ENV, "1");
             // Reserve only explicit loopback grants. Each connection still
@@ -1221,17 +1503,17 @@ impl Sandbox {
                 .as_ref()
                 .map(|fs| fs.binds().to_vec())
                 .unwrap_or_default();
-            if let Some(source) = private_tmp {
+            if let Some(source) = private_tmp.as_ref() {
                 binds.push(DynamicBindMount {
-                    source,
+                    source: source.clone(),
                     destination: PathBuf::from("/tmp"),
                     exact_unix_socket: None,
                     source_fd: None,
                 });
             }
-            if let Some(source) = private_home {
+            if let Some(source) = private_home.as_ref() {
                 binds.push(DynamicBindMount {
-                    source,
+                    source: source.clone(),
                     destination: PathBuf::from("/home/sandbox"),
                     exact_unix_socket: None,
                     source_fd: None,
@@ -1243,11 +1525,186 @@ impl Sandbox {
                 exact_unix_socket: Some(socket.identity),
                 source_fd: Some(socket.source_fd.as_raw_fd()),
             }));
-            if !binds.is_empty() {
-                let serialized = serde_json::to_string(&binds)
+            let mut bind_values = serde_json::to_value(&binds)
+                .context("serialize private bind mounts")?
+                .as_array()
+                .cloned()
+                .expect("private bind mounts serialize as an array");
+            if runtime_bundle.is_some() {
+                for (source, destination) in [
+                    (private_tmp.as_ref(), "/tmp"),
+                    (private_home.as_ref(), "/home/sandbox"),
+                ] {
+                    if let Some(source) = source {
+                        for bind in &mut bind_values {
+                            if bind["source"] == source.to_string_lossy().as_ref()
+                                && bind["destination"] == destination
+                            {
+                                bind["before_policy"] = serde_json::json!(true);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(control) = admission_control.as_ref() {
+                bind_values.push(control.bind_value());
+            }
+            if let Some(bundle) = runtime_bundle.as_ref() {
+                let runtime = linux_runtime
+                    .as_ref()
+                    .expect("runtime bundles require a Linux runtime");
+                bind_values.extend([
+                    serde_json::json!({"source": &bundle.shell_root, "destination": RUNTIME_ROOT, "read_only": true}),
+                    serde_json::json!({"source": &bundle.helper, "destination": INNER_HELPER_PATH, "read_only": true}),
+                ]);
+                if !policy_grants_public_destination(&allow_read, Path::new("/bin"), &cwd) {
+                    bind_values.push(serde_json::json!({"source": runtime.runtime_alias_bin(), "destination": "/bin", "read_only": true}));
+                }
+                if !policy_grants_public_destination(&allow_read, Path::new("/usr/bin"), &cwd) {
+                    bind_values.push(serde_json::json!({"source": runtime.runtime_alias_usr_bin(), "destination": "/usr/bin", "read_only": true}));
+                }
+                if bundle.component == RuntimeComponent::Analysis {
+                    bind_values.push(serde_json::json!({"source": &bundle.component_root, "destination": ANALYSIS_ROOT, "read_only": true}));
+                }
+            }
+            if !bind_values.is_empty() {
+                let serialized = serde_json::to_string(&bind_values)
                     .context("failed to serialize private bind mounts")?;
                 cmd.env(PRIVATE_BIND_MOUNTS_ENV, serialized);
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        let admission_receipt = runtime_bundle
+            .as_ref()
+            .map(|bundle| {
+                let inherited_names = if !inherit_env && allow_env.is_none() { Vec::new() } else {
+                    admission_inherited_environment_names(inherit_env, allow_env.as_deref())
+                };
+                let inherited = inherited_names
+                    .into_iter()
+                    .filter(|name| admission_target_env.contains_key(name) && !env.contains_key(name))
+                    .collect::<Vec<_>>();
+                let mut set = admission_target_env
+                    .keys()
+                    .filter(|name| !inherited.contains(name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                set.extend(admission_helper_environment_names(
+                    &admission_target_env,
+                    &final_env,
+                ));
+                let runtime = linux_runtime
+                    .as_ref()
+                    .expect("runtime bundles require a Linux runtime");
+                let mut mounts = vec![
+                    serde_json::json!({"source": bundle.shell_root, "destination": RUNTIME_ROOT, "access":"ro", "origin":"runtime"}),
+                    serde_json::json!({"source": bundle.helper, "destination":INNER_HELPER_PATH, "access":"ro", "origin":"runtime"}),
+                ];
+                if let Some(control) = admission_control.as_ref() {
+                    mounts.push(serde_json::json!({"source": control.root, "destination":"/__zerobox", "access":"ro", "origin":"internal"}));
+                }
+                if let Some(source) = private_tmp.as_ref() {
+                    mounts.push(serde_json::json!({"source": source, "destination":"/tmp", "access":"rw", "origin":"internal"}));
+                }
+                if let Some(source) = private_home.as_ref() {
+                    mounts.push(serde_json::json!({"source": source, "destination":"/home/sandbox", "access":"rw", "origin":"internal"}));
+                }
+                if let Some(source) = internal_target_env_root.as_ref() {
+                    mounts.push(serde_json::json!({"source": source, "destination":source, "access":"ro", "origin":"internal"}));
+                }
+                for root in fs_policy.get_readable_roots_with_cwd(&cwd) {
+                    if Some(root.as_path()) == internal_target_env_root.as_deref() { continue; }
+                    let access = if fs_policy.can_write_path_with_cwd(root.as_path(), &cwd) { "rw" } else { "ro" };
+                    mounts.push(serde_json::json!({"source": root, "destination":root, "access":access, "origin":"policy"}));
+                }
+                if let Some(dynamic) = dynamic_fs.as_ref() {
+                    // The FUSE source is runtime-owned and applies the reported
+                    // policy on every operation, including future deny targets.
+                    mounts.extend(dynamic.binds().iter().map(|bind| serde_json::json!({"source": bind.source, "destination": bind.destination, "access":"rw", "origin":"internal"})));
+                }
+                mounts.extend(exact_unix_sockets.iter().map(|socket| serde_json::json!({"source": socket.source, "destination": socket.source, "access":"rw", "origin":"policy"})));
+                if !policy_grants_public_destination(&allow_read, Path::new("/bin"), &cwd) {
+                    mounts.push(serde_json::json!({"source": runtime.runtime_alias_bin(), "destination":"/bin", "access":"ro", "origin":"internal"}));
+                }
+                if !policy_grants_public_destination(&allow_read, Path::new("/usr/bin"), &cwd) {
+                    mounts.push(serde_json::json!({"source": runtime.runtime_alias_usr_bin(), "destination":"/usr/bin", "access":"ro", "origin":"internal"}));
+                }
+                if bundle.component == RuntimeComponent::Analysis {
+                    mounts.push(serde_json::json!({"source": bundle.component_root, "destination": ANALYSIS_ROOT, "access":"ro", "origin":"runtime"}));
+                }
+                let receipt = serde_json::json!({
+                    "schema": 1,
+                    "runtime": {
+                        "target": "x86_64-unknown-linux-gnu",
+                        "version": bundle.version,
+                        "manifestSha256": bundle.manifest_sha256,
+                        "component": bundle.component.as_str(),
+                    },
+                    "helperSha256": bundle.helper_sha256,
+                    "mounts": mounts,
+                    "pathAliases": runtime_path_aliases,
+                    "filesystem": {
+                        "allowRead": display_paths(&allow_read.iter().filter(|path| Some(path.as_path()) != internal_target_env_root.as_deref()).cloned().collect::<Vec<_>>()),
+                        "denyRead": display_paths(&deny_read),
+                        "denyReadGlobs": deny_read_globs,
+                        "allowWrite": display_paths(&allow_write),
+                        "denyWrite": display_paths(&deny_write),
+                        "denyWriteGlobs": deny_write_globs,
+                    },
+                    "network": {
+                        "mode": if net_enabled { "domain-allowlist" } else { "deny-all" },
+                        "allow": allow_net.unwrap_or_default(),
+                        "allowHost": allow_host_net,
+                        "deny": deny_net,
+                        "allowLocalBinding": allow_local_binding,
+                    },
+                    "resources": {
+                        "unixSockets": allow_unix_sockets.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                        "tcpPublications": tcp_publications.iter().map(|publication| serde_json::json!({"transport":"tcp","scope": publication.scope,"listen":publication.listen,"target":publication.target})).collect::<Vec<_>>(),
+                    },
+                    "environment": {
+                        "inherit": sorted_environment_names(inherited),
+                        "set": sorted_environment_names(set),
+                        "deny": sorted_environment_names(deny_env.clone()),
+                    },
+                    "home": admission_home,
+                    "tmp": admission_tmp,
+                    "docker": docker_access,
+                    "path": admission_target_env.get("PATH").map(|value| value.split(':').collect::<Vec<_>>()).unwrap_or_default(),
+                });
+                serde_json::to_vec(&receipt).context("serialize runtime admission receipt")
+            })
+            .transpose()?;
+
+        #[cfg(target_os = "linux")]
+        if admission_fd.is_some() {
+            let receipt = admission_receipt
+                .as_deref()
+                .expect("admission requires a runtime receipt");
+            let receipt = std::str::from_utf8(receipt)
+                .context("runtime admission receipt must be UTF-8 JSON")?;
+            cmd.env(RUNTIME_ADMISSION_RECEIPT_ENV, receipt);
+            cmd.env(
+                "ZEROBOX_RUNTIME_ADMISSION_TOKEN",
+                admission_control
+                    .as_ref()
+                    .expect("admission control exists")
+                    .token
+                    .as_str(),
+            );
+            let target_environment = target_env_file
+                .as_ref()
+                .expect("runtime admission requires a private target environment");
+            target_environment.add_internal(RUNTIME_ADMISSION_RECEIPT_ENV, receipt)?;
+            target_environment.add_internal(
+                "ZEROBOX_RUNTIME_ADMISSION_TOKEN",
+                admission_control
+                    .as_ref()
+                    .expect("admission control exists")
+                    .token
+                    .as_str(),
+            )?;
         }
 
         #[cfg(unix)]
@@ -1258,6 +1715,7 @@ impl Sandbox {
 
         Ok(PreparedCommand {
             cmd,
+            admission_receipt,
             resources: ManagedExecutionResources {
                 _proxy_handle,
                 _proxy: proxy,
@@ -1273,6 +1731,11 @@ impl Sandbox {
                     .collect(),
                 #[cfg(target_os = "linux")]
                 tcp_publication_revocation,
+                #[cfg(target_os = "linux")]
+                admission_fd,
+                #[cfg(target_os = "linux")]
+                admission_ack: admission_ack_channel,
+                admission_control,
             },
         })
     }
@@ -1282,6 +1745,115 @@ impl Sandbox {
 struct TcpPublicationRevocation {
     supervisor: UnixStream,
     helper: Option<UnixStream>,
+}
+
+#[cfg(target_os = "linux")]
+struct RuntimeAdmissionControl {
+    listener: std::os::unix::net::UnixListener,
+    root: PathBuf,
+    path: PathBuf,
+    token: String,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeAdmissionControl {
+    fn create(runtime: &LinuxRuntime, component: RuntimeComponent) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = runtime.env_root().join("control");
+        std::fs::create_dir(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::create_dir(root.join("runtime"))?;
+        if component == RuntimeComponent::Analysis {
+            std::fs::create_dir(root.join("analysis"))?;
+        }
+        let path = root.join("control.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path)
+            .context("bind private runtime admission socket")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let mut token = [0_u8; 32];
+        getrandom::fill(&mut token).context("generate runtime admission token")?;
+        Ok(Self {
+            listener,
+            root,
+            path,
+            token: token.iter().map(|byte| format!("{byte:02x}")).collect(),
+        })
+    }
+
+    fn bind_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "source": self.root,
+            "destination": "/__zerobox",
+            "read_only": true,
+            "pre_remount": true,
+        })
+    }
+
+    async fn receive(
+        &self,
+        child: &mut Child,
+    ) -> Result<(std::os::unix::net::UnixStream, Vec<u8>)> {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        self.listener.set_nonblocking(true)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match self.listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!(
+                            "runtime admission helper exited before connecting: {status}"
+                        );
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!("runtime admission helper did not connect");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut credentials_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&stream),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut credentials_len,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let credentials = unsafe { credentials.assume_init() };
+        if credentials.uid != unsafe { libc::geteuid() } || credentials.pid <= 0 {
+            anyhow::bail!("runtime admission peer identity does not match the supervisor");
+        }
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o000))?;
+        std::fs::remove_file(&self.path)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let mut token = vec![0_u8; self.token.len()];
+        stream.read_exact(&mut token)?;
+        if token != self.token.as_bytes() {
+            anyhow::bail!("runtime admission helper authentication failed");
+        }
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > 1024 * 1024 {
+            anyhow::bail!("runtime admission receipt exceeds its size limit");
+        }
+        let mut receipt = vec![0_u8; length];
+        stream.read_exact(&mut receipt)?;
+        Ok((stream, receipt))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1335,6 +1907,12 @@ struct ManagedExecutionResources {
     _exact_unix_socket_fds: Vec<File>,
     #[cfg(target_os = "linux")]
     tcp_publication_revocation: Option<TcpPublicationRevocation>,
+    #[cfg(target_os = "linux")]
+    admission_fd: Option<i32>,
+    #[cfg(target_os = "linux")]
+    admission_ack: Option<File>,
+    #[cfg(target_os = "linux")]
+    admission_control: Option<RuntimeAdmissionControl>,
     #[cfg(not(target_os = "linux"))]
     tcp_publication_revocation: Option<()>,
     #[cfg(not(target_os = "linux"))]
@@ -1368,11 +1946,14 @@ impl ManagedExecutionResources {
             && self._linux_runtime.is_none()
             && self._exact_unix_socket_fds.is_empty()
             && self.tcp_publication_revocation.is_none()
+            && self.admission_fd.is_none()
+            && self.admission_control.is_none()
     }
 }
 
 pub struct PreparedCommand {
     cmd: tokio::process::Command,
+    admission_receipt: Option<Vec<u8>>,
     resources: ManagedExecutionResources,
 }
 
@@ -1383,6 +1964,10 @@ pub struct PreparedCommand {
 pub struct PreparedCommandIntoCommandError;
 
 impl PreparedCommand {
+    /// Exact post-profile runtime admission record, excluding environment values.
+    pub fn admission_receipt(&self) -> Option<&[u8]> {
+        self.admission_receipt.as_deref()
+    }
     /// Borrow the raw Tokio command to customize stdio or other spawn options.
     pub fn command_mut(&mut self) -> &mut tokio::process::Command {
         &mut self.cmd
@@ -1416,7 +2001,12 @@ impl PreparedCommand {
     /// Returns [`SandboxSetupError`] if spawning fails, or if a setup channel
     /// was explicitly attached and the helper rejects the final execution.
     pub async fn spawn(mut self) -> std::result::Result<SandboxChild, SandboxSetupError> {
-        let (inner, started_pid) = self.spawn_checked().await?;
+        let mut unexpected_admission = |_digest: &str| {
+            Err(SandboxSetupError::HelperProtocol(
+                "helper emitted unexpected admission".to_string(),
+            ))
+        };
+        let (inner, started_pid) = self.spawn_checked(&mut unexpected_admission).await?;
         Ok(SandboxChild {
             inner,
             started_pid,
@@ -1424,7 +2014,81 @@ impl PreparedCommand {
         })
     }
 
-    async fn spawn_checked(&mut self) -> std::result::Result<(Child, u32), SandboxSetupError> {
+    pub async fn spawn_with_admission(
+        mut self,
+        on_admitted: &mut (dyn FnMut(&str) -> std::result::Result<(), SandboxSetupError> + Send),
+    ) -> std::result::Result<SandboxChild, SandboxSetupError> {
+        let mut inner = self.spawn_helper()?;
+        let host_pid = inner.id();
+        #[cfg(target_os = "linux")]
+        let admitted: std::result::Result<(), SandboxSetupError> = async {
+            use std::io::Write;
+            use std::os::fd::FromRawFd;
+
+            let control = self.resources.admission_control.as_ref().ok_or_else(|| {
+                SandboxSetupError::HelperProtocol("missing runtime admission control".to_string())
+            })?;
+            let (mut stream, receipt) = control
+                .receive(&mut inner)
+                .await
+                .map_err(SandboxSetupError::Spawn)?;
+            let fd = self.resources.admission_fd.take().ok_or_else(|| {
+                SandboxSetupError::HelperProtocol(
+                    "missing runtime admission descriptor".to_string(),
+                )
+            })?;
+            if fd != 4 {
+                return Err(SandboxSetupError::HelperProtocol(
+                    "runtime admission descriptor must be 4".to_string(),
+                ));
+            }
+            let mut destination = unsafe { File::from_raw_fd(fd) };
+            destination
+                .write_all(&receipt)
+                .map_err(|error| SandboxSetupError::Spawn(anyhow::Error::from(error)))?;
+            let digest = format!("{:x}", Sha256::digest(&receipt));
+            drop(destination);
+            on_admitted(&digest)?;
+            if let Some(channel) = self.resources.admission_ack.take() {
+                wait_for_admission_ack(channel, &digest)
+                    .await
+                    .map_err(SandboxSetupError::Spawn)?;
+            }
+            stream
+                .write_all(b"ACK\n")
+                .map_err(|error| SandboxSetupError::Spawn(anyhow::Error::from(error)))?;
+            Ok(())
+        }
+        .await;
+        #[cfg(target_os = "linux")]
+        if let Err(error) = admitted {
+            return Err(stop_failed_setup(&mut inner, error).await);
+        }
+        // Admission proves the namespace. Wait separately for successful exec
+        // before reporting child_started, including for very short commands.
+        let started_pid = self
+            .confirm_child_started(&mut inner, host_pid, on_admitted)
+            .await?;
+        Ok(SandboxChild {
+            inner,
+            started_pid,
+            _resources: self.resources,
+        })
+    }
+
+    async fn spawn_checked(
+        &mut self,
+        on_admitted: &mut (dyn FnMut(&str) -> std::result::Result<(), SandboxSetupError> + Send),
+    ) -> std::result::Result<(Child, u32), SandboxSetupError> {
+        let mut child = self.spawn_helper()?;
+        let host_pid = child.id();
+        let started_pid = self
+            .confirm_child_started(&mut child, host_pid, on_admitted)
+            .await?;
+        Ok((child, started_pid))
+    }
+
+    fn spawn_helper(&mut self) -> std::result::Result<Child, SandboxSetupError> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -1460,7 +2124,7 @@ impl PreparedCommand {
                 });
             }
         }
-        let mut child = {
+        let child = {
             #[cfg(target_os = "linux")]
             let _publication = crate::linux_runtime::lock_helper_publication()?;
             self.cmd
@@ -1475,26 +2139,21 @@ impl PreparedCommand {
         };
         #[cfg(target_os = "linux")]
         self.resources.close_parent_tcp_publication_helper_fd();
-        let host_pid = child.id();
         if let Some(channel) = self.resources.setup_channel.as_mut() {
             channel.close_parent_write();
         }
-        let started_pid = if let Some(channel) = self.resources.setup_channel.as_ref() {
-            if let Err(error) = channel.wait_for_started(&mut child).await {
-                // No target has been confirmed. Preserve the helper's diagnostics
-                // before dropping its piped stdio and the owned setup resources.
-                let kill_error = child.start_kill().err();
-                let mut stderr = capture_setup_stderr(&mut child).await;
-                if let Some(error) = kill_error {
-                    stderr.push_str(&format!("\n[setup cleanup termination failed: {error}]"));
-                }
-                if let Err(error) = child.wait().await {
-                    stderr.push_str(&format!("\n[setup cleanup wait failed: {error}]"));
-                }
-                return Err(SandboxSetupError::HelperDiagnostics {
-                    source: Box::new(error),
-                    stderr,
-                });
+        Ok(child)
+    }
+
+    async fn confirm_child_started(
+        &mut self,
+        child: &mut Child,
+        host_pid: Option<u32>,
+        on_admitted: &mut (dyn FnMut(&str) -> std::result::Result<(), SandboxSetupError> + Send),
+    ) -> std::result::Result<u32, SandboxSetupError> {
+        let started_pid = if let Some(channel) = self.resources.setup_channel.as_mut() {
+            if let Err(error) = channel.wait_for_started(child, on_admitted).await {
+                return Err(stop_failed_setup(child, error).await);
             }
             host_pid.ok_or_else(|| {
                 SandboxSetupError::HelperProtocol(
@@ -1506,8 +2165,265 @@ impl PreparedCommand {
                 SandboxSetupError::HelperProtocol("spawned target has no process id".to_string())
             })?
         };
-        Ok((child, started_pid))
+        Ok(started_pid)
     }
+
+    async fn spawn_checked_without_admission(
+        &mut self,
+    ) -> std::result::Result<(Child, u32), SandboxSetupError> {
+        let mut unexpected_admission = |_digest: &str| {
+            Err(SandboxSetupError::HelperProtocol(
+                "helper emitted unexpected admission".to_string(),
+            ))
+        };
+        self.spawn_checked(&mut unexpected_admission).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_admission_ack(channel: File, digest: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(channel.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(channel.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let channel = tokio::io::unix::AsyncFd::new(channel)?;
+    let expected = format!("ACK:{digest}\n");
+    let receive = async {
+        let mut bytes = Vec::new();
+        loop {
+            let mut ready = channel.readable().await?;
+            let mut buffer = [0_u8; 70];
+            match ready.try_io(|inner| {
+                let count = unsafe {
+                    libc::read(
+                        inner.get_ref().as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(count as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    return Err(anyhow::anyhow!("admission acknowledgement channel closed"));
+                }
+                Ok(Ok(count)) => {
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if bytes.len() >= expected.len() {
+                        if bytes == expected.as_bytes() {
+                            return Ok(());
+                        }
+                        return Err(anyhow::anyhow!(
+                            "admission acknowledgement does not match the report"
+                        ));
+                    }
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => continue,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), receive)
+        .await
+        .context("admission acknowledgement timed out")?
+}
+
+async fn stop_failed_setup(child: &mut Child, error: SandboxSetupError) -> SandboxSetupError {
+    let kill_error = child.start_kill().err();
+    let mut stderr = capture_setup_stderr(child).await;
+    if let Some(error) = kill_error {
+        stderr.push_str(&format!("\n[setup cleanup termination failed: {error}]"));
+    }
+    if let Err(error) = child.wait().await {
+        stderr.push_str(&format!("\n[setup cleanup wait failed: {error}]"));
+    }
+    SandboxSetupError::HelperDiagnostics {
+        source: Box::new(error),
+        stderr,
+    }
+}
+
+fn display_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn policy_grants_public_destination(
+    granted_roots: &[PathBuf],
+    destination: &Path,
+    cwd: &Path,
+) -> bool {
+    granted_roots.iter().any(|path| {
+        resolve_path(cwd, path)
+            .map(|path| {
+                destination.starts_with(path.as_path()) || path.as_path().starts_with(destination)
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize)]
+struct RuntimePathAlias {
+    destination: PathBuf,
+    target: PathBuf,
+    directory: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn collect_runtime_path_aliases(
+    read: &[PathBuf],
+    write: &[PathBuf],
+    cwd: &Path,
+) -> Result<Vec<RuntimePathAlias>> {
+    let grants = read
+        .iter()
+        .chain(write)
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            }
+        })
+        .collect::<Vec<_>>();
+    let canonical = grants
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
+    let mut aliases = std::collections::BTreeMap::new();
+    for grant in grants {
+        let mut prefix = PathBuf::new();
+        for component in grant.components() {
+            prefix.push(component);
+            if canonical.iter().any(|root| prefix.starts_with(root)) {
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(&prefix) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let target = std::fs::canonicalize(&prefix)
+                .context("resolve an explicitly authorized path alias")?;
+            if prefix.starts_with("/__zerobox") {
+                anyhow::bail!("authorized path alias overlaps the private runtime");
+            }
+            aliases.insert(prefix.clone(), target);
+        }
+    }
+    Ok(aliases
+        .into_iter()
+        .map(|(destination, target)| RuntimePathAlias {
+            destination,
+            directory: target.is_dir(),
+            target,
+        })
+        .collect())
+}
+
+fn sorted_environment_names(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn admission_helper_environment_names(
+    target_environment: &HashMap<String, String>,
+    helper_environment: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut names = helper_environment
+        .keys()
+        .filter(|name| !target_environment.contains_key(*name))
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                TARGET_ENV_FILE_ENV
+                    | "PATH"
+                    | PRIVATE_BIND_MOUNTS_ENV
+                    | DOCKER_BROKER_SOCKET_ENV
+                    | ALLOW_LOCAL_BINDING_ENV
+                    | ALLOW_UNIX_SOCKET_ENV
+                    | HOST_LOOPBACK_PORTS_ENV
+                    | RUNTIME_INNER_HELPER_ENV
+                    | RUNTIME_ADMISSION_RECEIPT_ENV
+                    | RUNTIME_PATH_ALIASES_ENV
+                    | "ZEROBOX_RUNTIME_ADMISSION_TOKEN"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn validate_runtime_environment_denials(
+    target: &HashMap<String, String>,
+    helper: &HashMap<String, String>,
+    denied: &[String],
+) -> Result<()> {
+    let additions = admission_helper_environment_names(target, helper);
+    for name in denied {
+        if target.contains_key(name) || additions.contains(name) {
+            anyhow::bail!("denied environment variable is required by the sandbox runtime: {name}");
+        }
+    }
+    Ok(())
+}
+
+fn build_private_runtime_env(
+    inherit: bool,
+    allowed: Option<&[String]>,
+    denied: &[String],
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut result = HashMap::from([
+        ("USER".to_string(), "sandbox".to_string()),
+        ("SHELL".to_string(), format!("{SHELL_PATH}/bash")),
+        ("TERM".to_string(), "dumb".to_string()),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+    ]);
+    if inherit || allowed.is_some() {
+        result.extend(build_env(inherit, allowed, denied, overrides));
+    } else {
+        result.extend(overrides.clone());
+    }
+    for name in denied {
+        result.remove(name);
+    }
+    result
+}
+
+fn admission_inherited_environment_names(
+    inherit_all: bool,
+    allowed: Option<&[String]>,
+) -> Vec<String> {
+    if inherit_all {
+        return sorted_environment_names(
+            std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .collect(),
+        );
+    }
+    allowed
+        .map(|names| sorted_environment_names(names.to_vec()))
+        .unwrap_or_else(|| {
+            DEFAULT_ENV_KEYS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        })
 }
 
 async fn capture_setup_stderr(child: &mut Child) -> String {
@@ -1546,14 +2462,14 @@ struct PrivateSetupChannel {
 impl PrivateSetupChannel {
     fn create() -> Result<Self> {
         use std::os::fd::FromRawFd;
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
+        let mut status = [0; 2];
+        if unsafe { libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } < 0 {
             return Err(std::io::Error::last_os_error())
-                .context("failed to create private setup pipe");
+                .context("failed to create private setup pipes");
         }
         Ok(Self {
-            read: unsafe { std::fs::File::from_raw_fd(fds[0]) },
-            write: Some(unsafe { std::fs::File::from_raw_fd(fds[1]) }),
+            read: unsafe { std::fs::File::from_raw_fd(status[0]) },
+            write: Some(unsafe { std::fs::File::from_raw_fd(status[1]) }),
         })
     }
 
@@ -1567,8 +2483,9 @@ impl PrivateSetupChannel {
     }
 
     async fn wait_for_started(
-        &self,
+        &mut self,
         child: &mut Child,
+        on_admitted: &mut (dyn FnMut(&str) -> std::result::Result<(), SandboxSetupError> + Send),
     ) -> std::result::Result<u32, SandboxSetupError> {
         let wait_for_message = async {
             let mut pending = Vec::new();
@@ -1581,7 +2498,15 @@ impl PrivateSetupChannel {
                             Ok(Some(frame)) if frame.starts_with("ERR:") => {
                                 return Err(SandboxSetupError::HelperProtocol(frame));
                             }
-                            Ok(Some(_)) => return Err(SandboxSetupError::HelperProtocol("unexpected setup frame".to_string())),
+                            Ok(Some(frame)) => {
+                                let Some(digest) = frame.strip_prefix("ADMITTED:") else {
+                                    return Err(SandboxSetupError::HelperProtocol("unexpected setup frame".to_string()));
+                                };
+                                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                                    return Err(SandboxSetupError::HelperProtocol("invalid admission digest".to_string()));
+                                }
+                                on_admitted(digest)?;
+                            }
                             Ok(None) => {}
                             Err(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData) => {
                                 return Err(SandboxSetupError::HelperProtocol(error.to_string()));
@@ -1747,6 +2672,22 @@ impl PrivateTargetEnvironment {
 
     fn read_root(&self) -> &Path {
         &self.root
+    }
+
+    fn add_internal(&self, name: &str, value: &str) -> Result<()> {
+        use std::io::Write;
+
+        let bytes = std::fs::read(&self.path)?;
+        let mut environment: HashMap<String, String> = serde_json::from_slice(&bytes)?;
+        environment.insert(name.to_string(), value.to_string());
+        let encoded = serde_json::to_vec(&environment)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        Ok(())
     }
 }
 
@@ -1952,6 +2893,63 @@ fn build_fs_policy(
     net_enabled: bool,
     cwd: &Path,
 ) -> FileSystemSandboxPolicy {
+    build_fs_policy_with_default_read(
+        allow_read,
+        deny_read,
+        deny_read_globs,
+        allow_write,
+        deny_write,
+        deny_write_globs,
+        full_write,
+        full_access,
+        net_enabled,
+        cwd,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_fs_policy(
+    allow_read: &[PathBuf],
+    deny_read: &[PathBuf],
+    deny_read_globs: &[String],
+    allow_write: &[PathBuf],
+    deny_write: &[PathBuf],
+    deny_write_globs: &[String],
+    full_write: bool,
+    full_access: bool,
+    net_enabled: bool,
+    cwd: &Path,
+) -> FileSystemSandboxPolicy {
+    build_fs_policy_with_default_read(
+        allow_read,
+        deny_read,
+        deny_read_globs,
+        allow_write,
+        deny_write,
+        deny_write_globs,
+        full_write,
+        full_access,
+        net_enabled,
+        cwd,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_fs_policy_with_default_read(
+    allow_read: &[PathBuf],
+    deny_read: &[PathBuf],
+    deny_read_globs: &[String],
+    allow_write: &[PathBuf],
+    deny_write: &[PathBuf],
+    deny_write_globs: &[String],
+    full_write: bool,
+    full_access: bool,
+    net_enabled: bool,
+    cwd: &Path,
+    default_full_read: bool,
+) -> FileSystemSandboxPolicy {
     if full_access && deny_read_globs.is_empty() && deny_write_globs.is_empty() {
         return FileSystemSandboxPolicy::unrestricted();
     }
@@ -1970,7 +2968,7 @@ fn build_fs_policy(
     if full_access {
         // The root write grant above supplies the allow side. Dynamic deny
         // globs are appended below and always win inside the FUSE view.
-    } else if allow_read.is_empty() {
+    } else if allow_read.is_empty() && default_full_read {
         entries.push(FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
@@ -1979,12 +2977,14 @@ fn build_fs_policy(
         });
     } else {
         #[cfg(target_os = "linux")]
-        entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::Minimal,
-            },
-            access: FileSystemAccessMode::Read,
-        });
+        if default_full_read {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal,
+                },
+                access: FileSystemAccessMode::Read,
+            });
+        }
         for path in allow_read {
             if let Ok(abs) = resolve_path(cwd, path) {
                 entries.push(FileSystemSandboxEntry {
@@ -1993,7 +2993,8 @@ fn build_fs_policy(
                 });
             }
         }
-        if let Ok(exe) = std::env::current_exe()
+        if default_full_read
+            && let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
             && let Ok(abs) = AbsolutePathBuf::try_from(dir.to_path_buf())
         {
@@ -2002,7 +3003,7 @@ fn build_fs_policy(
                 access: FileSystemAccessMode::Read,
             });
         }
-        if net_enabled {
+        if net_enabled && default_full_read {
             if let Ok(abs) = AbsolutePathBuf::try_from(crate::zerobox_home().join("tmp")) {
                 entries.push(FileSystemSandboxEntry {
                     path: FileSystemPath::Path { path: abs },
@@ -2307,6 +3308,63 @@ fn validate_paths(
             .with_context(|| format!("invalid deny_write path: {}", p.display()))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn host_dynamic_deny_write_globs(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter(|pattern| {
+            // `/__zerobox` is a logical path created inside the tmpfs root.
+            // The read-only runtime/control binds enforce this denial after
+            // bubblewrap; it has no host pathname for the FUSE materializer.
+            pattern.as_str() != "/__zerobox" && !pattern.starts_with("/__zerobox/")
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn reject_reserved_runtime_overlays(
+    allow_read: &[PathBuf],
+    deny_read: &[PathBuf],
+    allow_write: &[PathBuf],
+    deny_write: &[PathBuf],
+) -> Result<()> {
+    let reserved = Path::new("/__zerobox");
+    for path in allow_read
+        .iter()
+        .chain(deny_read)
+        .chain(allow_write)
+        .chain(deny_write)
+    {
+        if path.starts_with(reserved) || reserved.starts_with(path) {
+            anyhow::bail!(
+                "filesystem policy must not overlay the reserved runtime prefix {}",
+                RUNTIME_ROOT
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn protect_runtime_bundle_writes(deny_write: &mut Vec<PathBuf>, bundle: &RuntimeBundle) {
+    if !deny_write.iter().any(|path| path == &bundle.root) {
+        deny_write.push(bundle.root.clone());
+    }
+
+    // The supervisor stays outside the target namespace, but an executable
+    // located beneath a writable project could otherwise be modified through
+    // that project mount while it is running. Keep its physical path read-only
+    // whenever it is distinct from the verified release tree.
+    if let Ok(executable) = std::env::current_exe()
+        && let Ok(executable) = std::fs::canonicalize(executable)
+        && !executable.starts_with(&bundle.root)
+        && !deny_write.iter().any(|path| path == &executable)
+    {
+        deny_write.push(executable);
+    }
 }
 
 fn validate_literal_deny_paths(deny_read: &[PathBuf], deny_write: &[PathBuf]) -> Result<()> {
@@ -2738,6 +3796,68 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn admission_receipt_includes_non_secret_helper_environment_names() {
+        let target = HashMap::from([
+            ("PATH".to_string(), "/__zerobox/runtime/bin".to_string()),
+            ("USER_VALUE".to_string(), "hidden".to_string()),
+        ]);
+        let helper = HashMap::from([
+            (
+                "CODEX_SANDBOX_NETWORK_DISABLED".to_string(),
+                "1".to_string(),
+            ),
+            ("HTTPS_PROXY".to_string(), "hidden".to_string()),
+            (PRIVATE_BIND_MOUNTS_ENV.to_string(), "hidden".to_string()),
+            ("PATH".to_string(), "host-path".to_string()),
+        ]);
+        assert_eq!(
+            admission_helper_environment_names(&target, &helper),
+            vec![
+                "CODEX_SANDBOX_NETWORK_DISABLED".to_string(),
+                "HTTPS_PROXY".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_environment_names_cannot_be_restored_by_the_private_runtime() {
+        let bundle = crate::runtime_bundle::tests::fixture(None, None);
+        let result = Sandbox::command("true")
+            .runtime_bundle(bundle.path(), "shell")
+            .strict()
+            .deny_env(&["CODEX_SANDBOX_NETWORK_DISABLED"])
+            .prepare()
+            .await;
+        let error = result
+            .err()
+            .expect("a mandatory denied runtime variable must block preparation");
+        assert!(error.to_string().contains("CODEX_SANDBOX_NETWORK_DISABLED"));
+    }
+
+    #[test]
+    fn private_runtime_environment_defaults_are_internal_and_denials_win() {
+        let environment = build_private_runtime_env(false, None, &[], &HashMap::new());
+        assert_eq!(
+            environment,
+            HashMap::from([
+                ("USER".to_string(), "sandbox".to_string()),
+                ("SHELL".to_string(), format!("{SHELL_PATH}/bash")),
+                ("TERM".to_string(), "dumb".to_string()),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+            ])
+        );
+        let overrides = HashMap::from([("CUSTOM".to_string(), "explicit".to_string())]);
+        assert_eq!(
+            build_private_runtime_env(false, None, &[], &overrides).get("CUSTOM"),
+            Some(&"explicit".to_string())
+        );
+        assert!(
+            !build_private_runtime_env(false, None, &["CUSTOM".to_string()], &overrides)
+                .contains_key("CUSTOM")
+        );
+    }
+
+    #[test]
     fn linux_helper_environment_does_not_expose_child_values() {
         let child_env = HashMap::from([
             ("PATH".to_string(), "/target/bin".to_string()),
@@ -3111,6 +4231,104 @@ mod tests {
         let pol = fs(&[], &[], &[], &[], false, false, false);
         assert!(pol.has_full_disk_read_access());
         assert!(!pol.has_full_disk_write_access());
+    }
+
+    #[test]
+    fn runtime_bundle_default_does_not_grant_host_root_read() {
+        let pol = build_runtime_fs_policy(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            Path::new("/work"),
+        );
+        assert!(!pol.has_full_disk_read_access());
+        assert!(!pol.can_read_path_with_cwd(Path::new("/usr/bin/env"), Path::new("/work")));
+        assert!(!pol.entries.iter().any(|entry| {
+            matches!(
+                entry.path,
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal
+                }
+            )
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_bundle_is_write_protected_under_a_writable_project() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().join("runtimes/zerobox/test");
+        let bundle = RuntimeBundle {
+            root: root.clone(),
+            component: RuntimeComponent::Shell,
+            shell_root: root.join("components/shell"),
+            component_root: root.join("components/shell"),
+            helper: root.join("helper/zerobox-linux-sandbox"),
+            manifest_sha256: "0".repeat(64),
+            helper_sha256: "0".repeat(64),
+            version: "test".to_string(),
+        };
+        let mut deny_write = Vec::new();
+        protect_runtime_bundle_writes(&mut deny_write, &bundle);
+        assert!(deny_write.contains(&root));
+
+        let policy = build_runtime_fs_policy(
+            &[project.path().to_path_buf()],
+            &[],
+            &[],
+            &[project.path().to_path_buf()],
+            &deny_write,
+            &[],
+            false,
+            false,
+            false,
+            project.path(),
+        );
+        assert!(
+            policy.can_write_path_with_cwd(&project.path().join("work/update"), project.path())
+        );
+        assert!(!policy.can_write_path_with_cwd(&root.join("manifest.json"), project.path()));
+        assert!(!policy.can_write_path_with_cwd(&bundle.helper, project.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_internal_denies_do_not_reach_host_glob_materialization() {
+        let globs = vec![
+            "/__zerobox".to_string(),
+            "/__zerobox/**".to_string(),
+            "/project/.env".to_string(),
+        ];
+        assert_eq!(
+            host_dynamic_deny_write_globs(&globs),
+            vec!["/project/.env".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_aliases_do_not_shadow_explicit_public_path_grants() {
+        let cwd = Path::new("/work");
+        assert!(policy_grants_public_destination(
+            &[PathBuf::from("/usr")],
+            Path::new("/usr/bin"),
+            cwd,
+        ));
+        assert!(policy_grants_public_destination(
+            &[PathBuf::from("/bin/bash")],
+            Path::new("/bin"),
+            cwd,
+        ));
+        assert!(!policy_grants_public_destination(
+            &[PathBuf::from("/opt/project")],
+            Path::new("/bin"),
+            cwd,
+        ));
     }
 
     #[test]
@@ -3504,6 +4722,7 @@ mod tests {
     fn prepared_command_into_command_remains_available_without_managed_resources() {
         let prepared = PreparedCommand {
             cmd: tokio::process::Command::new("echo"),
+            admission_receipt: None,
             resources: ManagedExecutionResources {
                 _proxy_handle: None,
                 _proxy: None,
@@ -3515,6 +4734,9 @@ mod tests {
                 _linux_runtime: None,
                 _exact_unix_socket_fds: Vec::new(),
                 tcp_publication_revocation: None,
+                admission_fd: None,
+                admission_ack: None,
+                admission_control: None,
             },
         };
         let command = prepared.into_command().expect("unmanaged raw command");
@@ -3528,6 +4750,7 @@ mod tests {
         let proxy_root = PrivateProxyRoot::create_in(runs.path()).expect("private proxy root");
         let prepared = PreparedCommand {
             cmd: tokio::process::Command::new("true"),
+            admission_receipt: None,
             resources: ManagedExecutionResources {
                 _proxy_handle: None,
                 _proxy: None,
@@ -3539,6 +4762,9 @@ mod tests {
                 _linux_runtime: None,
                 _exact_unix_socket_fds: Vec::new(),
                 tcp_publication_revocation: None,
+                admission_fd: None,
+                admission_ack: None,
+                admission_control: None,
             },
         };
 
@@ -3559,6 +4785,7 @@ mod tests {
             .env("MANAGED_ROOT", &proxy_root_path);
         let prepared = PreparedCommand {
             cmd,
+            admission_receipt: None,
             resources: ManagedExecutionResources {
                 _proxy_handle: None,
                 _proxy: None,
@@ -3570,6 +4797,9 @@ mod tests {
                 _linux_runtime: None,
                 _exact_unix_socket_fds: Vec::new(),
                 tcp_publication_revocation: None,
+                admission_fd: None,
+                admission_ack: None,
+                admission_control: None,
             },
         };
 
@@ -3656,6 +4886,14 @@ mod tests {
         let s = Sandbox::command("x").linux_sandbox_exe(p("/tmp/zerobox-linux-sandbox"));
 
         assert_eq!(s.linux_sandbox_exe, Some(p("/tmp/zerobox-linux-sandbox")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builder_can_select_a_verified_runtime_bundle_component() {
+        let s = Sandbox::command("x").runtime_bundle("/opt/zerobox-runtime", "shell");
+
+        assert!(s.runtime_bundle.is_some());
     }
 
     // apply_profile
