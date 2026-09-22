@@ -1,5 +1,269 @@
 use crate::support::*;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_uses_an_outer_setup_namespace() {
+    let script = r#"import errno, glob, os, socket, subprocess
+with open('/proc/self/status', encoding='ascii') as status:
+    fields = dict(line.split(':', 1) for line in status if ':' in line)
+assert int(fields['CapEff'].strip(), 16) == 0
+pids = sorted(int(pid) for pid in os.listdir('/proc') if pid.isdigit())
+assert 1 in pids and os.getpid() in pids, pids
+assert subprocess.run(['unshare', '-Ur', '/bin/true'], capture_output=True).returncode != 0
+assert subprocess.run(['ip', '-4', 'route', 'add', '198.51.100.0/24', 'dev', 'lo'], capture_output=True).returncode != 0
+with socket.create_connection(('203.0.113.10', 443), 2) as connection:
+    connection.settimeout(2)
+    connection.sendall(b'\x00')
+    assert connection.recv(1) == b''
+with socket.socket() as replacement:
+    try:
+        replacement.bind(('0.0.0.0', 443))
+    except OSError as error:
+        assert error.errno in (errno.EADDRINUSE, errno.EPERM, errno.EACCES), error
+    else:
+        raise AssertionError('mediated listener replaced')
+for fd in os.listdir('/proc/self/fd'):
+    try:
+        target = os.readlink('/proc/self/fd/' + fd)
+    except FileNotFoundError:
+        continue
+    assert not target.startswith('socket:'), (fd, target)
+assert not glob.glob('/dev/.zerobox-proxy/m-*.sock')
+print('mediated-boundary-ok')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "mediated-boundary-ok\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_preserves_managed_loopback_bridge() {
+    let (port, host) = local_http_server(std::net::Ipv4Addr::LOCALHOST.into());
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-local-binding",
+        &format!("--allow-net=localhost:{port}"),
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "curl",
+        "-fsS",
+        "--max-time",
+        "3",
+        &format!("http://localhost:{port}"),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OK");
+    assert!(host.join().unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_allows_proxy_bypassing_tls_for_an_allowed_hostname() {
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "curl",
+        "--proxy",
+        "",
+        "-fsS",
+        "--max-time",
+        "8",
+        "https://example.com",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Example Domain"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_allows_proxy_bypassing_http_for_an_allowed_hostname() {
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com:80",
+        "--mediated-direct-tcp-port=80",
+        "--",
+        "curl",
+        "--proxy",
+        "",
+        "-fsS",
+        "--max-time",
+        "8",
+        "http://example.com",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Example Domain"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_denies_raw_ip_and_wrong_http_host_without_leaking_the_path() {
+    let script = r#"import socket
+address = socket.gethostbyname('example.com')
+for host in (address, 'not-allowed.invalid'):
+    connection = socket.create_connection((address, 80), 3)
+    connection.sendall(('GET /private?token=secret HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n').encode('ascii'))
+    connection.settimeout(3)
+    try:
+        data = connection.recv(1)
+    except ConnectionResetError:
+        data = b''
+    assert data == b'', (host, data)
+    connection.close()
+print('denied')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com:80",
+        "--mediated-direct-tcp-port=80",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "denied\n");
+    assert!(!stderr(&output).contains("private"), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("secret"), "{}", stderr(&output));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_tcp_denies_private_destinations_even_when_domain_allowed() {
+    let script = r#"import socket
+connection = socket.create_connection(('127.0.0.1', 80), 2)
+connection.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+connection.settimeout(2)
+try:
+    data = connection.recv(1)
+except ConnectionResetError:
+    data = b''
+assert data == b'', data
+print('private-denied')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=localhost:80",
+        "--mediated-direct-tcp-port=80",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "private-denied\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_dns_udp_cannot_escape_the_network_namespace() {
+    let host = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    host.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap();
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    probe.connect(("8.8.8.8", 53)).unwrap();
+    let host_ip = probe.local_addr().unwrap().ip();
+    let host_port = host.local_addr().unwrap().port();
+    let script = format!(
+        r#"import socket
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+    client.sendto(b'must-stay-private', ('{host_ip}', {host_port}))
+print('udp-sent')
+"#
+    );
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        &script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "udp-sent\n");
+    assert_eq!(
+        host.recv_from(&mut [0_u8; 64]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_serves_policy_filtered_tcp_dns() {
+    let script = r#"import socket, struct
+def query(host):
+    packet = bytearray(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+    for label in host.split('.'):
+        packet.append(len(label)); packet.extend(label.encode('ascii'))
+    packet.extend(b'\x00\x00\x01\x00\x01')
+    with socket.create_connection(('8.8.8.8', 53), 2) as dns:
+        dns.sendall(struct.pack('!H', len(packet)) + packet)
+        size = struct.unpack('!H', dns.recv(2))[0]
+        response = b''
+        while len(response) < size:
+            response += dns.recv(size - len(response))
+    return struct.unpack('!H', response[6:8])[0]
+assert query('example.com') > 0
+assert query('not-allowed.invalid') == 0
+print('tcp-dns-ok')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "tcp-dns-ok\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mediated_direct_caps_concurrent_tcp_connections() {
+    let script = r#"import socket
+connections = [socket.create_connection(('203.0.113.10', 443), 2) for _ in range(65)]
+connections[-1].settimeout(2)
+assert connections[-1].recv(1) == b''
+for connection in connections:
+    connection.close()
+print('connection-cap-ok')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-net=example.com",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "connection-cap-ok\n");
+}
+
 #[tokio::test]
 async fn private_listeners_reject_unproxied_host_network_access() {
     let error = zerobox::Sandbox::command("/bin/true")

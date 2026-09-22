@@ -31,6 +31,8 @@ mod docker_broker;
 mod dynamic_fs;
 #[cfg(target_os = "linux")]
 mod linux_runtime;
+#[cfg(target_os = "linux")]
+mod mediated_direct;
 #[cfg(unix)]
 mod process_owner;
 pub mod profile_core;

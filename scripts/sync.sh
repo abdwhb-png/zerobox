@@ -554,6 +554,23 @@ if [ -f "$RUNTIME_BUNDLE_PATCH" ]; then
     fi
 fi
 
+MEDIATED_DIRECT_TCP_PATCH="$SCRIPT_DIR/upstream-mediated-direct-tcp.patch"
+if [ -f "$MEDIATED_DIRECT_TCP_PATCH" ]; then
+    echo "    mediated-direct-tcp"
+    patch --fuzz=0 -p0 < "$MEDIATED_DIRECT_TCP_PATCH"
+    if command -v cargo >/dev/null 2>&1 && command -v rustfmt >/dev/null 2>&1; then
+        cargo fmt -- \
+            upstream/linux-sandbox/src/bwrap.rs \
+            upstream/linux-sandbox/src/landlock.rs \
+            upstream/linux-sandbox/src/lib.rs \
+            upstream/linux-sandbox/src/linux_run_main.rs \
+            upstream/linux-sandbox/src/linux_run_main_tests.rs \
+            upstream/linux-sandbox/src/mediated_direct.rs \
+            upstream/linux-sandbox/src/proxy_routing.rs \
+            upstream/network-proxy/src/runtime.rs
+    fi
+fi
+
 cd -
 
 {

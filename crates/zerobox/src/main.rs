@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub deny_net: Option<Vec<String>>,
 
+    /// Permit hostname-mediated direct IPv4 TCP on an exact destination port.
+    #[arg(long = "mediated-direct-tcp-port", action = clap::ArgAction::Append)]
+    pub mediated_direct_tcp_ports: Vec<u16>,
+
     /// Effective per-execution Docker policy supplied by a trusted launcher.
     #[arg(long, hide = true, value_parser = parse_docker_policy)]
     pub docker_policy: Option<DockerAccessPolicy>,
@@ -486,6 +490,9 @@ async fn tokio_main(
     }
     if let Some(ref domains) = cli.deny_net {
         sandbox = sandbox.deny_net(domains);
+    }
+    for port in &cli.mediated_direct_tcp_ports {
+        sandbox = sandbox.mediated_direct_tcp_port(*port);
     }
     if let Some(ref docker_policy) = cli.docker_policy {
         sandbox = sandbox.docker_access(docker_policy.clone());

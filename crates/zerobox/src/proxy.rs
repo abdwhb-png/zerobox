@@ -8,12 +8,17 @@ use zerobox_network_proxy::{
 
 use crate::secret::SecretStore;
 
+pub struct BuiltProxy {
+    pub(crate) proxy: NetworkProxy,
+    pub(crate) state: Arc<NetworkProxyState>,
+}
+
 pub async fn build_proxy(
     allow_domains: Option<&[String]>,
     allow_host_domains: &[String],
     deny_domains: Option<&[String]>,
     secret_store: &Arc<SecretStore>,
-) -> Result<Option<NetworkProxy>> {
+) -> Result<Option<BuiltProxy>> {
     let has_secrets = !secret_store.is_empty();
     let has_net = allow_domains.is_some() || !allow_host_domains.is_empty() || has_secrets;
     if !has_net {
@@ -70,13 +75,14 @@ pub async fn build_proxy(
         proxy_state.set_header_transformer(secret_store.clone());
     }
 
+    let state = Arc::new(proxy_state);
     let proxy = NetworkProxy::builder()
-        .state(Arc::new(proxy_state))
+        .state(state.clone())
         .managed_by_codex(true)
         .build()
         .await?;
 
-    Ok(Some(proxy))
+    Ok(Some(BuiltProxy { proxy, state }))
 }
 
 /// A ConfigReloader that never reloads (static config for CLI use).
@@ -116,7 +122,11 @@ mod tests {
             .expect("host-only proxy should build")
             .expect("host-only route should require a proxy");
 
-        let config = proxy.current_cfg().await.expect("proxy config should load");
+        let config = proxy
+            .proxy
+            .current_cfg()
+            .await
+            .expect("proxy config should load");
         assert_eq!(config.network.allowed_domains(), None);
         assert_eq!(config.network.allowed_host_domains(), Some(host_routes));
     }

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::Child;
 use zerobox_protocol::config_types::WindowsSandboxLevel;
 use zerobox_protocol::docker::DockerAccessPolicy;
+use zerobox_protocol::mediated_direct::MediatedDirectListenerManifest;
 use zerobox_protocol::models::PermissionProfile;
 use zerobox_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
@@ -244,6 +245,7 @@ pub struct Sandbox {
     allow_net: Option<Vec<String>>,
     allow_host_net: Vec<String>,
     deny_net: Vec<String>,
+    mediated_direct_tcp_ports: Vec<u16>,
     docker_access: Option<DockerAccessPolicy>,
     secrets: Vec<(String, String)>,
     secret_hosts: Vec<(String, String)>,
@@ -387,6 +389,7 @@ impl Sandbox {
             allow_net: None,
             allow_host_net: Vec::new(),
             deny_net: Vec::new(),
+            mediated_direct_tcp_ports: Vec::new(),
             docker_access: None,
             secrets: Vec::new(),
             secret_hosts: Vec::new(),
@@ -542,6 +545,11 @@ impl Sandbox {
     pub fn allow_host_net(mut self, domains: &[impl AsRef<str>]) -> Self {
         self.allow_host_net
             .extend(domains.iter().map(|s| s.as_ref().to_string()));
+        self
+    }
+
+    pub fn mediated_direct_tcp_port(mut self, port: u16) -> Self {
+        self.mediated_direct_tcp_ports.push(port);
         self
     }
 
@@ -767,6 +775,7 @@ impl Sandbox {
             mut allow_net,
             mut allow_host_net,
             mut deny_net,
+            mut mediated_direct_tcp_ports,
             mut docker_access,
             mut secrets,
             mut secret_hosts,
@@ -787,6 +796,13 @@ impl Sandbox {
             allow_unix_sockets,
             tcp_publications,
         } = self;
+
+        if !mediated_direct_tcp_ports.is_empty() {
+            mediated_direct_tcp_ports =
+                MediatedDirectListenerManifest::new(mediated_direct_tcp_ports)
+                    .context("invalid mediated direct TCP port grant")?
+                    .ports;
+        }
 
         let cwd = match cwd {
             Some(p) => p,
@@ -1295,11 +1311,24 @@ impl Sandbox {
         }
 
         let _proxy_handle = match proxy {
-            Some(ref p) => Some(p.run().await.context("failed to start network proxy")?),
+            Some(ref p) => Some(
+                p.proxy
+                    .run()
+                    .await
+                    .context("failed to start network proxy")?,
+            ),
             None => None,
         };
 
         let managed_network = proxy.is_some() || docker_broker.is_some();
+        if !mediated_direct_tcp_ports.is_empty()
+            && (sandbox_type != SandboxType::LinuxSeccomp || proxy.is_none())
+        {
+            return Err(anyhow::anyhow!(
+                "mediated direct TCP requires the Linux bubblewrap sandbox and a managed domain proxy"
+            )
+            .into());
+        }
         let proxy_root = if (managed_network || !tcp_publications.is_empty())
             && sandbox_type == SandboxType::LinuxSeccomp
         {
@@ -1312,6 +1341,25 @@ impl Sandbox {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let mediated_direct_broker = if mediated_direct_tcp_ports.is_empty() {
+            None
+        } else {
+            Some(crate::mediated_direct::MediatedDirectBroker::start(
+                proxy_root
+                    .as_ref()
+                    .expect("mediated direct TCP requires a private proxy root")
+                    .path(),
+                proxy
+                    .as_ref()
+                    .expect("mediated direct TCP requires a managed proxy")
+                    .state
+                    .clone(),
+                mediated_direct_tcp_ports.clone(),
+            )?)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mediated_direct_broker: Option<()> = None;
         #[cfg(target_os = "linux")]
         let tcp_publication_revocation = if tcp_publications.is_empty() {
             None
@@ -1346,7 +1394,7 @@ impl Sandbox {
                 permissions: &permissions,
                 sandbox: sandbox_type,
                 enforce_managed_network: managed_network,
-                network: proxy.as_ref(),
+                network: proxy.as_ref().map(|proxy| &proxy.proxy),
                 proxy_root: proxy_root.as_ref().map(PrivateProxyRoot::path),
                 setup_status_fd: setup_channel.as_ref().map(PrivateSetupChannel::write_fd),
                 sandbox_policy_cwd: &cwd,
@@ -1399,6 +1447,26 @@ impl Sandbox {
                 ],
             );
         }
+        if !mediated_direct_tcp_ports.is_empty() {
+            let separator = exec_request
+                .command
+                .iter()
+                .position(|argument| argument == "--")
+                .expect("Linux sandbox command must have a separator");
+            let broker_path = mediated_direct_broker
+                .as_ref()
+                .expect("mediated direct TCP broker is available")
+                .socket_path()
+                .to_string_lossy()
+                .into_owned();
+            let mut options = vec!["--mediated-direct-broker-path".to_string(), broker_path];
+            options.extend(
+                mediated_direct_tcp_ports
+                    .iter()
+                    .flat_map(|port| ["--mediated-direct-tcp-port".to_string(), port.to_string()]),
+            );
+            exec_request.command.splice(separator..separator, options);
+        }
 
         let mut cmd = tokio::process::Command::new(&exec_request.command[0]);
         cmd.args(&exec_request.command[1..]);
@@ -1417,7 +1485,7 @@ impl Sandbox {
 
         let mut final_env = exec_request.env;
         if let Some(ref proxy) = proxy {
-            proxy.apply_to_env(&mut final_env);
+            proxy.proxy.apply_to_env(&mut final_env);
             for key in zerobox_network_proxy::NO_PROXY_ENV_KEYS {
                 final_env.remove(*key);
             }
@@ -1633,8 +1701,21 @@ impl Sandbox {
                 if bundle.component == RuntimeComponent::Analysis {
                     mounts.push(serde_json::json!({"source": bundle.component_root, "destination": ANALYSIS_ROOT, "access":"ro", "origin":"runtime"}));
                 }
+                let admission_schema = if mediated_direct_tcp_ports.is_empty() { 1 } else { 2 };
+                let mut admission_network = serde_json::json!({
+                    "mode": if net_enabled { "domain-allowlist" } else { "deny-all" },
+                    "allow": allow_net.unwrap_or_default(),
+                    "allowHost": allow_host_net,
+                    "deny": deny_net,
+                    "allowLocalBinding": allow_local_binding,
+                });
+                if !mediated_direct_tcp_ports.is_empty() {
+                    admission_network["mediatedDirectTcp"] = serde_json::json!({
+                        "ports": mediated_direct_tcp_ports,
+                    });
+                }
                 let receipt = serde_json::json!({
-                    "schema": 1,
+                    "schema": admission_schema,
                     "runtime": {
                         "target": "x86_64-unknown-linux-gnu",
                         "version": bundle.version,
@@ -1652,13 +1733,7 @@ impl Sandbox {
                         "denyWrite": display_paths(&deny_write),
                         "denyWriteGlobs": deny_write_globs,
                     },
-                    "network": {
-                        "mode": if net_enabled { "domain-allowlist" } else { "deny-all" },
-                        "allow": allow_net.unwrap_or_default(),
-                        "allowHost": allow_host_net,
-                        "deny": deny_net,
-                        "allowLocalBinding": allow_local_binding,
-                    },
+                    "network": admission_network,
                     "resources": {
                         "unixSockets": allow_unix_sockets.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
                         "tcpPublications": tcp_publications.iter().map(|publication| serde_json::json!({"transport":"tcp","scope": publication.scope,"listen":publication.listen,"target":publication.target})).collect::<Vec<_>>(),
@@ -1718,8 +1793,9 @@ impl Sandbox {
             admission_receipt,
             resources: ManagedExecutionResources {
                 _proxy_handle,
-                _proxy: proxy,
+                _proxy: proxy.map(|proxy| proxy.proxy),
                 _proxy_root: proxy_root,
+                _mediated_direct_broker: mediated_direct_broker,
                 setup_channel,
                 _target_env_file: target_env_file,
                 _dynamic_fs: dynamic_fs,
@@ -1891,6 +1967,10 @@ struct ManagedExecutionResources {
     _proxy_handle: Option<zerobox_network_proxy::NetworkProxyHandle>,
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
     _proxy_root: Option<PrivateProxyRoot>,
+    #[cfg(target_os = "linux")]
+    _mediated_direct_broker: Option<crate::mediated_direct::MediatedDirectBroker>,
+    #[cfg(not(target_os = "linux"))]
+    _mediated_direct_broker: Option<()>,
     setup_channel: Option<PrivateSetupChannel>,
     _target_env_file: Option<PrivateTargetEnvironment>,
     #[cfg(target_os = "linux")]
@@ -1939,6 +2019,7 @@ impl ManagedExecutionResources {
         self._proxy_handle.is_none()
             && self._proxy.is_none()
             && self._proxy_root.is_none()
+            && self._mediated_direct_broker.is_none()
             && self.setup_channel.is_none()
             && self._target_env_file.is_none()
             && self._dynamic_fs.is_none()
@@ -3834,6 +3915,58 @@ mod tests {
         assert!(error.to_string().contains("CODEX_SANDBOX_NETWORK_DISABLED"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mediated_direct_admission_uses_schema_two_with_exact_canonical_ports() {
+        let bundle = crate::runtime_bundle::tests::fixture(None, None);
+        let prepared = Sandbox::command("true")
+            .runtime_bundle(bundle.path(), "shell")
+            .strict()
+            .allow_net(&["example.com"])
+            .mediated_direct_tcp_port(443)
+            .mediated_direct_tcp_port(80)
+            .mediated_direct_tcp_port(443)
+            .prepare()
+            .await
+            .expect("prepare mediated direct runtime");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            prepared
+                .admission_receipt()
+                .expect("runtime admission receipt"),
+        )
+        .unwrap();
+
+        assert_eq!(receipt["schema"], 2);
+        assert_eq!(
+            receipt["network"]["mediatedDirectTcp"]["ports"],
+            serde_json::json!([80, 443])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admission_preserves_schema_one_when_mediated_direct_is_disabled() {
+        let bundle = crate::runtime_bundle::tests::fixture(None, None);
+        let prepared = Sandbox::command("true")
+            .runtime_bundle(bundle.path(), "shell")
+            .strict()
+            .prepare()
+            .await
+            .expect("prepare runtime without mediated direct");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            prepared
+                .admission_receipt()
+                .expect("runtime admission receipt"),
+        )
+        .unwrap();
+
+        assert_eq!(receipt["schema"], 1);
+        assert!(
+            receipt["network"].get("mediatedDirectTcp").is_none(),
+            "schema one receipt must remain byte-contract compatible"
+        );
+    }
+
     #[test]
     fn private_runtime_environment_defaults_are_internal_and_denials_win() {
         let environment = build_private_runtime_env(false, None, &[], &HashMap::new());
@@ -4727,6 +4860,7 @@ mod tests {
                 _proxy_handle: None,
                 _proxy: None,
                 _proxy_root: None,
+                _mediated_direct_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
@@ -4755,6 +4889,7 @@ mod tests {
                 _proxy_handle: None,
                 _proxy: None,
                 _proxy_root: Some(proxy_root),
+                _mediated_direct_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
@@ -4790,6 +4925,7 @@ mod tests {
                 _proxy_handle: None,
                 _proxy: None,
                 _proxy_root: Some(proxy_root),
+                _mediated_direct_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,

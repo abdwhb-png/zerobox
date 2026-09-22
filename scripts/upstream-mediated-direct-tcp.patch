@@ -1,0 +1,830 @@
+--- upstream/linux-sandbox/src/bwrap.rs
++++ upstream/linux-sandbox/src/bwrap.rs
+@@ -65,6 +65,9 @@
+     pub mount_proc: bool,
+     /// How networking should be configured inside the bubblewrap sandbox.
+     pub network_mode: BwrapNetworkMode,
++    /// The trusted supervisor already created and configured an isolated
++    /// network namespace for mediated direct TCP.
++    pub mediated_direct_tcp: bool,
+     /// Optional maximum depth for expanding unreadable glob patterns with ripgrep.
+     ///
+     /// Keep this uncapped by default so existing nested deny-read matches are
+@@ -77,6 +80,7 @@
+         Self {
+             mount_proc: true,
+             network_mode: BwrapNetworkMode::FullAccess,
++            mediated_direct_tcp: false,
+             glob_scan_max_depth: None,
+         }
+     }
+@@ -280,9 +284,15 @@
+         "--disable-userns".to_string(),
+         "--unshare-pid".to_string(),
+     ];
+-    if options.network_mode.should_unshare_network() {
++    if options.mediated_direct_tcp {
++        args.push("--assert-userns-disabled".to_string());
++    }
++    if options.network_mode.should_unshare_network() && !options.mediated_direct_tcp {
+         args.push("--unshare-net".to_string());
+     }
++    if options.mediated_direct_tcp {
++        args.extend(["--cap-drop".to_string(), "ALL".to_string()]);
++    }
+     if options.mount_proc {
+         args.push("--proc".to_string());
+         args.push("/proc".to_string());
+@@ -330,10 +340,16 @@
+     // This must immediately follow --unshare-user: user namespaces are only
+     // needed for bubblewrap setup, never for the sandboxed target.
+     args.push("--disable-userns".to_string());
++    if options.mediated_direct_tcp {
++        args.push("--assert-userns-disabled".to_string());
++    }
+     args.push("--unshare-pid".to_string());
+-    if options.network_mode.should_unshare_network() {
++    if options.network_mode.should_unshare_network() && !options.mediated_direct_tcp {
+         args.push("--unshare-net".to_string());
+     }
++    if options.mediated_direct_tcp {
++        args.extend(["--cap-drop".to_string(), "ALL".to_string()]);
++    }
+     // Mount a fresh /proc unless the caller explicitly disables it.
+     if options.mount_proc {
+         args.push("--proc".to_string());
+@@ -1608,6 +1624,34 @@
+         );
+     }
+ 
++    #[test]
++    fn mediated_direct_keeps_outer_network_and_drops_target_capabilities() {
++        let args = create_bwrap_command_args(
++            vec!["/bin/true".to_string()],
++            &FileSystemSandboxPolicy::unrestricted(),
++            Path::new("/"),
++            Path::new("/"),
++            BwrapOptions {
++                network_mode: BwrapNetworkMode::ProxyOnly,
++                mediated_direct_tcp: true,
++                ..Default::default()
++            },
++        )
++        .expect("create mediated bwrap args")
++        .args;
++
++        assert!(!args.iter().any(|argument| argument == "--unshare-net"));
++        assert!(args.iter().any(|argument| argument == "--disable-userns"));
++        assert!(
++            args.iter()
++                .any(|argument| argument == "--assert-userns-disabled")
++        );
++        assert!(
++            args.windows(2)
++                .any(|arguments| arguments == ["--cap-drop", "ALL"])
++        );
++    }
++
+     #[test]
+     fn full_disk_write_with_unreadable_glob_still_wraps_and_masks_match() {
+         if !ripgrep_available() {
+--- upstream/linux-sandbox/src/landlock.rs
++++ upstream/linux-sandbox/src/landlock.rs
+@@ -45,6 +45,7 @@
+     apply_landlock_fs: bool,
+     allow_network_for_proxy: bool,
+     proxy_routed_network: bool,
++    mediated_direct_network: bool,
+ ) -> Result<()> {
+     let (file_system_sandbox_policy, network_sandbox_policy) =
+         permission_profile.to_runtime_permissions();
+@@ -52,6 +53,7 @@
+         network_sandbox_policy,
+         allow_network_for_proxy,
+         proxy_routed_network,
++        mediated_direct_network,
+     );
+ 
+     // `PR_SET_NO_NEW_PRIVS` is required for seccomp, but it also prevents
+@@ -93,6 +95,8 @@
+     UnixSocketOnly,
+     ProxyRouted,
+     ProxyRoutedWithUnixSockets,
++    ProxyRoutedMediated,
++    ProxyRoutedMediatedWithUnixSockets,
+ }
+ 
+ fn should_install_network_seccomp(
+@@ -108,6 +112,7 @@
+     network_sandbox_policy: NetworkSandboxPolicy,
+     allow_network_for_proxy: bool,
+     proxy_routed_network: bool,
++    mediated_direct_network: bool,
+ ) -> Option<NetworkSeccompMode> {
+     if !should_install_network_seccomp(network_sandbox_policy, allow_network_for_proxy) {
+         None
+@@ -116,7 +121,11 @@
+         if proxy_routed_network
+             || std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1")
+         {
+-            Some(if allow_unix_sockets {
++            Some(if mediated_direct_network && allow_unix_sockets {
++                NetworkSeccompMode::ProxyRoutedMediatedWithUnixSockets
++            } else if mediated_direct_network {
++                NetworkSeccompMode::ProxyRoutedMediated
++            } else if allow_unix_sockets {
+                 NetworkSeccompMode::ProxyRoutedWithUnixSockets
+             } else {
+                 NetworkSeccompMode::ProxyRouted
+@@ -299,8 +308,20 @@
+                 ],
+             );
+         }
+-        NetworkSeccompMode::ProxyRouted | NetworkSeccompMode::ProxyRoutedWithUnixSockets => {
+-            let allow_unix_sockets = matches!(mode, NetworkSeccompMode::ProxyRoutedWithUnixSockets);
++        NetworkSeccompMode::ProxyRouted
++        | NetworkSeccompMode::ProxyRoutedWithUnixSockets
++        | NetworkSeccompMode::ProxyRoutedMediated
++        | NetworkSeccompMode::ProxyRoutedMediatedWithUnixSockets => {
++            let allow_unix_sockets = matches!(
++                mode,
++                NetworkSeccompMode::ProxyRoutedWithUnixSockets
++                    | NetworkSeccompMode::ProxyRoutedMediatedWithUnixSockets
++            );
++            let allow_ipv4_dns_udp = matches!(
++                mode,
++                NetworkSeccompMode::ProxyRoutedMediated
++                    | NetworkSeccompMode::ProxyRoutedMediatedWithUnixSockets
++            );
+             // In proxy-routed mode we allow IP sockets in the isolated
+             // namespace (used to reach the local TCP bridge) but deny all
+             // other socket families. Exact Unix socket grants optionally add
+@@ -372,6 +393,12 @@
+             const SOCK_TYPE_MASK: u64 = 0xf;
+             for domain in [libc::AF_INET, libc::AF_INET6] {
+                 for socket_type in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
++                    if allow_ipv4_dns_udp
++                        && domain == libc::AF_INET
++                        && socket_type == libc::SOCK_DGRAM
++                    {
++                        continue;
++                    }
+                     socket_rules.push(SeccompRule::new(vec![
+                         SeccompCondition::new(
+                             0,
+@@ -468,6 +495,7 @@
+                 NetworkSandboxPolicy::Enabled,
+                 /*allow_network_for_proxy*/ true,
+                 /*proxy_routed_network*/ true,
++                /*mediated_direct_network*/ false,
+             ),
+             Some(NetworkSeccompMode::ProxyRouted)
+         );
+@@ -501,6 +529,44 @@
+     }
+ 
+     #[test]
++    fn mediated_proxy_seccomp_allows_only_ipv4_udp_for_local_dns()
++    -> Result<(), Box<dyn std::error::Error>> {
++        set_no_new_privs()?;
++        install_network_seccomp_filter_on_current_thread(NetworkSeccompMode::ProxyRoutedMediated)?;
++
++        let ipv4_udp = unsafe {
++            libc::socket(
++                libc::AF_INET,
++                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
++                0,
++            )
++        };
++        assert!(
++            ipv4_udp >= 0,
++            "IPv4 UDP is required for the local DNS mediator"
++        );
++        unsafe { libc::close(ipv4_udp) };
++
++        for (domain, socket_type) in [
++            (libc::AF_INET6, libc::SOCK_DGRAM),
++            (libc::AF_INET, libc::SOCK_RAW),
++            (libc::AF_INET6, libc::SOCK_RAW),
++        ] {
++            let fd = unsafe {
++                libc::socket(
++                    domain,
++                    socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
++                    0,
++                )
++            };
++            assert_eq!(fd, -1);
++            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
++        }
++
++        Ok(())
++    }
++
++    #[test]
+     fn proxy_routed_seccomp_rejects_inbound_tcp_listener() -> Result<(), Box<dyn std::error::Error>>
+     {
+         set_no_new_privs()?;
+@@ -541,6 +607,7 @@
+                 NetworkSandboxPolicy::Restricted,
+                 /*allow_network_for_proxy*/ false,
+                 /*proxy_routed_network*/ false,
++                /*mediated_direct_network*/ false,
+             ),
+             Some(NetworkSeccompMode::Restricted)
+         );
+@@ -553,6 +620,7 @@
+                 NetworkSandboxPolicy::Enabled,
+                 /*allow_network_for_proxy*/ false,
+                 /*proxy_routed_network*/ false,
++                /*mediated_direct_network*/ false,
+             ),
+             None
+         );
+--- upstream/linux-sandbox/src/lib.rs
++++ upstream/linux-sandbox/src/lib.rs
+@@ -20,6 +20,8 @@
+ #[cfg(target_os = "linux")]
+ mod linux_run_main;
+ #[cfg(target_os = "linux")]
++mod mediated_direct;
++#[cfg(target_os = "linux")]
+ mod proxy_routing;
+ 
+ #[cfg(target_os = "linux")]
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -135,6 +135,14 @@
+     #[arg(long = "proxy-route-spec", hide = true)]
+     pub proxy_route_spec: Option<String>,
+ 
++    /// Exact destination ports intercepted by the trusted direct TCP gateway.
++    #[arg(long = "mediated-direct-tcp-port", hide = true, action = clap::ArgAction::Append)]
++    pub mediated_direct_tcp_ports: Vec<u16>,
++
++    /// Owner-only host broker socket created by the trusted Zerobox parent.
++    #[arg(long = "mediated-direct-broker-path", hide = true)]
++    pub mediated_direct_broker_path: Option<PathBuf>,
++
+     /// Explicit private root for host-side managed proxy bridge sockets.
+     #[arg(long = "proxy-root", hide = true)]
+     pub proxy_root: Option<PathBuf>,
+@@ -182,6 +190,8 @@
+         apply_seccomp_then_exec,
+         allow_network_for_proxy,
+         proxy_route_spec,
++        mediated_direct_tcp_ports,
++        mediated_direct_broker_path,
+         proxy_root,
+         tcp_publication_spec,
+         tcp_publication_revoke_fd,
+@@ -196,6 +206,9 @@
+     }
+     let target_environment = load_target_environment(setup_status_fd);
+     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
++    if !mediated_direct_tcp_ports.is_empty() && (use_legacy_landlock || !allow_network_for_proxy) {
++        panic!("mediated direct TCP requires Bubblewrap managed proxy mode");
++    }
+     let EffectivePermissions {
+         permission_profile,
+         file_system_sandbox_policy,
+@@ -242,6 +255,7 @@
+             /*apply_landlock_fs*/ false,
+             allow_network_for_proxy,
+             proxy_routing_active,
++            !mediated_direct_tcp_ports.is_empty(),
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+@@ -266,6 +280,7 @@
+             /*apply_landlock_fs*/ false,
+             allow_network_for_proxy,
+             /*proxy_routed_network*/ false,
++            /*mediated_direct_network*/ false,
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+@@ -305,11 +320,24 @@
+                     panic!("failed to prepare TCP publication host bridge: {err}")
+                 })
+         });
++        if !mediated_direct_tcp_ports.is_empty() {
++            let broker_path = mediated_direct_broker_path.as_deref().unwrap_or_else(|| {
++                panic!("mediated direct TCP requires an explicit private broker path")
++            });
++            crate::mediated_direct::enter_setup_namespace_and_transfer_listeners(
++                &mediated_direct_tcp_ports,
++                broker_path,
++            )
++            .unwrap_or_else(|error| {
++                panic!("failed to prepare mediated network namespace: {error}")
++            });
++        }
+         let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
+             sandbox_policy_cwd: &sandbox_policy_cwd,
+             command_cwd: command_cwd.as_deref(),
+             permission_profile: &permission_profile,
+             allow_network_for_proxy,
++            mediated_direct_tcp_ports: &mediated_direct_tcp_ports,
+             proxy_route_spec,
+             tcp_publication_spec: tcp_publication_host
+                 .as_ref()
+@@ -325,6 +353,7 @@
+             inner,
+             !no_proc,
+             allow_network_for_proxy,
++            !mediated_direct_tcp_ports.is_empty(),
+             private_proxy_source,
+             private_bind_mounts,
+             tcp_publication_host.is_some(),
+@@ -338,6 +367,7 @@
+         /*apply_landlock_fs*/ true,
+         allow_network_for_proxy,
+         /*proxy_routed_network*/ false,
++        /*mediated_direct_network*/ false,
+     ) {
+         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
+     }
+@@ -506,6 +536,7 @@
+     inner: Vec<String>,
+     mount_proc: bool,
+     allow_network_for_proxy: bool,
++    mediated_direct_tcp: bool,
+     proxy_root: Option<&Path>,
+     private_bind_mounts: Vec<PreparedPrivateBindMount>,
+     keep_parent_for_tcp_publication: bool,
+@@ -531,6 +562,7 @@
+     let options = BwrapOptions {
+         mount_proc,
+         network_mode,
++        mediated_direct_tcp,
+         ..Default::default()
+     };
+     let mut bwrap_args = build_bwrap_argv(
+@@ -2131,6 +2163,7 @@
+     command_cwd: Option<&'a Path>,
+     permission_profile: &'a PermissionProfile,
+     allow_network_for_proxy: bool,
++    mediated_direct_tcp_ports: &'a [u16],
+     proxy_route_spec: Option<String>,
+     tcp_publication_spec: Option<String>,
+     setup_status_fd: Option<i32>,
+@@ -2321,6 +2354,7 @@
+         command_cwd,
+         permission_profile,
+         allow_network_for_proxy,
++        mediated_direct_tcp_ports,
+         proxy_route_spec,
+         tcp_publication_spec,
+         setup_status_fd,
+@@ -2362,6 +2396,10 @@
+         inner.push("--proxy-route-spec".to_string());
+         inner.push(proxy_route_spec);
+     }
++    for port in mediated_direct_tcp_ports {
++        inner.push("--mediated-direct-tcp-port".to_string());
++        inner.push(port.to_string());
++    }
+     if let Some(setup_status_fd) = setup_status_fd {
+         inner.push("--setup-status-fd".to_string());
+         inner.push(setup_status_fd.to_string());
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -576,6 +576,7 @@
+         command_cwd: Some(Path::new("/tmp/link")),
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: true,
++        mediated_direct_tcp_ports: &[],
+         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -587,6 +588,29 @@
+ }
+ 
+ #[test]
++fn mediated_direct_inner_command_includes_exact_ports() {
++    let permission_profile = read_only_permission_profile();
++    let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
++        sandbox_policy_cwd: Path::new("/tmp"),
++        command_cwd: Some(Path::new("/tmp/link")),
++        permission_profile: &permission_profile,
++        allow_network_for_proxy: true,
++        mediated_direct_tcp_ports: &[80, 443],
++        proxy_route_spec: Some("{\"routes\":[]}".to_string()),
++        tcp_publication_spec: None,
++        setup_status_fd: None,
++        command: vec!["/bin/true".to_string()],
++    });
++
++    let ports = args
++        .windows(2)
++        .filter(|arguments| arguments[0] == "--mediated-direct-tcp-port")
++        .map(|arguments| arguments[1].as_str())
++        .collect::<Vec<_>>();
++    assert_eq!(ports, vec!["80", "443"]);
++}
++
++#[test]
+ fn inner_command_includes_permission_profile_flag() {
+     let permission_profile = read_only_permission_profile();
+     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
+@@ -594,6 +618,7 @@
+         command_cwd: Some(Path::new("/tmp/link")),
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
++        mediated_direct_tcp_ports: &[],
+         proxy_route_spec: None,
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -615,6 +640,7 @@
+         command_cwd: Some(Path::new("/tmp/link")),
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
++        mediated_direct_tcp_ports: &[],
+         proxy_route_spec: None,
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -633,6 +659,7 @@
+             command_cwd: Some(Path::new("/tmp/link")),
+             permission_profile: &permission_profile,
+             allow_network_for_proxy: true,
++            mediated_direct_tcp_ports: &[],
+             proxy_route_spec: None,
+             tcp_publication_spec: None,
+             setup_status_fd: None,
+--- /dev/null
++++ upstream/linux-sandbox/src/mediated_direct.rs
+@@ -0,0 +1,279 @@
++use std::fs;
++use std::io;
++use std::io::Read;
++use std::net::TcpListener;
++use std::net::UdpSocket;
++use std::os::fd::AsRawFd;
++use std::os::unix::net::UnixStream;
++use std::path::Path;
++use std::time::Duration;
++
++use zerobox_protocol::mediated_direct::MEDIATED_DIRECT_ACK;
++use zerobox_protocol::mediated_direct::MediatedDirectListenerManifest;
++
++pub(crate) fn enter_setup_namespace_and_transfer_listeners(
++    ports: &[u16],
++    broker_path: &Path,
++) -> io::Result<()> {
++    let manifest = MediatedDirectListenerManifest::new(ports.to_vec())?;
++    enter_setup_namespaces()?;
++    crate::proxy_routing::ensure_loopback_interface_up()?;
++    install_local_ipv4_route()?;
++
++    let mut direct_listeners = Vec::with_capacity(manifest.ports.len());
++    for port in &manifest.ports {
++        direct_listeners.push(TcpListener::bind(("0.0.0.0", *port)).map_err(|error| {
++            io::Error::new(error.kind(), format!("bind mediated port {port}: {error}"))
++        })?);
++    }
++    let dns_udp = UdpSocket::bind(("0.0.0.0", 53))?;
++    let dns_tcp = TcpListener::bind(("0.0.0.0", 53))?;
++
++    let mut broker = UnixStream::connect(broker_path)?;
++    broker.set_read_timeout(Some(Duration::from_secs(5)))?;
++    send_listener_descriptors(&broker, &manifest, &direct_listeners, &dns_udp, &dns_tcp)?;
++    let mut ack = [0_u8; 1];
++    broker.read_exact(&mut ack)?;
++    if ack[0] != MEDIATED_DIRECT_ACK {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "mediated broker returned an invalid acknowledgement",
++        ));
++    }
++    Ok(())
++}
++
++fn send_listener_descriptors(
++    broker: &UnixStream,
++    manifest: &MediatedDirectListenerManifest,
++    direct_listeners: &[TcpListener],
++    dns_udp: &UdpSocket,
++    dns_tcp: &TcpListener,
++) -> io::Result<()> {
++    let payload = manifest.encode();
++    let mut descriptors = direct_listeners
++        .iter()
++        .map(AsRawFd::as_raw_fd)
++        .collect::<Vec<_>>();
++    descriptors.extend([dns_udp.as_raw_fd(), dns_tcp.as_raw_fd()]);
++    if descriptors.len() != manifest.descriptor_count() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            "mediated listener descriptor count mismatch",
++        ));
++    }
++
++    let mut io_vector = libc::iovec {
++        iov_base: payload.as_ptr().cast_mut().cast(),
++        iov_len: payload.len(),
++    };
++    let descriptor_bytes = descriptors.len() * std::mem::size_of::<libc::c_int>();
++    let control_len = unsafe { libc::CMSG_SPACE(descriptor_bytes as libc::c_uint) } as usize;
++    let mut control = vec![0_u8; control_len];
++    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
++    message.msg_iov = &mut io_vector;
++    message.msg_iovlen = 1;
++    message.msg_control = control.as_mut_ptr().cast();
++    message.msg_controllen = control.len();
++
++    unsafe {
++        let header = libc::CMSG_FIRSTHDR(&message);
++        if header.is_null() {
++            return Err(io::Error::other(
++                "could not allocate mediated descriptor message",
++            ));
++        }
++        (*header).cmsg_level = libc::SOL_SOCKET;
++        (*header).cmsg_type = libc::SCM_RIGHTS;
++        (*header).cmsg_len = libc::CMSG_LEN(descriptor_bytes as libc::c_uint) as usize;
++        std::ptr::copy_nonoverlapping(
++            descriptors.as_ptr(),
++            libc::CMSG_DATA(header).cast::<libc::c_int>(),
++            descriptors.len(),
++        );
++    }
++
++    let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
++    if sent < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if sent as usize != payload.len() {
++        return Err(io::Error::new(
++            io::ErrorKind::WriteZero,
++            "mediated descriptor message was truncated",
++        ));
++    }
++    Ok(())
++}
++
++fn enter_setup_namespaces() -> io::Result<()> {
++    let outer_uid = unsafe { libc::geteuid() };
++    let outer_gid = unsafe { libc::getegid() };
++    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    match fs::write("/proc/self/setgroups", "deny\n") {
++        Ok(()) => {}
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++        Err(error) => return Err(error),
++    }
++    fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1\n"))?;
++    fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1\n"))?;
++    if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
++}
++
++fn install_local_ipv4_route() -> io::Result<()> {
++    #[repr(C)]
++    struct NetlinkHeader {
++        length: u32,
++        message_type: u16,
++        flags: u16,
++        sequence: u32,
++        process_id: u32,
++    }
++
++    #[repr(C)]
++    struct RouteMessage {
++        family: u8,
++        destination_prefix_length: u8,
++        source_prefix_length: u8,
++        tos: u8,
++        table: u8,
++        protocol: u8,
++        scope: u8,
++        route_type: u8,
++        flags: u32,
++    }
++
++    #[repr(C)]
++    struct RouteAttribute {
++        length: u16,
++        attribute_type: u16,
++        output_interface: u32,
++    }
++
++    #[repr(C)]
++    struct RouteRequest {
++        header: NetlinkHeader,
++        route: RouteMessage,
++        output_interface: RouteAttribute,
++    }
++
++    let interface = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
++    if interface == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let request = RouteRequest {
++        header: NetlinkHeader {
++            length: std::mem::size_of::<RouteRequest>() as u32,
++            message_type: libc::RTM_NEWROUTE,
++            flags: (libc::NLM_F_REQUEST | libc::NLM_F_ACK | libc::NLM_F_CREATE | libc::NLM_F_EXCL)
++                as u16,
++            sequence: 1,
++            process_id: 0,
++        },
++        route: RouteMessage {
++            family: libc::AF_INET as u8,
++            destination_prefix_length: 0,
++            source_prefix_length: 0,
++            tos: 0,
++            table: libc::RT_TABLE_LOCAL,
++            protocol: libc::RTPROT_BOOT,
++            scope: libc::RT_SCOPE_HOST,
++            route_type: libc::RTN_LOCAL,
++            flags: 0,
++        },
++        output_interface: RouteAttribute {
++            length: std::mem::size_of::<RouteAttribute>() as u16,
++            attribute_type: libc::RTA_OIF,
++            output_interface: interface,
++        },
++    };
++
++    let socket = unsafe {
++        libc::socket(
++            libc::AF_NETLINK,
++            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
++            libc::NETLINK_ROUTE,
++        )
++    };
++    if socket < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let result = send_route_request(socket, &request);
++    let close_result = unsafe { libc::close(socket) };
++    if let Err(error) = result {
++        return Err(error);
++    }
++    if close_result != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
++}
++
++fn send_route_request<T>(socket: libc::c_int, request: &T) -> io::Result<()> {
++    let mut kernel = unsafe { std::mem::zeroed::<libc::sockaddr_nl>() };
++    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
++    let sent = unsafe {
++        libc::sendto(
++            socket,
++            std::ptr::from_ref(request).cast(),
++            std::mem::size_of::<T>(),
++            0,
++            std::ptr::from_ref(&kernel).cast(),
++            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
++        )
++    };
++    if sent < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if sent as usize != std::mem::size_of::<T>() {
++        return Err(io::Error::new(
++            io::ErrorKind::WriteZero,
++            "local route netlink request was truncated",
++        ));
++    }
++
++    let mut response = [0_u8; 4096];
++    let received = loop {
++        let received =
++            unsafe { libc::recv(socket, response.as_mut_ptr().cast(), response.len(), 0) };
++        if received >= 0 {
++            break received as usize;
++        }
++        let error = io::Error::last_os_error();
++        if error.kind() != io::ErrorKind::Interrupted {
++            return Err(error);
++        }
++    };
++    let header_length = 16;
++    if received < header_length + std::mem::size_of::<i32>() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "invalid local route netlink response",
++        ));
++    }
++    let message_type = u16::from_ne_bytes([response[4], response[5]]);
++    if message_type != libc::NLMSG_ERROR as u16 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "unexpected local route netlink response",
++        ));
++    }
++    let error = i32::from_ne_bytes(
++        response[header_length..header_length + 4]
++            .try_into()
++            .unwrap(),
++    );
++    if error == 0 || error == -libc::EEXIST {
++        Ok(())
++    } else {
++        Err(io::Error::from_raw_os_error(-error))
++    }
++}
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -1081,7 +1081,7 @@
+     Ok(stream)
+ }
+ 
+-fn ensure_loopback_interface_up() -> io::Result<()> {
++pub(crate) fn ensure_loopback_interface_up() -> io::Result<()> {
+     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+     if fd < 0 {
+         return Err(io::Error::last_os_error());
+--- upstream/network-proxy/src/runtime.rs
++++ upstream/network-proxy/src/runtime.rs
+@@ -25,6 +25,7 @@
+ use std::collections::VecDeque;
+ use std::future::Future;
+ use std::net::IpAddr;
++use std::net::Ipv4Addr;
+ use std::net::SocketAddr;
+ use std::path::Path;
+ use std::sync::Arc;
+@@ -456,6 +457,45 @@
+         }
+     }
+ 
++    /// Apply the canonical domain policy, then resolve one hostname to public
++    /// IPv4 destinations for a direct connection. A denied, malformed,
++    /// private, IPv6-only, or unresolvable hostname returns `None`.
++    pub async fn resolve_allowed_public_ipv4(
++        &self,
++        host: &str,
++        port: u16,
++    ) -> Result<Option<Vec<Ipv4Addr>>> {
++        if host.parse::<IpAddr>().is_ok()
++            || !matches!(
++                self.host_blocked(host, port).await?,
++                HostBlockDecision::Allowed
++            )
++        {
++            return Ok(None);
++        }
++        let addresses = match timeout(DNS_LOOKUP_TIMEOUT, lookup_host((host, port))).await {
++            Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
++            Ok(Err(_)) | Err(_) => return Ok(None),
++        };
++        if addresses.is_empty()
++            || addresses
++                .iter()
++                .any(|address| is_non_public_ip(address.ip()))
++        {
++            return Ok(None);
++        }
++        let mut ipv4 = addresses
++            .into_iter()
++            .filter_map(|address| match address.ip() {
++                IpAddr::V4(address) => Some(address),
++                IpAddr::V6(_) => None,
++            })
++            .collect::<Vec<_>>();
++        ipv4.sort_unstable();
++        ipv4.dedup();
++        Ok((!ipv4.is_empty()).then_some(ipv4))
++    }
++
+     pub async fn is_host_domain_route(&self, host: &str, port: u16) -> Result<bool> {
+         self.reload_if_needed().await?;
+         let host = match Host::parse(host) {
+@@ -1066,6 +1106,26 @@
+         );
+     }
+ 
++    #[tokio::test]
++    async fn direct_resolution_rejects_raw_and_private_destinations() {
++        let raw = network_proxy_state_for_policy(network_settings(&["8.8.8.8:53"], &[]));
++        assert_eq!(
++            raw.resolve_allowed_public_ipv4("8.8.8.8", 53)
++                .await
++                .unwrap(),
++            None
++        );
++
++        let private = network_proxy_state_for_policy(network_settings(&["localhost:80"], &[]));
++        assert_eq!(
++            private
++                .resolve_allowed_public_ipv4("localhost", 80)
++                .await
++                .unwrap(),
++            None
++        );
++    }
++
+     #[tokio::test]
+     async fn loopback_deny_rules_are_alias_equivalent_at_the_exact_port() {
+         let allow = ["localhost:43128", "127.0.0.1:43128", "[::1]:43128"];
