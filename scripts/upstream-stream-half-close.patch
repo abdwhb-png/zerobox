@@ -1,0 +1,90 @@
+--- upstream/linux-sandbox/src/proxy_routing.rs
++++ upstream/linux-sandbox/src/proxy_routing.rs
+@@ -1163,19 +1163,45 @@
+     proxy_bidirectional(tcp_stream, unix_stream, tcp_reader, unix_writer)
+ }
+ 
+-fn proxy_bidirectional<Left, Right>(
+-    mut left: Left,
+-    mut right: Right,
+-    mut left_reader: Left,
+-    mut right_writer: Right,
+-) -> io::Result<()>
+-where
+-    Left: Read + Write + Send + 'static,
+-    Right: Read + Write + Send + 'static,
+-{
++trait BridgeStream: Read + Write + Send + 'static {
++    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
++}
++
++impl BridgeStream for TcpStream {
++    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
++        TcpStream::shutdown(self, how)
++    }
++}
++
++impl BridgeStream for UnixStream {
++    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
++        UnixStream::shutdown(self, how)
++    }
++}
++
++fn copy_bridge_direction<Reader: BridgeStream, Writer: BridgeStream>(
++    mut reader: Reader,
++    mut writer: Writer,
++) -> io::Result<()> {
++    let result = std::io::copy(&mut reader, &mut writer)
++        .and_then(|_| writer.shutdown(Shutdown::Write));
++    if result.is_err() {
++        // Wake the other direction on errors, including idle timeouts.
++        let _ = reader.shutdown(Shutdown::Both);
++        let _ = writer.shutdown(Shutdown::Both);
++    }
++    result
++}
++
++fn proxy_bidirectional<Left: BridgeStream, Right: BridgeStream>(
++    left: Left,
++    right: Right,
++    left_reader: Left,
++    right_writer: Right,
++) -> io::Result<()> {
+     let left_to_right =
+-        std::thread::spawn(move || std::io::copy(&mut left_reader, &mut right_writer));
+-    let right_to_left = std::io::copy(&mut right, &mut left);
++        std::thread::spawn(move || copy_bridge_direction(left_reader, right_writer));
++    let right_to_left = copy_bridge_direction(right, left);
+     let left_to_right = left_to_right
+         .join()
+         .map_err(|_| io::Error::other("bridge thread panicked"))?;
+@@ -2034,26 +2060,9 @@
+     left.set_write_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
+     right.set_read_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
+     right.set_write_timeout(Some(BROKER_STREAM_IDLE_TIMEOUT))?;
+-    let left_to_right_reader = left.try_clone()?;
+-    let left_to_right_writer = right.try_clone()?;
+-    let left_to_right = std::thread::spawn(move || {
+-        let mut reader = left_to_right_reader;
+-        let mut writer = left_to_right_writer;
+-        std::io::copy(&mut reader, &mut writer)?;
+-        writer.shutdown(Shutdown::Write)
+-    });
+-    let mut right_to_left_reader = right;
+-    let mut right_to_left_writer = left;
+-    let right_to_left = (|| {
+-        std::io::copy(&mut right_to_left_reader, &mut right_to_left_writer)?;
+-        right_to_left_writer.shutdown(Shutdown::Write)
+-    })();
+-    let left_to_right = left_to_right
+-        .join()
+-        .map_err(|_| io::Error::other("TCP publication bridge thread panicked"))?;
+-    left_to_right?;
+-    right_to_left?;
+-    Ok(())
++    let left_reader = left.try_clone()?;
++    let right_writer = right.try_clone()?;
++    proxy_bidirectional(left, right, left_reader, right_writer)
+ }
+ 
+ fn private_listener_present(target: SocketAddr) -> bool {

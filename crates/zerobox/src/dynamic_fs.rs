@@ -81,7 +81,7 @@ impl DynamicDenyPolicy {
         let canonical_cwd = std::fs::canonicalize(cwd).with_context(|| {
             format!("failed to canonicalize dynamic deny root {}", cwd.display())
         })?;
-        let mut effective_roots = if base_policy.has_full_disk_read_access() {
+        let readable_roots = if base_policy.has_full_disk_read_access() {
             vec![PathBuf::from("/")]
         } else {
             base_policy
@@ -90,27 +90,28 @@ impl DynamicDenyPolicy {
                 .map(PathBuf::from)
                 .collect::<Vec<_>>()
         };
-        effective_roots.extend(
+        let writable_roots = if base_policy.has_full_disk_write_access() {
+            vec![PathBuf::from("/")]
+        } else {
             base_policy
                 .get_writable_roots_with_cwd(&canonical_cwd)
                 .into_iter()
-                .map(|root| PathBuf::from(root.root)),
-        );
-        effective_roots.sort();
-        effective_roots.dedup();
+                .map(|root| PathBuf::from(root.root))
+                .collect::<Vec<_>>()
+        };
         let deny_read = deny_read
             .iter()
             .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|pattern| pattern.can_affect_any(&effective_roots))
+            .filter(|pattern| pattern.can_affect_any(&readable_roots))
             .collect::<Vec<_>>();
         let deny_write = deny_write
             .iter()
             .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|pattern| pattern.can_affect_any(&effective_roots))
+            .filter(|pattern| pattern.can_affect_any(&writable_roots))
             .collect::<Vec<_>>();
         if deny_read.is_empty() && deny_write.is_empty() && exact_unix_sockets.is_empty() {
             return Ok(None);
@@ -2041,6 +2042,33 @@ mod tests {
             root.path(),
             &[format!("{}/.aws/**", home.display())],
             &[],
+            base,
+            &[],
+        )
+        .unwrap();
+
+        assert!(policy.is_none());
+    }
+
+    #[test]
+    fn deny_write_glob_in_read_only_cwd_does_not_create_a_dynamic_view() {
+        use zerobox_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+        };
+        use zerobox_utils_absolute_path::AbsolutePathBuf;
+
+        let root = TempDir::new().unwrap();
+        let base = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(root.path().to_path_buf()).unwrap(),
+            },
+            access: FileSystemAccessMode::Read,
+        }]);
+
+        let policy = DynamicDenyPolicy::compile_with_base_policy(
+            root.path(),
+            &[],
+            &[".env.*".to_string()],
             base,
             &[],
         )

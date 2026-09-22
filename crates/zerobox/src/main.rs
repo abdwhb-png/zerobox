@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use clap::{Parser, Subcommand, error::ErrorKind};
 #[cfg(target_os = "linux")]
 use zerobox::arg0;
-use zerobox::{DockerAccessPolicy, Sandbox, TcpPublication};
+use zerobox::{DockerAccessPolicy, Sandbox, SandboxSetupError, TcpPublication};
 
 #[derive(Parser, Debug)]
 #[command(name = "zerobox", version, about, long_about = None)]
@@ -71,6 +71,10 @@ pub struct Cli {
     #[arg(long)]
     pub private_tmp: Option<PathBuf>,
 
+    /// Keep policy-visible host /tmp instead of allocating a private lease tmp.
+    #[arg(long, conflicts_with = "private_tmp")]
+    pub host_tmp: bool,
+
     /// Use an owner-only session directory as the sandbox HOME.
     #[arg(long)]
     pub private_home: Option<PathBuf>,
@@ -113,6 +117,29 @@ pub struct Cli {
         help = "Writable Unix pipe or stream-socket FD for JSONL lifecycle records"
     )]
     pub status_fd: Option<i32>,
+
+    /// Lifecycle protocol version for --status-fd. Version 2 adds the
+    /// sandbox_admitted record before child_started when admission is enabled.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub status_version: u8,
+
+    /// Dedicated writable descriptor for one admission receipt. Runtime v2
+    /// callers use FD 4 so the target cannot inherit this control channel.
+    #[arg(long)]
+    pub admission_fd: Option<i32>,
+
+    /// Require the caller to acknowledge the report digest on this read-only
+    /// control descriptor before the sandbox can execute the target.
+    #[arg(long)]
+    pub admission_ack_fd: Option<i32>,
+
+    /// Absolute root of a verified private Linux runtime release.
+    #[arg(long)]
+    pub runtime_bundle: Option<PathBuf>,
+
+    /// Component selected from --runtime-bundle.
+    #[arg(long, value_parser = ["shell", "analysis"])]
+    pub runtime_component: Option<String>,
 
     #[arg(long = "profile", value_delimiter = ',')]
     pub profile: Vec<String>,
@@ -284,6 +311,7 @@ async fn tokio_main(
     linux_sandbox_exe: Option<PathBuf>,
     mut status: StatusReporter,
 ) -> ExitCode {
+    status.set_version(cli.status_version);
     if cli.status_fd.is_some() && cli.subcommand.is_some() {
         let _ = status.setup_error(
             "unsupported_status_mode",
@@ -301,6 +329,42 @@ async fn tokio_main(
     if cli.command.is_empty() {
         eprintln!("error: no command specified");
         let _ = status.setup_error("missing_command", "no command specified");
+        return status.setup_exit_code();
+    }
+
+    if cli.runtime_bundle.is_some() != cli.runtime_component.is_some() {
+        eprintln!("error: --runtime-bundle and --runtime-component must be used together");
+        let _ = status.setup_error(
+            "invalid_runtime_bundle",
+            "--runtime-bundle and --runtime-component must be used together",
+        );
+        return status.setup_exit_code();
+    }
+    if let Some(fd) = cli.admission_fd
+        && (fd != 4
+            || cli.status_fd.is_none()
+            || cli.status_version != 2
+            || cli.runtime_bundle.is_none())
+    {
+        eprintln!(
+            "error: --admission-fd=4 requires --status-fd, --status-version=2, and a runtime bundle"
+        );
+        let _ = status.setup_error(
+            "invalid_admission",
+            "admission requires runtime status protocol v2",
+        );
+        return status.setup_exit_code();
+    }
+
+    if cli
+        .admission_ack_fd
+        .is_some_and(|fd| fd != 5 || cli.admission_fd.is_none())
+    {
+        eprintln!("error: --admission-ack-fd=5 requires --admission-fd=4");
+        let _ = status.setup_error(
+            "invalid_admission",
+            "invalid admission acknowledgement channel",
+        );
         return status.setup_exit_code();
     }
 
@@ -322,6 +386,18 @@ async fn tokio_main(
         .args(&cli.command[1..])
         .linux_sandbox_exe_opt(linux_sandbox_exe)
         .setup_status(status.enabled());
+    #[cfg(target_os = "linux")]
+    if let (Some(bundle), Some(component)) = (&cli.runtime_bundle, &cli.runtime_component) {
+        sandbox = sandbox.runtime_bundle(bundle, component);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = cli.admission_fd {
+        sandbox = sandbox.admission_fd(fd);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = cli.admission_ack_fd {
+        sandbox = sandbox.admission_ack_fd(fd);
+    }
     sandbox = sandbox.allow_local_binding(cli.allow_local_binding);
     if let Some(ref paths) = cli.allow_unix_socket {
         for path in paths {
@@ -345,6 +421,9 @@ async fn tokio_main(
     }
     if let Some(ref private_tmp) = cli.private_tmp {
         sandbox = sandbox.private_tmp(private_tmp);
+    }
+    if cli.host_tmp {
+        sandbox = sandbox.host_tmp();
     }
     if let Some(ref private_home) = cli.private_home {
         sandbox = sandbox.private_home(private_home);
@@ -503,10 +582,26 @@ async fn tokio_main(
     };
 
     let relay_stdio = should_relay_stdio();
-    let child = if relay_stdio {
-        sandbox.spawn_streaming().await
-    } else {
-        sandbox.spawn_inherited().await
+    let child = match sandbox.prepare().await {
+        Ok(mut prepared) => {
+            if relay_stdio {
+                prepared.command_mut().stdout(std::process::Stdio::piped());
+                prepared.command_mut().stderr(std::process::Stdio::piped());
+            }
+            if cli.admission_fd.is_some() {
+                let mut report_admitted = |digest: &str| {
+                    status.sandbox_admitted(digest).map_err(|error| {
+                        SandboxSetupError::HelperProtocol(format!(
+                            "failed to emit sandbox_admitted status event: {error}"
+                        ))
+                    })
+                };
+                prepared.spawn_with_admission(&mut report_admitted).await
+            } else {
+                prepared.spawn().await
+            }
+        }
+        Err(error) => Err(error),
     };
 
     let (exit, raw_exit_code) = match child {
@@ -638,6 +733,7 @@ async fn forward_stderr(mut source: Option<tokio::process::ChildStderr>) {
 
 struct StatusReporter {
     enabled: bool,
+    version: u8,
     #[cfg(unix)]
     destination: Option<StatusDestination>,
 }
@@ -655,6 +751,7 @@ impl StatusReporter {
             let Some(fd) = fd else {
                 return Ok(Self {
                     enabled: false,
+                    version: 1,
                     destination: None,
                 });
             };
@@ -753,6 +850,7 @@ impl StatusReporter {
             }
             Ok(Self {
                 enabled: true,
+                version: 1,
                 destination: Some(destination),
             })
         }
@@ -761,7 +859,10 @@ impl StatusReporter {
             if fd.is_some() {
                 return Err("--status-fd is supported only on Unix".to_string());
             }
-            Ok(Self { enabled: false })
+            Ok(Self {
+                enabled: false,
+                version: 1,
+            })
         }
     }
 
@@ -775,6 +876,9 @@ impl StatusReporter {
     fn enabled(&self) -> bool {
         self.enabled
     }
+    fn set_version(&mut self, version: u8) {
+        self.version = version;
+    }
     fn setup_error(&mut self, code: &str, message: &str) -> std::io::Result<()> {
         // 512 code points stay below PIPE_BUF even when every character is
         // JSON-escaped as `\uXXXX`.
@@ -784,26 +888,35 @@ impl StatusReporter {
             message.push_str(" [truncated; full diagnostic on stderr]");
         }
         self.emit_terminal(
-            serde_json::json!({"version":1,"event":"setup_error","code":code,"message":message}),
+            serde_json::json!({"version":self.version,"event":"setup_error","code":code,"message":message}),
         )
     }
     fn child_started(&mut self, pid: u32) -> std::io::Result<()> {
-        let result = self.emit(serde_json::json!({"version":1,"event":"child_started","pid":pid,"pid_scope":"supervisor"}));
+        let result = self.emit(serde_json::json!({"version":self.version,"event":"child_started","pid":pid,"pid_scope":"supervisor"}));
         if result.is_err() {
             self.close();
         }
         result
+    }
+    fn sandbox_admitted(&mut self, report_sha256: &str) -> std::io::Result<()> {
+        if self.version != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sandbox_admitted requires status protocol v2",
+            ));
+        }
+        self.emit(serde_json::json!({"version":2,"event":"sandbox_admitted","report_sha256":report_sha256}))
     }
     fn child_exit(&mut self, status: std::process::ExitStatus) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             if let Some(signal) = status.signal() {
-                return self.emit_terminal(serde_json::json!({"version":1,"event":"child_exit","code":128 + signal,"signal":signal}));
+                return self.emit_terminal(serde_json::json!({"version":self.version,"event":"child_exit","code":128 + signal,"signal":signal}));
             }
         }
         self.emit_terminal(
-            serde_json::json!({"version":1,"event":"child_exit","code":status.code().unwrap_or(1)}),
+            serde_json::json!({"version":self.version,"event":"child_exit","code":status.code().unwrap_or(1)}),
         )
     }
     fn emit_terminal(&mut self, value: serde_json::Value) -> std::io::Result<()> {

@@ -294,6 +294,11 @@ class only when the rule names one of those three aliases and includes the
 exact destination port. This does not allow the rest of `127.0.0.0/8` or any
 other private address.
 
+When the managed proxy denies a request, Zerobox writes the denied host and
+port with the policy reason to stderr and returns the same detail in the HTTP
+response body. This keeps CONNECT failures diagnosable when a client reports
+only the numeric `403` status. The diagnostic omits request paths and queries.
+
 `--allow-host-net` is a separate host-local route. It accepts only an exact DNS
 hostname or a scoped wildcard with an explicit port, dials `127.0.0.1` on that
 port, and preserves the requested hostname through a raw CONNECT tunnel. It

@@ -1,0 +1,792 @@
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -10,6 +10,7 @@
+ use std::os::fd::FromRawFd;
+ use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::fs::OpenOptionsExt;
++use std::os::unix::net::UnixStream;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -42,6 +43,10 @@
+ const SYNTHETIC_MOUNT_MARKER_SYNTHETIC: &[u8] = b"synthetic\n";
+ const SYNTHETIC_MOUNT_MARKER_EXISTING: &[u8] = b"existing\n";
+ const TARGET_ENV_FILE_ENV: &str = "ZEROBOX_TARGET_ENV_FILE";
++const RUNTIME_ADMISSION_RECEIPT_ENV: &str = "ZEROBOX_RUNTIME_ADMISSION_RECEIPT";
++const RUNTIME_ADMISSION_TOKEN_ENV: &str = "ZEROBOX_RUNTIME_ADMISSION_TOKEN";
++const RUNTIME_ADMISSION_SOCKET: &str = "/__zerobox/control.sock";
++const RUNTIME_PATH_ALIASES_ENV: &str = "ZEROBOX_RUNTIME_PATH_ALIASES";
+ const PROTECTED_CREATE_MARKER: &[u8] = b"protected-create\n";
+ 
+ #[derive(Debug)]
+@@ -143,6 +148,12 @@
+ 
+     #[arg(long = "setup-status-fd", hide = true)]
+     pub setup_status_fd: Option<i32>,
++
++    #[arg(long = "admission-fd", hide = true)]
++    pub admission_fd: Option<i32>,
++
++    #[arg(long = "admission-ack-fd", hide = true)]
++    pub admission_ack_fd: Option<i32>,
+ 
+     /// When set, skip mounting a fresh `/proc` even though PID isolation is
+     /// still enabled. This is primarily intended for restrictive container
+@@ -177,6 +188,7 @@
+         setup_status_fd,
+         no_proc,
+         command,
++        ..
+     } = LandlockCommand::parse();
+ 
+     if command.is_empty() {
+@@ -199,6 +211,14 @@
+     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
+     // established the filesystem view.
+     if apply_seccomp_then_exec {
++        // Open the private rendezvous while AF_UNIX connect is still available.
++        // Receipt bytes are withheld until seccomp/no_new_privs has succeeded.
++        let runtime_admission = target_environment
++            .as_ref()
++            .filter(|environment| environment.contains_key(RUNTIME_ADMISSION_TOKEN_ENV))
++            .map(begin_runtime_admission)
++            .transpose()
++            .unwrap_or_else(|error| panic!("runtime admission failed: {error}"));
+         if allow_network_for_proxy {
+             let spec = proxy_route_spec
+                 .as_deref()
+@@ -224,6 +244,10 @@
+             proxy_routing_active,
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
++        }
++        if let Some(admission) = runtime_admission {
++            finish_runtime_admission(admission)
++                .unwrap_or_else(|error| panic!("runtime admission failed: {error}"));
+         }
+         let target_environment = merge_internal_target_environment(target_environment);
+         exec_or_panic(command, setup_status_fd, target_environment.as_ref());
+@@ -394,6 +418,8 @@
+     target: Option<HashMap<String, String>>,
+ ) -> Option<HashMap<String, String>> {
+     let mut target = target?;
++    target.remove(RUNTIME_ADMISSION_RECEIPT_ENV);
++    target.remove(RUNTIME_ADMISSION_TOKEN_ENV);
+     for (name, value) in std::env::vars() {
+         if name != TARGET_ENV_FILE_ENV
+             && name != "PATH"
+@@ -402,6 +428,8 @@
+             && name != "ZEROBOX_ALLOW_LOCAL_BINDING"
+             && name != "ZEROBOX_ALLOW_UNIX_SOCKET"
+             && name != "ZEROBOX_HOST_LOOPBACK_PORTS"
++            && name != RUNTIME_INNER_HELPER_ENV
++            && name != RUNTIME_PATH_ALIASES_ENV
+         {
+             target.insert(name, value);
+         }
+@@ -513,14 +541,161 @@
+         options,
+     )
+     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
++    let runtime_aliases = std::env::var_os(RUNTIME_PATH_ALIASES_ENV).map(|value|
++        serde_json::from_str::<Vec<RuntimePathAlias>>(&value.to_string_lossy())
++            .unwrap_or_else(|error| panic!("invalid runtime path aliases: {error}")));
++    if let Some(aliases) = runtime_aliases.as_ref() {
++        inject_runtime_path_aliases(&mut bwrap_args.args, aliases.clone())
++            .unwrap_or_else(|error| panic!("invalid runtime path aliases: {error}"));
++    }
+     inject_private_bind_mounts(&mut bwrap_args, private_bind_mounts)
+         .unwrap_or_else(|err| panic!("invalid private bind mount: {err}"));
+     if let Some(proxy_root) = proxy_root {
+         inject_private_proxy_mount(&mut bwrap_args.args, proxy_root)
+             .unwrap_or_else(|err| panic!("invalid private proxy mount: {err}"));
+     }
++    if let Some(aliases) = runtime_aliases.as_ref() {
++        pin_runtime_policy_mounts(&mut bwrap_args, aliases)
++            .unwrap_or_else(|error| panic!("invalid runtime policy mount: {error}"));
++    }
+     apply_inner_command_argv0(&mut bwrap_args.args);
+     run_or_exec_bwrap(bwrap_args, keep_parent_for_tcp_publication);
++}
++
++#[derive(Clone, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct RuntimePathAlias {
++    destination: PathBuf,
++    target: PathBuf,
++    directory: bool,
++}
++
++fn inject_runtime_path_aliases(
++    args: &mut Vec<String>,
++    aliases: Vec<RuntimePathAlias>,
++) -> std::io::Result<()> {
++    if aliases.is_empty() {
++        return Ok(());
++    }
++    let root = args
++        .windows(2)
++        .position(|pair| pair == ["--tmpfs", "/"])
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "runtime aliases require a private filesystem root",
++            )
++        })?;
++    let mut additions = Vec::new();
++    for alias in &aliases {
++        if !alias.destination.is_absolute()
++            || !alias.target.is_absolute()
++            || alias.destination == Path::new("/")
++            || alias.destination.starts_with("/__zerobox")
++            || alias
++                .destination
++                .components()
++                .chain(alias.target.components())
++                .any(|part| matches!(part, std::path::Component::ParentDir))
++        {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "runtime alias paths must be absolute and outside the reserved prefix",
++            ));
++        }
++        if let Some(parent) = alias
++            .destination
++            .parent()
++            .filter(|parent| *parent != Path::new("/"))
++        {
++            additions.extend(["--dir".to_string(), parent.to_string_lossy().into_owned()]);
++        }
++        let target_directory = if alias.directory {
++            Some(alias.target.as_path())
++        } else {
++            alias.target.parent()
++        };
++        if let Some(directory) = target_directory.filter(|path| *path != Path::new("/")) {
++            additions.extend(["--dir".to_string(), directory.to_string_lossy().into_owned()]);
++        }
++        let parent = alias.destination.parent().ok_or_else(||
++            std::io::Error::new(std::io::ErrorKind::InvalidInput, "runtime alias has no parent"))?;
++        let filename = alias.destination.file_name().ok_or_else(||
++            std::io::Error::new(std::io::ErrorKind::InvalidInput, "runtime alias has no filename"))?;
++        additions.extend([
++            "--symlink".to_string(),
++            relative_runtime_alias_target(
++                &resolve_runtime_alias_path(parent, &aliases).join(filename),
++                &alias.target,
++            )?,
++            alias.destination.to_string_lossy().into_owned(),
++        ]);
++    }
++    // Create links on the empty private root before any host bind can cover a
++    // destination. Links reference only resources already granted by policy.
++    args.splice(root + 2..root + 2, additions);
++    Ok(())
++}
++
++// Resolve against the canonical aliases captured by the policy owner, never
++// against a host symlink that could have changed since authorization.
++fn resolve_runtime_alias_path(path: &Path, aliases: &[RuntimePathAlias]) -> PathBuf {
++    aliases.iter()
++        .filter_map(|alias| path.strip_prefix(&alias.destination).ok().map(|suffix| (alias, suffix)))
++        .max_by_key(|(alias, _)| alias.destination.components().count())
++        .map(|(alias, suffix)| {
++            if suffix.as_os_str().is_empty() { alias.target.clone() } else { alias.target.join(suffix) }
++        })
++        .unwrap_or_else(|| path.to_path_buf())
++}
++
++fn open_canonical_mount_source(expected: &Path) -> std::io::Result<File> {
++    let source = OpenOptions::new().read(true)
++        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_PATH)
++        .open(expected)?;
++    let actual = std::fs::read_link(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
++    if actual != expected || source.metadata()?.file_type().is_symlink() {
++        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
++            format!("canonical mount source changed before admission: {}", expected.display())));
++    }
++    Ok(source)
++}
++
++fn pin_runtime_policy_mounts(
++    args: &mut crate::bwrap::BwrapArgs,
++    aliases: &[RuntimePathAlias],
++) -> std::io::Result<()> {
++    let mut index = 0;
++    while index < args.args.len() && args.args[index] != "--" {
++        if matches!(args.args[index].as_str(), "--ro-bind" | "--bind") {
++            let source = args.args.get(index + 1).ok_or_else(||
++                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing policy mount source"))?;
++            let expected = resolve_runtime_alias_path(Path::new(source), aliases);
++            let file = open_canonical_mount_source(&expected)?;
++            args.args[index].push_str("-fd");
++            args.args[index + 1] = file.as_raw_fd().to_string();
++            args.preserved_files.push(file);
++            index += 3;
++        } else {
++            index += 1;
++        }
++    }
++    Ok(())
++}
++
++// Bubblewrap creates mountpoints before pivoting into the private root.
++// Relative links resolve inside that root during both construction and use.
++fn relative_runtime_alias_target(destination: &Path, target: &Path) -> std::io::Result<String> {
++    let parent = destination.parent().ok_or_else(||
++        std::io::Error::new(std::io::ErrorKind::InvalidInput, "runtime alias has no parent"))?;
++    let from = parent.components().collect::<Vec<_>>();
++    let to = target.components().collect::<Vec<_>>();
++    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
++    let mut result = PathBuf::new();
++    for _ in &from[shared..] { result.push(".."); }
++    for part in &to[shared..] { result.push(part.as_os_str()); }
++    if result.as_os_str().is_empty() { result.push("."); }
++    Ok(result.to_string_lossy().into_owned())
+ }
+ 
+ fn bwrap_network_mode(
+@@ -564,6 +739,7 @@
+ 
+ const PRIVATE_BIND_MOUNTS_ENV: &str = "ZEROBOX_PRIVATE_BIND_MOUNTS";
+ const DOCKER_BROKER_SOCKET_ENV: &str = "ZEROBOX_DOCKER_BROKER_SOCKET";
++const RUNTIME_INNER_HELPER_ENV: &str = "ZEROBOX_RUNTIME_INNER_HELPER";
+ 
+ #[derive(Debug, serde::Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -571,6 +747,12 @@
+     source: PathBuf,
+     destination: PathBuf,
+     #[serde(default)]
++    read_only: bool,
++    #[serde(default)]
++    pre_remount: bool,
++    #[serde(default)]
++    before_policy: bool,
++    #[serde(default)]
+     exact_unix_socket: Option<ExactUnixSocketIdentity>,
+     #[serde(default)]
+     source_fd: Option<i32>,
+@@ -586,7 +768,10 @@
+ struct PreparedPrivateBindMount {
+     source: File,
+     destination: PathBuf,
+-    exact_unix_socket: bool,
++    read_only: bool,
++    pre_remount: bool,
++    before_policy: bool,
++    source_is_directory: bool,
+ }
+ 
+ fn load_private_bind_mounts() -> Vec<PrivateBindMount> {
+@@ -633,12 +818,7 @@
+                         "only exact Unix sockets may use a pre-opened descriptor",
+                     ));
+                 }
+-                (false, None) => OpenOptions::new()
+-                    .read(true)
+-                    .custom_flags(
+-                        libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_PATH,
+-                    )
+-                    .open(&mount.source)
++                (false, None) => open_canonical_mount_source(&mount.source)
+                     .map_err(|error| {
+                         std::io::Error::new(
+                             error.kind(),
+@@ -652,8 +832,7 @@
+             };
+             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+             if unsafe { libc::fstat(source.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+-                return Err(std::io::Error::new(
+-                    std::io::ErrorKind::Other,
++                return Err(std::io::Error::other(
+                     format!(
+                         "inspect private bind source {}: {}",
+                         mount.source.display(),
+@@ -662,6 +841,19 @@
+                 ));
+             }
+             let stat = unsafe { stat.assume_init() };
++            let source_is_directory = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
++            if !exact_unix_socket
++                && !source_is_directory
++                && stat.st_mode & libc::S_IFMT != libc::S_IFREG
++            {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::PermissionDenied,
++                    format!(
++                        "private bind source must be a regular file or directory: {}",
++                        mount.source.display()
++                    ),
++                ));
++            }
+             if exact_unix_socket {
+                 let source_path =
+                     std::fs::read_link(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
+@@ -672,11 +864,11 @@
+                     ));
+                 }
+             }
+-            if let Some(expected) = mount.exact_unix_socket {
+-                if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+-                    || stat.st_dev as u64 != expected.dev
++            if let Some(expected) = mount.exact_unix_socket
++                && (stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
++                    || stat.st_dev != expected.dev
+                     || stat.st_ino != expected.ino
+-                {
++                ) {
+                     return Err(std::io::Error::new(
+                         std::io::ErrorKind::PermissionDenied,
+                         format!(
+@@ -684,12 +876,14 @@
+                             mount.source.display()
+                         ),
+                     ));
+-                }
+             }
+             Ok(PreparedPrivateBindMount {
+                 source,
+                 destination: mount.destination,
+-                exact_unix_socket,
++                read_only: mount.read_only,
++                pre_remount: mount.pre_remount,
++                before_policy: mount.before_policy,
++                source_is_directory,
+             })
+         })
+         .collect()
+@@ -725,23 +919,76 @@
+     } else {
+         separator
+     };
+-    let mut mount_args = Vec::with_capacity(mounts.len() * 5);
++    let mut early_args = Vec::new();
++    let mut creation_args = Vec::with_capacity(mounts.len() * 2);
++    let mut pre_remount_args = Vec::with_capacity(mounts.len() * 3);
++    let mut mount_args = Vec::with_capacity(mounts.len() * 3);
+     for mount in mounts {
+-        if bwrap_args.used_tmpfs_root && !mount.exact_unix_socket {
+-            mount_args.extend([
+-                "--dir".to_string(),
+-                mount.destination.to_string_lossy().into_owned(),
++        if mount.before_policy {
++            if !bwrap_args.used_tmpfs_root || !mount.source_is_directory ||
++                !matches!(mount.destination.to_str(), Some("/tmp" | "/home/sandbox")) {
++                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "early private bind must be a private namespace directory"));
++            }
++            early_args.extend([
++                "--dir".to_string(), mount.destination.to_string_lossy().into_owned(),
++                if mount.read_only { "--ro-bind-fd" } else { "--bind-fd" }.to_string(),
++                mount.source.as_raw_fd().to_string(), mount.destination.to_string_lossy().into_owned(),
+             ]);
++            bwrap_args.preserved_files.push(mount.source);
++            continue;
++        }
++        if bwrap_args.used_tmpfs_root {
++            let target = if mount.source_is_directory {
++                Some(mount.destination.as_path())
++            } else {
++                mount.destination.parent()
++            };
++            if let Some(target) = target {
++                creation_args.extend(["--dir".to_string(), target.to_string_lossy().into_owned()]);
++            }
+         }
+         let source_fd = mount.source.as_raw_fd().to_string();
+-        mount_args.extend([
+-            "--bind-fd".to_string(),
++        let args = [
++            if mount.read_only {
++                "--ro-bind-fd"
++            } else {
++                "--bind-fd"
++            }
++            .to_string(),
+             source_fd,
+             mount.destination.to_string_lossy().into_owned(),
+-        ]);
++        ];
++        if mount.pre_remount {
++            pre_remount_args.extend(args);
++        } else {
++            mount_args.extend(args);
++        }
+         bwrap_args.preserved_files.push(mount.source);
+     }
+-    bwrap_args.args.splice(mount_index..mount_index, mount_args);
++    // Create synthetic mountpoints while the tmpfs root is writable, then
++    // bind private sources after the root read-only remount. A writable
++    // internal directory bind must retain its mount permissions for Unix
++    // control sockets and lease-private /tmp and HOME.
++    let creation_len = creation_args.len();
++    let pre_remount_len = pre_remount_args.len();
++    bwrap_args
++        .args
++        .splice(mount_index..mount_index, creation_args);
++    bwrap_args.args.splice(
++        mount_index + creation_len..mount_index + creation_len,
++        pre_remount_args,
++    );
++    let root_remount_end = mount_index + creation_len + pre_remount_len + 2;
++    bwrap_args
++        .args
++        .splice(root_remount_end..root_remount_end, mount_args);
++    if !early_args.is_empty() {
++        let root = bwrap_args.args.windows(2).position(|pair| pair == ["--tmpfs", "/"])
++            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing private filesystem root"))?;
++        // Establish private HOME/tmp before project mounts, so an explicitly
++        // granted project beneath /tmp is not hidden by the namespace bind.
++        bwrap_args.args.splice(root + 2..root + 2, early_args);
++    }
+     Ok(())
+ }
+ 
+@@ -1832,6 +2079,158 @@
+     command: Vec<String>,
+ }
+ 
++struct RuntimeAdmission {
++    control: UnixStream,
++    token: String,
++    receipt: String,
++}
++
++fn observed_kernel_mounts() -> std::io::Result<Vec<serde_json::Value>> {
++    let table = fs::read_to_string("/proc/self/mountinfo")?;
++    let decode = |value: &str| value.replace("\\040", " ").replace("\\011", "\t")
++        .replace("\\012", "\n").replace("\\134", "\\");
++    let mut mounts = Vec::new();
++    for line in table.lines() {
++        let fields = line.split_whitespace().collect::<Vec<_>>();
++        let separator = fields.iter().position(|field| *field == "-")
++            .filter(|index| *index >= 6 && fields.len() > *index + 2)
++            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid kernel mount table"))?;
++        mounts.push(serde_json::json!({
++            "destination": decode(fields[4]),
++            "root": decode(fields[3]),
++            "source": decode(fields[separator + 2]),
++            "filesystem": fields[separator + 1],
++            "access": if fields[5].split(',').any(|flag| flag == "ro") { "ro" } else { "rw" },
++        }));
++    }
++    Ok(mounts)
++}
++
++fn begin_runtime_admission(
++    environment: &HashMap<String, String>,
++) -> std::io::Result<RuntimeAdmission> {
++    const MAX_ADMISSION_BYTES: usize = 1024 * 1024;
++    let receipt = environment
++        .get(RUNTIME_ADMISSION_RECEIPT_ENV)
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "runtime admission receipt is unavailable",
++            )
++        })?;
++    if receipt.is_empty() || receipt.len() > MAX_ADMISSION_BYTES {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidData,
++            "runtime admission receipt exceeds its size limit",
++        ));
++    }
++    let mut observed: serde_json::Value = serde_json::from_str(receipt)
++        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
++    let mounts = observed_kernel_mounts()?;
++    for destination in ["/__zerobox", "/__zerobox/runtime"] {
++        if !mounts.iter().any(|mount|
++            mount["destination"] == destination && mount["access"] == "ro") {
++            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
++                format!("private runtime mount is absent or writable: {destination}")));
++        }
++    }
++    if observed["runtime"]["component"] == "analysis" && !mounts.iter().any(|mount|
++        mount["destination"] == "/__zerobox/analysis" && mount["access"] == "ro") {
++        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private Analysis mount is absent or writable"));
++    }
++    observed["kernelMounts"] = serde_json::Value::Array(mounts);
++    let receipt = serde_json::to_string(&observed)
++        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
++    if receipt.len() > MAX_ADMISSION_BYTES {
++        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "runtime admission receipt exceeds its size limit"));
++    }
++    let token = environment
++        .get(RUNTIME_ADMISSION_TOKEN_ENV)
++        .ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "runtime admission token is unavailable",
++            )
++        })?;
++    Ok(RuntimeAdmission {
++        control: UnixStream::connect(RUNTIME_ADMISSION_SOCKET)?,
++        token: token.clone(),
++        receipt,
++    })
++}
++
++fn finish_runtime_admission(admission: RuntimeAdmission) -> std::io::Result<()> {
++    use std::os::fd::AsRawFd;
++
++    let control_fd = admission.control.as_raw_fd();
++    write_all_control(control_fd, admission.token.as_bytes())?;
++    write_all_control(control_fd, &(admission.receipt.len() as u32).to_be_bytes())?;
++    write_all_control(control_fd, admission.receipt.as_bytes())?;
++    let mut acknowledgement = [0_u8; 4];
++    read_exact_control(control_fd, &mut acknowledgement)?;
++    if acknowledgement != *b"ACK\n" {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            "runtime admission was not acknowledged by the supervisor",
++        ));
++    }
++    Ok(())
++}
++
++fn write_all_control(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        let written = unsafe {
++            libc::write(
++                fd,
++                bytes[offset..].as_ptr().cast::<libc::c_void>(),
++                bytes.len() - offset,
++            )
++        };
++        if written > 0 {
++            offset += written as usize;
++        } else if written == 0 {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::WriteZero,
++                "runtime admission control closed",
++            ));
++        } else {
++            let error = std::io::Error::last_os_error();
++            if error.kind() != std::io::ErrorKind::Interrupted {
++                return Err(error);
++            }
++        }
++    }
++    Ok(())
++}
++
++fn read_exact_control(fd: i32, bytes: &mut [u8]) -> std::io::Result<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        let read = unsafe {
++            libc::read(
++                fd,
++                bytes[offset..].as_mut_ptr().cast::<libc::c_void>(),
++                bytes.len() - offset,
++            )
++        };
++        if read > 0 {
++            offset += read as usize;
++        } else if read == 0 {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::UnexpectedEof,
++                "runtime admission control closed",
++            ));
++        } else {
++            let error = std::io::Error::last_os_error();
++            if error.kind() != std::io::ErrorKind::Interrupted {
++                return Err(error);
++            }
++        }
++    }
++    Ok(())
++}
++
+ /// Build the inner command that applies seccomp after bubblewrap.
+ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String> {
+     let InnerSeccompCommandArgs {
+@@ -1844,10 +2243,12 @@
+         setup_status_fd,
+         command,
+     } = args;
+-    let current_exe = match std::env::current_exe() {
+-        Ok(path) => path,
+-        Err(err) => panic!("failed to resolve current executable path: {err}"),
+-    };
++    let current_exe = std::env::var(RUNTIME_INNER_HELPER_ENV)
++        .map(PathBuf::from)
++        .unwrap_or_else(|_| match std::env::current_exe() {
++            Ok(path) => path,
++            Err(err) => panic!("failed to resolve current executable path: {err}"),
++        });
+     let permission_profile_json = match serde_json::to_string(permission_profile) {
+         Ok(json) => json,
+         Err(err) => panic!("failed to serialize permission profile: {err}"),
+@@ -2147,6 +2548,9 @@
+         let result = prepare_private_bind_mounts(vec![PrivateBindMount {
+             source,
+             destination: PathBuf::from("/service.sock"),
++            read_only: false,
++            pre_remount: false,
++            before_policy: false,
+             exact_unix_socket: Some(ExactUnixSocketIdentity {
+                 dev: metadata.dev(),
+                 ino: metadata.ino(),
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -17,6 +17,47 @@
+ 
+ fn read_only_permission_profile() -> PermissionProfile {
+     PermissionProfile::read_only()
++}
++
++#[test]
++fn runtime_path_aliases_create_private_links_before_host_mounts() {
++    let mut args = vec![
++        "bwrap",
++        "--tmpfs",
++        "/",
++        "--ro-bind",
++        "/host/allowed",
++        "/allowed",
++        "--remount-ro",
++        "/",
++        "--",
++        "true",
++    ]
++    .into_iter()
++    .map(str::to_string)
++    .collect::<Vec<_>>();
++    inject_runtime_path_aliases(
++        &mut args,
++        vec![RuntimePathAlias {
++            destination: PathBuf::from("/alias"),
++            target: PathBuf::from("/allowed"),
++            directory: true,
++        }],
++    )
++    .unwrap();
++    assert_eq!(&args[3..8], &["--dir", "/allowed", "--symlink", "allowed", "/alias"]);
++    assert_eq!(args.iter().filter(|arg| *arg == "--ro-bind").count(), 1);
++    assert!(
++        inject_runtime_path_aliases(
++            &mut args,
++            vec![RuntimePathAlias {
++                destination: PathBuf::from("/__zerobox/tool"),
++                target: PathBuf::from("/allowed"),
++                directory: true,
++            }]
++        )
++        .is_err()
++    );
+ }
+ 
+ fn read_only_file_system_policy() -> FileSystemSandboxPolicy {
+@@ -738,6 +779,9 @@
+     let mounts = prepare_private_bind_mounts(vec![PrivateBindMount {
+         source: source.clone(),
+         destination: PathBuf::from("/work"),
++        read_only: false,
++        pre_remount: false,
++        before_policy: false,
+         exact_unix_socket: None,
+         source_fd: None,
+     }])
+@@ -760,15 +804,99 @@
+             "--new-session".to_string(),
+             "--dir".to_string(),
+             "/work".to_string(),
++            "--remount-ro".to_string(),
++            "/".to_string(),
+             "--bind-fd".to_string(),
+             source_fd,
+             "/work".to_string(),
+-            "--remount-ro".to_string(),
+-            "/".to_string(),
+             "--".to_string(),
+             "/bin/true".to_string(),
+         ]
+     );
++}
++
++#[test]
++fn private_bind_rejects_a_redirected_canonical_ancestor() {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join("authorized/data");
++    let outside = root.path().join("outside");
++    std::fs::create_dir_all(&source).unwrap();
++    std::fs::create_dir_all(outside.join("data")).unwrap();
++    std::fs::rename(root.path().join("authorized"), root.path().join("previous")).unwrap();
++    std::os::unix::fs::symlink(&outside, root.path().join("authorized")).unwrap();
++    let result = prepare_private_bind_mounts(vec![PrivateBindMount {
++        source, destination: PathBuf::from("/tools"), read_only: true,
++        pre_remount: false, before_policy: false, exact_unix_socket: None, source_fd: None,
++    }]);
++    assert!(result.is_err(), "a canonical authorization must not follow a replaced ancestor");
++}
++
++#[test]
++fn nested_runtime_alias_uses_the_resolved_parent_directory() {
++    let mut args = ["bwrap", "--tmpfs", "/", "--", "true"].into_iter().map(str::to_owned).collect();
++    inject_runtime_path_aliases(&mut args, vec![
++        RuntimePathAlias { destination: PathBuf::from("/lib"), target: PathBuf::from("/usr/lib"), directory: true },
++        RuntimePathAlias { destination: PathBuf::from("/lib/x86/libexample.so.1"), target: PathBuf::from("/usr/lib/x86/libexample.so.1.2"), directory: false },
++    ]).unwrap();
++    assert!(args.windows(3).any(|args| args == ["--symlink", "libexample.so.1.2", "/lib/x86/libexample.so.1"]));
++}
++
++#[test]
++fn runtime_policy_mount_resolves_an_exact_file_alias() {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join("tool-v1");
++    std::fs::write(&source, b"authorized").unwrap();
++    let aliases = vec![RuntimePathAlias { destination: PathBuf::from("/alias-tool"), target: source, directory: false }];
++    let mut args = crate::bwrap::BwrapArgs {
++        args: ["bwrap", "--ro-bind", "/alias-tool", "/alias-tool", "--", "true"].into_iter().map(str::to_owned).collect(),
++        preserved_files: Vec::new(), synthetic_mount_targets: Vec::new(),
++        protected_create_targets: Vec::new(), used_tmpfs_root: true,
++    };
++    pin_runtime_policy_mounts(&mut args, &aliases).unwrap();
++    assert_eq!(std::fs::read(format!("/proc/self/fd/{}", args.preserved_files[0].as_raw_fd())).unwrap(), b"authorized");
++}
++
++#[test]
++fn runtime_policy_mount_keeps_its_validated_source_after_replacement() {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join("tool");
++    let previous = root.path().join("previous");
++    std::fs::write(&source, b"authorized").unwrap();
++    let mut args = crate::bwrap::BwrapArgs {
++        args: vec!["bwrap".into(), "--ro-bind".into(), source.to_string_lossy().into(), "/tools/tool".into(), "--".into(), "true".into()],
++        preserved_files: Vec::new(), synthetic_mount_targets: Vec::new(),
++        protected_create_targets: Vec::new(), used_tmpfs_root: true,
++    };
++    pin_runtime_policy_mounts(&mut args, &[]).unwrap();
++    std::fs::rename(&source, &previous).unwrap();
++    std::fs::write(&source, b"replacement").unwrap();
++    assert_eq!(args.args[1], "--ro-bind-fd");
++    assert_eq!(args.args[3], "/tools/tool");
++    assert_eq!(std::fs::read(format!("/proc/self/fd/{}", args.preserved_files[0].as_raw_fd())).unwrap(), b"authorized");
++}
++
++#[test]
++fn private_namespaces_are_bound_before_project_mounts() {
++    let root = tempfile::tempdir().unwrap();
++    let source = root.path().join("private-tmp");
++    std::fs::create_dir(&source).unwrap();
++    let mut args = crate::bwrap::BwrapArgs {
++        args: ["bwrap", "--tmpfs", "/", "--ro-bind", "/tmp/project", "/tmp/project", "--remount-ro", "/", "--", "true"].into_iter().map(str::to_owned).collect(),
++        preserved_files: Vec::new(), synthetic_mount_targets: Vec::new(),
++        protected_create_targets: Vec::new(), used_tmpfs_root: true,
++    };
++    let mounts = prepare_private_bind_mounts(vec![PrivateBindMount {
++        source, destination: PathBuf::from("/tmp"), read_only: false,
++        pre_remount: false, before_policy: true, exact_unix_socket: None, source_fd: None,
++    }]).unwrap();
++    inject_private_bind_mounts(&mut args, mounts).unwrap();
++    let namespace = args.args.iter().position(|arg| arg == "--bind-fd").unwrap();
++    let project = args.args.iter().position(|arg| arg == "--ro-bind").unwrap();
++    assert!(namespace < project);
++    assert_eq!(args.args[namespace + 2], "/tmp");
++    assert_eq!(args.preserved_files.len(), 1);
++    assert_eq!(relative_runtime_alias_target(Path::new("/lib"), Path::new("/usr/lib")).unwrap(), "usr/lib");
++    assert_eq!(relative_runtime_alias_target(Path::new("/usr/lib64/loader"), Path::new("/usr/lib/x86/loader")).unwrap(), "../lib/x86/loader");
+ }
+ 
+ #[test]

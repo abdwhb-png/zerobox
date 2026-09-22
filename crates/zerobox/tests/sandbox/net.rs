@@ -62,6 +62,71 @@ sys.exit(37)
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_loopback_client_disconnect_preserves_the_target_result_without_relay_noise() {
+    use std::io::{Read, Write};
+
+    let host = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = host.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        host.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut stream = loop {
+            match host.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "client did not connect"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        stream.write_all(b"response-prefix").unwrap();
+        // Keep the response open until the client aborts it.
+        let _ = stream.read(&mut [0; 1]);
+    });
+    let script = format!(
+        r#"import socket, struct, sys, time
+c = socket.create_connection(('127.0.0.1', {port}), 2)
+prefix = b''
+while len(prefix) < 15:
+    chunk = c.recv(15 - len(prefix))
+    assert chunk, 'response ended before prefix'
+    prefix += chunk
+assert prefix == b'response-prefix'
+c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+c.close()
+# Let the bridge report the reset before the target process exits.
+time.sleep(0.2)
+print('target-output')
+sys.stderr.write('target-error\n')
+sys.exit(37)
+"#
+    );
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-local-binding",
+        &format!("--allow-net=localhost:{port}"),
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
+    server.join().unwrap();
+    assert_eq!(stdout(&output), "target-output\n");
+    let diagnostic = stderr(&output);
+    assert_eq!(diagnostic, "target-error\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn local_test_listeners_preserve_explicit_host_loopback_grants() {
     let (port, host) = local_http_server(std::net::Ipv4Addr::LOCALHOST.into());
     let output = run(&[
@@ -385,6 +450,30 @@ fn allow_net_full_permits_outbound() {
 
 mod allow_net_domains {
     use super::*;
+
+    #[test]
+    fn blocked_connect_reports_the_denied_authority() {
+        let output = run(&[
+            "--allow-net=example.com",
+            "--",
+            "curl",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "2",
+            "https://blocked.invalid",
+        ]);
+
+        assert!(
+            !output.status.success(),
+            "blocked request unexpectedly succeeded"
+        );
+        assert!(
+            stderr(&output).contains("zerobox: Network access denied for blocked.invalid:443:"),
+            "denied authority was hidden: {}",
+            stderr(&output)
+        );
+    }
 
     #[test]
     fn single_domain_allowed() {

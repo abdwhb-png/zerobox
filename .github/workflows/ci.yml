@@ -108,6 +108,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release -p zerobox
+      - name: Build static runtime helper
+        run: >
+          cargo rustc --locked --release -p zerobox --bin zerobox
+          --target x86_64-unknown-linux-gnu -- -C target-feature=+crt-static
+      - name: Runtime bundle admission qualification
+        env:
+          ZEROBOX_EXEC: ./target/release/zerobox
+        run: >
+          cargo test -p zerobox --test integration
+          sandbox::misc::admission_record_is_closed_and_advertised_before_a_child_can_start
+          -- --exact
       - name: Rust unit tests
         run: cargo test --workspace --lib
       - name: Rust E2E sandbox tests

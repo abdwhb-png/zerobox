@@ -1,0 +1,61 @@
+--- upstream/network-proxy/src/responses.rs
++++ upstream/network-proxy/src/responses.rs
+@@ -78,20 +78,44 @@
+         .body(Body::from(blocked_message(reason)))
+         .unwrap_or_else(|_| Response::new(Body::from("blocked")))
+ }
++
++fn display_authority(host: &str, port: u16) -> String {
++    let host = host.escape_default().to_string();
++    if host.contains(':') {
++        format!("[{host}]:{port}")
++    } else {
++        format!("{host}:{port}")
++    }
++}
++
++fn write_denial_diagnostic(message: &str) {
++    use std::io::Write as _;
++
++    if let Err(error) = writeln!(std::io::stderr().lock(), "zerobox: {message}") {
++        error!("failed to write network denial diagnostic: {error}");
++    }
++}
++
+ pub fn blocked_message_with_policy(reason: &str, details: &PolicyDecisionDetails<'_>) -> String {
+-    let _ = (details.reason, details.host);
+-    blocked_message(reason).to_string()
++    debug_assert_eq!(reason, details.reason);
++    format!(
++        "Network access denied for {}: {}",
++        display_authority(details.host, details.port),
++        blocked_message(reason)
++    )
+ }
+ 
+ pub fn blocked_text_response_with_policy(
+     reason: &str,
+     details: &PolicyDecisionDetails<'_>,
+ ) -> Response {
++    let message = blocked_message_with_policy(reason, details);
++    write_denial_diagnostic(&message);
+     Response::builder()
+         .status(StatusCode::FORBIDDEN)
+         .header("content-type", "text/plain")
+         .header("x-proxy-error", blocked_header_value(reason))
+-        .body(Body::from(blocked_message_with_policy(reason, details)))
++        .body(Body::from(message))
+         .unwrap_or_else(|_| Response::new(Body::from("blocked")))
+ }
+ 
+@@ -113,6 +127,9 @@
+         };
+ 
+         let message = blocked_message_with_policy(REASON_NOT_ALLOWED, &details);
+-        assert_eq!(message, "Domain not in allowlist.");
++        assert_eq!(
++            message,
++            "Network access denied for api.example.com:443: Domain not in allowlist."
++        );
+     }
+ }
