@@ -11,6 +11,14 @@ pids = sorted(int(pid) for pid in os.listdir('/proc') if pid.isdigit())
 assert 1 in pids and os.getpid() in pids, pids
 assert subprocess.run(['unshare', '-Ur', '/bin/true'], capture_output=True).returncode != 0
 assert subprocess.run(['ip', '-4', 'route', 'add', '198.51.100.0/24', 'dev', 'lo'], capture_output=True).returncode != 0
+try:
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as ipv6:
+        ipv6.settimeout(2)
+        ipv6.connect(('2606:4700:4700::1111', 443, 0, 0))
+except OSError:
+    pass
+else:
+    raise AssertionError('IPv6 direct egress escaped mediation')
 with socket.create_connection(('203.0.113.10', 443), 2) as connection:
     connection.settimeout(2)
     connection.sendall(b'\x00')
