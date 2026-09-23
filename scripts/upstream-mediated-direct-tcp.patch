@@ -755,7 +755,32 @@
  use std::net::SocketAddr;
  use std::path::Path;
  use std::sync::Arc;
-@@ -456,6 +457,45 @@
+@@ -371,6 +372,15 @@
+     }
+ 
+     pub async fn host_blocked(&self, host: &str, port: u16) -> Result<HostBlockDecision> {
++        self.host_blocked_with_host_routes(host, port, true).await
++    }
++
++    async fn host_blocked_with_host_routes(
++        &self,
++        host: &str,
++        port: u16,
++        allow_host_routes: bool,
++    ) -> Result<HostBlockDecision> {
+         self.reload_if_needed().await?;
+         let host = match Host::parse(host) {
+             Ok(host) => host,
+@@ -403,7 +413,7 @@
+             return Ok(HostBlockDecision::Blocked(HostBlockReason::Denied));
+         }
+ 
+-        if rules_match_host_or_unscoped(&allow_host_rules, host_str, port, false) {
++        if allow_host_routes && rules_match_host_or_unscoped(&allow_host_rules, host_str, port, false) {
+             return Ok(HostBlockDecision::Allowed);
+         }
+ 
+@@ -456,6 +466,45 @@
          }
      }
  
@@ -769,7 +794,7 @@
 +    ) -> Result<Option<Vec<Ipv4Addr>>> {
 +        if host.parse::<IpAddr>().is_ok()
 +            || !matches!(
-+                self.host_blocked(host, port).await?,
++                self.host_blocked_with_host_routes(host, port, false).await?,
 +                HostBlockDecision::Allowed
 +            )
 +        {
@@ -801,7 +826,7 @@
      pub async fn is_host_domain_route(&self, host: &str, port: u16) -> Result<bool> {
          self.reload_if_needed().await?;
          let host = match Host::parse(host) {
-@@ -1066,6 +1106,26 @@
+@@ -1066,6 +1115,26 @@
          );
      }
  

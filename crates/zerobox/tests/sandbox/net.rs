@@ -98,6 +98,31 @@ fn mediated_direct_tcp_allows_proxy_bypassing_tls_for_an_allowed_hostname() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn mediated_direct_tcp_does_not_turn_a_host_route_into_public_dns_access() {
+    let script = r#"import socket
+try:
+    socket.gethostbyname('example.com')
+except socket.gaierror:
+    print('host-route-stayed-local')
+else:
+    raise AssertionError('host-only grant resolved a public direct destination')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--allow-read=/usr",
+        "--allow-host-net=example.com:443",
+        "--mediated-direct-tcp-port=443",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "host-route-stayed-local\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn mediated_direct_tcp_allows_proxy_bypassing_http_for_an_allowed_hostname() {
     let output = run(&[
         "--profile=analysis-strict",

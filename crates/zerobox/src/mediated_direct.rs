@@ -41,6 +41,7 @@ const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
 const DNS_TTL_SECONDS: u32 = 30;
+const MAX_DNS_CACHE_ENTRIES: usize = 512;
 
 pub(crate) struct MediatedDirectBroker {
     socket_path: PathBuf,
@@ -128,7 +129,19 @@ impl BrokerPolicy {
             return Ok(cached.addresses);
         }
         let addresses = self.state.resolve_allowed_public_ipv4(host, port).await?;
-        self.cache.lock().await.insert(
+        let now = Instant::now();
+        let mut cache = self.cache.lock().await;
+        cache.retain(|_, entry| entry.expires > now);
+        if cache.len() >= MAX_DNS_CACHE_ENTRIES
+            && !cache.contains_key(&key)
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
             key,
             CachedResolution {
                 expires: now + DNS_CACHE_TTL,
@@ -463,26 +476,76 @@ fn inspect_http_request(prefix: &[u8]) -> Inspection {
     let Ok(headers) = std::str::from_utf8(&prefix[..header_end + 2]) else {
         return Inspection::Reject("malformed HTTP headers");
     };
-    let mut lines = headers.split("\r\n");
+    let mut lines = headers.split_terminator("\r\n");
     let Some(request_line) = lines.next() else {
         return Inspection::Reject("malformed HTTP request");
     };
-    if !request_line.ends_with(" HTTP/1.1") {
+    let mut request_parts = request_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) = (
+        request_parts.next(),
+        request_parts.next(),
+        request_parts.next(),
+        request_parts.next(),
+    ) else {
+        return Inspection::Reject("malformed HTTP request");
+    };
+    if method.is_empty()
+        || !method.bytes().all(is_http_token_byte)
+        || target.is_empty()
+        || !target.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Inspection::Reject("malformed HTTP request");
+    }
+    if version != "HTTP/1.1" {
         return Inspection::Reject("unsupported direct HTTP version");
     }
-    let hosts = lines
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("host").then_some(value.trim())
-        })
-        .collect::<Vec<_>>();
-    if hosts.len() != 1 {
-        return Inspection::Reject("HTTP/1.1 requires one Host header");
+    let mut host = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Inspection::Reject("malformed HTTP headers");
+        };
+        if name.is_empty()
+            || !name.bytes().all(is_http_token_byte)
+            || !value
+                .bytes()
+                .all(|byte| byte == b'\t' || byte >= 0x20 && byte != 0x7f)
+        {
+            return Inspection::Reject("malformed HTTP headers");
+        }
+        if name.eq_ignore_ascii_case("host")
+            && host.replace(value.trim_matches([' ', '\t'])).is_some()
+        {
+            return Inspection::Reject("HTTP/1.1 requires one Host header");
+        }
     }
-    match normalize_observed_hostname(hosts[0]) {
+    let Some(host) = host else {
+        return Inspection::Reject("HTTP/1.1 requires one Host header");
+    };
+    match normalize_observed_hostname(host) {
         Some(host) => Inspection::Hostname(host),
         None => Inspection::Reject("HTTP Host is not an enforceable hostname"),
     }
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn inspect_tls_client_hello(prefix: &[u8]) -> Inspection {
@@ -815,6 +878,23 @@ mod tests {
     }
 
     #[test]
+    fn http_inspection_rejects_malformed_request_lines_and_headers() {
+        for request in [
+            "GET HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET /  HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: example.com\r\nBrokenHeader\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: example.com\r\n X-Fold: value\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: example.com\r\nX Bad: value\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: example.com\r\nX-Test: value\u{0001}\r\n\r\n",
+        ] {
+            assert!(
+                matches!(inspect_protocol(request.as_bytes()), Inspection::Reject(_)),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fragmented_http_and_tls_wait_for_the_complete_hostname() {
         assert_eq!(
             inspect_protocol(b"GET / HTTP/1.1\r\nHo"),
@@ -921,6 +1001,32 @@ mod tests {
         .await
         .expect("broker must reject the malformed helper frame");
         assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn denied_dns_questions_do_not_grow_the_broker_cache_without_bound() {
+        let allowed = vec!["*".to_string()];
+        let denied = vec!["*.invalid".to_string()];
+        let proxy = crate::proxy::build_proxy(
+            Some(&allowed),
+            &[],
+            Some(&denied),
+            &Arc::new(crate::secret::SecretStore::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let policy = BrokerPolicy::new(proxy.state, vec![443]);
+        for index in 0..513 {
+            assert!(
+                policy
+                    .resolve_for_dns(&format!("name-{index}.invalid"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(policy.cache.lock().await.len() <= 512);
     }
 
     fn tls_client_hello(host: &str, ech: bool) -> Vec<u8> {
