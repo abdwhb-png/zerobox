@@ -31,7 +31,7 @@ jobs:
           test "$(uname -m)" = x86_64
           if uname -r | grep -Eiq 'microsoft|wsl'; then exit 1; fi
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libcap-dev
+          sudo apt-get install -y bubblewrap libcap-dev iproute2 openssl
           sudo sysctl -w kernel.unprivileged_userns_clone=1
           if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -55,4 +55,30 @@ jobs:
           ZEROBOX_EXEC: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release/zerobox
         # Legacy root-readable fixtures observe other tests' transient FUSE
         # mounts. Serialize fixtures while retaining their explicit concurrency tests.
-        run: cargo test --offline --locked -p zerobox --test integration -- --test-threads=1
+        run: |
+          set -euo pipefail
+          fixture_root=$(mktemp -d)
+          fixture_ip=93.184.215.14
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$fixture_root/key.pem" -out "$fixture_root/cert.pem" \
+            -subj /CN=example.com -addext subjectAltName=DNS:example.com >/dev/null 2>&1
+          sudo ip route add local "$fixture_ip/32" dev lo table local
+          printf '%s example.com # zerobox-native-fixture\n' "$fixture_ip" | sudo tee -a /etc/hosts >/dev/null
+          sudo install -m 0644 "$fixture_root/cert.pem" /usr/local/share/ca-certificates/zerobox-native-example.crt
+          sudo update-ca-certificates >/dev/null
+          sudo python3 scripts/ci-native-direct-fixture.py \
+            --address "$fixture_ip" --cert "$fixture_root/cert.pem" --key "$fixture_root/key.pem" \
+            >"$fixture_root/server.log" 2>&1 &
+          fixture_pid=$!
+          trap 'sudo kill "$fixture_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl --proxy '' -fsS --max-time 2 http://example.com | grep -q 'Example Domain' && \
+               curl --proxy '' -fsS --max-time 2 https://example.com | grep -q 'Example Domain'; then
+              ready=1
+              break
+            fi
+            sleep 0.2
+          done
+          if test "$ready" -ne 1; then cat "$fixture_root/server.log"; exit 1; fi
+          cargo test --offline --locked -p zerobox --test integration -- --test-threads=1
