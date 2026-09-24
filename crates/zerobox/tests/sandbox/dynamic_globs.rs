@@ -107,6 +107,69 @@ async fn sdk_dynamic_globs_preserve_shebang_process_errors() {
 }
 
 #[tokio::test]
+async fn sdk_dynamic_globs_replace_absolute_symlinks_without_weakening_denies() {
+    let project = temp_dir();
+    let target = project.path().join("target.txt");
+    let denied = project.path().join("restricted/secret.txt");
+    std::fs::create_dir(project.path().join("restricted")).unwrap();
+    std::fs::write(&target, "target").unwrap();
+    std::fs::write(&denied, "secret").unwrap();
+    for name in ["removable", "source", "destination"] {
+        std::os::unix::fs::symlink(&target, project.path().join(name)).unwrap();
+    }
+    std::os::unix::fs::symlink(&denied, project.path().join("denied-link")).unwrap();
+    std::os::unix::fs::symlink(&target, project.path().join("blocked-link")).unwrap();
+    std::os::unix::fs::symlink("restricted", project.path().join("ancestor")).unwrap();
+
+    let output = Sandbox::command("/bin/sh")
+        .args(&[
+            "-c",
+            concat!(
+                "blocked=0; ",
+                "printf changed >denied-link 2>/dev/null && blocked=1; ",
+                "rm denied-link 2>/dev/null && blocked=1; ",
+                "mv denied-link escaped 2>/dev/null && blocked=1; ",
+                "rm blocked-link 2>/dev/null && blocked=1; ",
+                "rm ancestor/secret.txt 2>/dev/null && blocked=1; ",
+                "test \"$blocked\" -eq 0 || exit 44; ",
+                "rm removable || exit 45; ",
+                "mv source destination || exit 46; ",
+                "printf done"
+            ),
+        ])
+        .cwd(project.path())
+        .no_profile()
+        .allow_read("/")
+        .allow_write(project.path())
+        .deny_write_glob("*.pem")
+        .deny_write_glob("restricted/**")
+        .deny_write_glob("blocked-link")
+        .linux_sandbox_exe(zerobox_exec())
+        .run()
+        .await
+        .expect("run absolute symlink mutations through dynamic glob sandbox");
+
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "done");
+    assert!(std::fs::symlink_metadata(project.path().join("removable")).is_err());
+    assert!(std::fs::symlink_metadata(project.path().join("source")).is_err());
+    assert_eq!(
+        std::fs::read_link(project.path().join("destination")).unwrap(),
+        target
+    );
+    assert!(project.path().join("denied-link").exists());
+    assert!(project.path().join("blocked-link").exists());
+    assert!(!project.path().join("escaped").exists());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "target");
+    assert_eq!(std::fs::read_to_string(denied).unwrap(), "secret");
+}
+
+#[tokio::test]
 async fn sdk_dynamic_globs_preserve_atomic_file_and_tree_renames() {
     let project = temp_dir();
 

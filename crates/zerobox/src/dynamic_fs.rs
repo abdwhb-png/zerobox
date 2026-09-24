@@ -938,6 +938,24 @@ impl GuardedPassthroughFs {
         }
     }
 
+    fn check_existing_entry_write(&self, path: &Path) -> io::Result<()> {
+        match self.open_relative(path, libc::O_PATH | libc::O_NOFOLLOW, 0) {
+            Ok(fd) => {
+                let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+                self.check_write(path, resolved.as_deref())?;
+                if fstat(fd.as_raw_fd())?.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                    let target = readlink_fd(fd.as_raw_fd())?;
+                    let link = resolved.unwrap_or_else(|| self.absolute_path(path));
+                    let target = resolve_symlink_target(&link, &target)?;
+                    self.check_write(path, Some(&target))?;
+                }
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn stat_path(&self, path: &Path) -> io::Result<libc::stat> {
         let fd = self.open_metadata_checked(path)?;
         let stat = fstat(fd.as_raw_fd())?;
@@ -1038,13 +1056,24 @@ impl GuardedPassthroughFs {
         Ok((fd, cstring(name)?))
     }
 
-    fn open_parent_for_write(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
+    fn open_parent_checked_for_write(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
         self.check_write(path, None)?;
         let (parent, name) = self.open_parent(path)?;
         let resolved = Self::resolved_for_fd(parent.as_raw_fd())
             .map(|path| path.join(OsStr::from_bytes(name.as_bytes())));
         self.check_write(path, resolved.as_deref())?;
+        Ok((parent, name))
+    }
+
+    fn open_parent_for_write(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
+        let (parent, name) = self.open_parent_checked_for_write(path)?;
         self.check_existing_resolved_write(path)?;
+        Ok((parent, name))
+    }
+
+    fn open_parent_for_entry_mutation(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
+        let (parent, name) = self.open_parent_checked_for_write(path)?;
+        self.check_existing_entry_write(path)?;
         Ok((parent, name))
     }
 
@@ -1411,8 +1440,8 @@ impl Filesystem for GuardedPassthroughFs {
         let result = (|| {
             let old = self.child_path(parent, name)?;
             let new = self.child_path(new_parent, new_name)?;
-            let (old_parent, old_name) = self.open_parent_for_write(&old)?;
-            let (new_parent, new_name) = self.open_parent_for_write(&new)?;
+            let (old_parent, old_name) = self.open_parent_for_entry_mutation(&old)?;
+            let (new_parent, new_name) = self.open_parent_for_entry_mutation(&new)?;
             cvt(unsafe {
                 libc::syscall(
                     libc::SYS_renameat2,
@@ -1591,7 +1620,7 @@ impl GuardedPassthroughFs {
     fn remove(&self, parent: INodeNo, name: &OsStr, flags: i32, reply: ReplyEmpty) {
         let result = (|| {
             let path = self.child_path(parent, name)?;
-            let (parent, name) = self.open_parent_for_write(&path)?;
+            let (parent, name) = self.open_parent_for_entry_mutation(&path)?;
             cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) })?;
             self.state().remove_path_tree(&path);
             Ok(())
@@ -2313,6 +2342,122 @@ mod tests {
         let root = TempDir::new().unwrap();
 
         assert!(DynamicDenyPolicy::compile(root.path(), &["[broken".to_string()], &[]).is_err());
+    }
+
+    #[test]
+    fn mounted_view_unlinks_absolute_symlink_without_changing_target() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let target = lower.path().join("target.txt");
+        let link = lower.path().join("link");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+
+        std::fs::remove_file(view.join("link")).unwrap();
+        assert!(!link.exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn mounted_view_renames_absolute_symlinks_and_replaces_destination_entry() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let source_target = lower.path().join("source-target");
+        let destination_target = private.path().join("destination-target");
+        std::fs::write(&source_target, "source").unwrap();
+        std::fs::write(&destination_target, "destination").unwrap();
+        std::os::unix::fs::symlink(&source_target, lower.path().join("source")).unwrap();
+        std::os::unix::fs::symlink(&destination_target, lower.path().join("destination")).unwrap();
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+
+        std::fs::rename(view.join("source"), view.join("destination")).unwrap();
+        assert!(!lower.path().join("source").exists());
+        assert_eq!(
+            std::fs::read_link(lower.path().join("destination")).unwrap(),
+            source_target
+        );
+        assert_eq!(std::fs::read_to_string(source_target).unwrap(), "source");
+        assert_eq!(
+            std::fs::read_to_string(destination_target).unwrap(),
+            "destination"
+        );
+    }
+
+    #[test]
+    fn mounted_view_keeps_denied_symlink_targets_and_entries_protected() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::create_dir(lower.path().join("restricted")).unwrap();
+        let target = lower.path().join("restricted/secret");
+        std::fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, lower.path().join("allowed-link")).unwrap();
+        std::os::unix::fs::symlink(&target, lower.path().join("blocked-link")).unwrap();
+        std::os::unix::fs::symlink("restricted/secret", lower.path().join("relative-link"))
+            .unwrap();
+        std::os::unix::fs::symlink("restricted", lower.path().join("ancestor")).unwrap();
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &["restricted/**".to_string(), "blocked*".to_string()],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+
+        assert!(std::fs::remove_file(view.join("allowed-link")).is_err());
+        assert!(std::fs::rename(view.join("allowed-link"), view.join("moved")).is_err());
+        assert!(std::fs::remove_file(view.join("blocked-link")).is_err());
+        assert!(std::fs::remove_file(view.join("ancestor/secret")).is_err());
+        assert!(std::fs::write(view.join("relative-link"), "changed").is_err());
+        assert!(lower.path().join("allowed-link").exists());
+        assert!(lower.path().join("blocked-link").exists());
+        assert!(!lower.path().join("moved").exists());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn mounted_view_unlinks_dangling_absolute_symlink() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        let target = lower.path().join("missing");
+        let link = lower.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::remove_file(mounts.binds()[0].source.join("link")).unwrap();
+        assert!(std::fs::symlink_metadata(link).is_err());
     }
 
     #[test]
