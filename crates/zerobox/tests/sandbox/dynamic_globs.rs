@@ -2,6 +2,86 @@ use crate::support::{Command, temp_dir, zerobox_exec};
 use std::os::unix::fs::PermissionsExt;
 use zerobox::Sandbox;
 
+#[test]
+fn profile_scoped_write_exceptions_allow_future_caches_without_opening_packages() {
+    let project = temp_dir();
+    let home = tempfile::tempdir_in("/var/tmp").unwrap();
+    std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+    std::fs::create_dir_all(project.path().join("node_modules/package")).unwrap();
+    std::fs::write(
+        project.path().join("node_modules/package/index.js"),
+        "original",
+    )
+    .unwrap();
+    std::fs::write(home.path().join("profiles/scoped.json"), serde_json::to_vec(&serde_json::json!({
+        "deny_write_globs":["node_modules/*","*.key"],
+        "deny_write_exceptions":[{"pattern":"node_modules/*","paths":["node_modules/.vite-temp","node_modules/.vite","node_modules/.cache","node_modules/.vue-global-types","node_modules/.tmp"]}]
+    })).unwrap()).unwrap();
+    let output = Command::new(zerobox_exec()).env("ZEROBOX_HOME",home.path())
+        .args(["--profile","scoped","--allow-read","/","--allow-write"])
+        .arg(project.path()).arg("-C").arg(project.path()).args(["--","/bin/sh","-c", concat!(
+            "set -eu; for cache_name in .vite-temp .vite .cache .vue-global-types .tmp; do mkdir node_modules/$cache_name; printf cache >node_modules/$cache_name/generated; done; ",
+            "if printf changed >node_modules/package/index.js 2>/dev/null; then exit 21; fi; ",
+            "if printf secret >node_modules/.vite-temp/secret.key 2>/dev/null; then exit 22; fi; ",
+            "if mv node_modules/package/index.js node_modules/.vite-temp/moved 2>/dev/null; then exit 23; fi; ",
+            "if ln node_modules/package/index.js node_modules/.vite-temp/hardlink 2>/dev/null; then exit 24; fi; ",
+            "ln -s ../package node_modules/.vite-temp/link; ",
+            "if printf changed >node_modules/.vite-temp/link/index.js 2>/dev/null; then exit 25; fi; ",
+            "printf scoped-ok"
+        )]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "scoped-ok");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("node_modules/package/index.js")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn scoped_write_exceptions_reject_redirected_ungranted_and_unknown_targets() {
+    let project = temp_dir();
+    let outside = temp_dir();
+    let home = tempfile::tempdir_in("/var/tmp").unwrap();
+    std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+    std::fs::create_dir_all(project.path().join("node_modules/package")).unwrap();
+    std::os::unix::fs::symlink("package", project.path().join("node_modules/.vite")).unwrap();
+    for (pattern, path) in [
+        ("node_modules/*", "node_modules/.vite".to_string()),
+        ("node_modules/*", outside.path().display().to_string()),
+        ("node_modules/*", "node_modules/../escaped".to_string()),
+        ("unknown/*", "unknown/.cache".to_string()),
+    ] {
+        std::fs::write(
+            home.path().join("profiles/scoped.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "deny_write_globs":["node_modules/*"],
+                "deny_write_exceptions":[{"pattern":pattern,"paths":[path]}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(zerobox_exec())
+            .env("ZEROBOX_HOME", home.path())
+            .args(["--profile", "scoped", "--allow-read", "/", "--allow-write"])
+            .arg(project.path())
+            .arg("-C")
+            .arg(project.path())
+            .args(["--", "/bin/true"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "unexpected grant for {path}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("write exception"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "wall-clock benchmark: run explicitly on an idle host with --ignored --nocapture"]
 async fn dynamic_glob_hot_metadata_does_not_recompute_static_policy() {

@@ -50,6 +50,7 @@ pub use sandbox::SandboxOutput;
 pub use sandbox::SandboxSetupError;
 pub use sandbox::TcpPublication;
 pub use sandbox::TcpPublicationScope;
+pub use sandbox::WriteDenial;
 pub use zerobox_protocol::docker::{
     DockerAccessPolicy, DockerOperation, DockerTargetGrant, DockerTargetSelector, UnixSocketPath,
 };

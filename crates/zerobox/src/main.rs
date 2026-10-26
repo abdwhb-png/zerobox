@@ -629,7 +629,7 @@ async fn tokio_main(
                 let stderr_task = tokio::spawn(forward_stderr(stderr));
                 let stdout_abort = stdout_task.abort_handle();
                 let stderr_abort = stderr_task.abort_handle();
-                let child_status = child.wait().await;
+                let child_status = child.wait_with_write_denials().await;
                 if tokio::time::timeout(Duration::from_millis(250), async {
                     let _ = tokio::join!(stdout_task, stderr_task);
                 })
@@ -641,11 +641,11 @@ async fn tokio_main(
                 }
                 child_status
             } else {
-                child.wait().await
+                child.wait_with_write_denials().await
             };
             match child_status {
-                Ok(child_status) => {
-                    if let Err(error) = status.child_exit(child_status) {
+                Ok((child_status, denials)) => {
+                    if let Err(error) = status.child_exit(child_status, &denials) {
                         eprintln!("error: failed to emit child_exit status event: {error}");
                         return ExitCode::from(125);
                     }
@@ -914,17 +914,24 @@ impl StatusReporter {
         }
         self.emit(serde_json::json!({"version":2,"event":"sandbox_admitted","report_sha256":report_sha256}))
     }
-    fn child_exit(&mut self, status: std::process::ExitStatus) -> std::io::Result<()> {
+    fn child_exit(
+        &mut self,
+        status: std::process::ExitStatus,
+        denials: &[zerobox::WriteDenial],
+    ) -> std::io::Result<()> {
+        let mut event = serde_json::json!({"version":self.version,"event":"child_exit","code":status.code().unwrap_or(1)});
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             if let Some(signal) = status.signal() {
-                return self.emit_terminal(serde_json::json!({"version":self.version,"event":"child_exit","code":128 + signal,"signal":signal}));
+                event["code"] = (128 + signal).into();
+                event["signal"] = signal.into();
             }
         }
-        self.emit_terminal(
-            serde_json::json!({"version":self.version,"event":"child_exit","code":status.code().unwrap_or(1)}),
-        )
+        if self.version == 2 && !denials.is_empty() {
+            event["write_denials"] = serde_json::json!(denials);
+        }
+        self.emit_terminal(event)
     }
     fn emit_terminal(&mut self, value: serde_json::Value) -> std::io::Result<()> {
         let result = self.emit(value);

@@ -250,6 +250,10 @@ name, which is an explicit limit of path-based policy. Mutations resolve and
 check their parent before using the same directory descriptor; nofollow
 metadata operations modify the link itself and cannot mutate a denied target.
 
+Profiles may declare `deny_write_exceptions` entries with a denial `pattern` and a non-empty array of literal `paths`. For example, `{"pattern":"node_modules/*","paths":["node_modules/.vite-temp"]}` permits this generated directory and its descendants only when the ordinary policy already permits writing there. The exception affects that glob alone; other denials remain effective. Redirected paths, parent traversal, unmatched denial patterns and targets outside existing write authority are rejected before execution. Ordinary profiles without exceptions keep their existing behavior.
+
+Runtime bundles report configured write exceptions through admission schema 3. Status protocol v2 may include a bounded `write_denials` array in `child_exit`, identifying actual refused writes and their glob rules. These records come from the native filesystem checks and do not interpret command stderr as evidence. The SDK's `wait_with_write_denials` returns the exit status and those records while preserving resource ownership until the command exits.
+
 Dynamic globs require Linux Bubblewrap, `/dev/fuse`, and `fusermount3`.
 Zerobox mounts a guarded view under its private runtime directory and exposes
 it only inside the command namespace. Mount failure blocks spawn; there is no

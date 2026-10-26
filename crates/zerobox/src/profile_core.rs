@@ -140,6 +140,7 @@ pub struct Profile {
     pub allow_write: Option<Vec<String>>,
     pub deny_write: Option<Vec<String>>,
     pub deny_write_globs: Option<Vec<String>>,
+    pub deny_write_exceptions: Option<Vec<WriteException>>,
     pub allow_net: Option<Vec<String>>,
     pub allow_host_net: Option<Vec<String>>,
     pub deny_net: Option<Vec<String>>,
@@ -156,6 +157,13 @@ pub struct Profile {
     pub snapshot_paths: Option<Vec<String>>,
     pub snapshot_exclude: Option<Vec<String>>,
     pub debug: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteException {
+    pub pattern: String,
+    pub paths: Vec<String>,
 }
 
 fn schema_string_or_array(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
@@ -203,6 +211,14 @@ pub fn expand_profile(p: &mut Profile, home: &Path, cwd: &Path, tmpdir: &Path) {
     expand_vec(&mut p.allow_write, home, cwd, tmpdir);
     expand_vec(&mut p.deny_write, home, cwd, tmpdir);
     expand_vec(&mut p.deny_write_globs, home, cwd, tmpdir);
+    if let Some(rules) = &mut p.deny_write_exceptions {
+        for rule in rules {
+            rule.pattern = expand_templates(&rule.pattern, home, cwd, tmpdir);
+            for path in &mut rule.paths {
+                *path = expand_templates(path, home, cwd, tmpdir);
+            }
+        }
+    }
     expand_vec(&mut p.snapshot_paths, home, cwd, tmpdir);
     expand_vec(&mut p.snapshot_exclude, home, cwd, tmpdir);
     if let Some(ref mut env) = p.set_env {
@@ -212,10 +228,10 @@ pub fn expand_profile(p: &mut Profile, home: &Path, cwd: &Path, tmpdir: &Path) {
     }
 }
 
-pub fn dedup_append(
-    base: &Option<Vec<String>>,
-    child: &Option<Vec<String>>,
-) -> Option<Vec<String>> {
+pub fn dedup_append<T: Clone + PartialEq>(
+    base: &Option<Vec<T>>,
+    child: &Option<Vec<T>>,
+) -> Option<Vec<T>> {
     match (base, child) {
         (None, None) => None,
         (Some(b), None) => Some(b.clone()),
@@ -283,6 +299,10 @@ pub fn merge_profiles(base: &Profile, child: &Profile) -> Profile {
         allow_write: dedup_append(&base.allow_write, &child.allow_write),
         deny_write: dedup_append(&base.deny_write, &child.deny_write),
         deny_write_globs: dedup_append(&base.deny_write_globs, &child.deny_write_globs),
+        deny_write_exceptions: dedup_append(
+            &base.deny_write_exceptions,
+            &child.deny_write_exceptions,
+        ),
         allow_net: dedup_append(&base.allow_net, &child.allow_net),
         allow_host_net: dedup_append(&base.allow_host_net, &child.allow_host_net),
         deny_net: dedup_append(&base.deny_net, &child.deny_net),
@@ -451,6 +471,16 @@ pub fn load_profile_uses(name: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_exception_profile_preserves_rule_scoped_literal_paths() {
+        let json = serde_json::json!({"deny_write_globs":["node_modules/*"],"deny_write_exceptions":[{"pattern":"node_modules/*","paths":["node_modules/.vite-temp"]}]});
+        let profile: super::Profile =
+            serde_json::from_value(json.clone()).expect("parse scoped write exceptions");
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["deny_write_exceptions"],
+            json["deny_write_exceptions"]
+        );
+    }
     use std::path::Path;
 
     use super::load_profile;

@@ -24,6 +24,15 @@
         "type": "string"
       }
     },
+    "allow_host_net": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
     "allow_net": {
       "type": [
         "array",
@@ -84,7 +93,34 @@
         "type": "string"
       }
     },
+    "deny_read_globs": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
     "deny_write": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "deny_write_exceptions": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/WriteException"
+      }
+    },
+    "deny_write_globs": {
       "type": [
         "array",
         "null"
@@ -97,6 +133,16 @@
       "type": [
         "string",
         "null"
+      ]
+    },
+    "docker": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DockerAccessPolicy"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "no_sandbox": {
@@ -183,5 +229,211 @@
       ]
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "definitions": {
+    "DockerAccessPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "disabled"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "endpoint",
+            "mode",
+            "targets"
+          ],
+          "properties": {
+            "endpoint": {
+              "$ref": "#/definitions/UnixSocketPath"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "targeted"
+              ]
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/DockerTargetGrant"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "endpoint",
+            "mode"
+          ],
+          "properties": {
+            "endpoint": {
+              "$ref": "#/definitions/UnixSocketPath"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "full"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "DockerOperation": {
+      "type": "string",
+      "enum": [
+        "ps",
+        "inspect",
+        "logs",
+        "stats",
+        "exec",
+        "start",
+        "stop",
+        "restart"
+      ]
+    },
+    "DockerTargetGrant": {
+      "type": "object",
+      "required": [
+        "selector"
+      ],
+      "properties": {
+        "allowUnsafeExec": {
+          "description": "Explicit permanent exception. Absence retains bounded inspection.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allowUnsafeTarget": {
+          "default": false,
+          "type": "boolean"
+        },
+        "operations": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/DockerOperation"
+          }
+        },
+        "selector": {
+          "$ref": "#/definitions/DockerTargetSelector"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DockerTargetSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "type"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "container-name"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "project",
+            "service",
+            "type"
+          ],
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "compose-service"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Runtime-only, exact-container authorization. Callers must reject this selector in persistent authority so it cannot outlive its owning session.",
+          "type": "object",
+          "required": [
+            "id",
+            "type",
+            "unsafeExecExpiresAtMs"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "ephemeral-container"
+              ]
+            },
+            "unsafeExecExpiresAtMs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "UnixSocketPath": {
+      "description": "A local Unix-domain socket endpoint for the Docker Engine API.",
+      "type": "string"
+    },
+    "WriteException": {
+      "type": "object",
+      "required": [
+        "paths",
+        "pattern"
+      ],
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pattern": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

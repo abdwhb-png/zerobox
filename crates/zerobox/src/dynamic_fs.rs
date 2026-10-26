@@ -22,6 +22,8 @@ use zerobox_protocol::permissions::{
 };
 
 use crate::process_owner::{is_process_alive, owned_run_prefix, owner_pid};
+use crate::profile_core::WriteException;
+use crate::sandbox::WriteDenial;
 
 const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 // FUSE exposes this kernel-internal bit on opens originating from execve(2).
@@ -30,6 +32,8 @@ const FMODE_EXEC: i32 = 0x20;
 
 #[derive(Debug, Clone)]
 struct CompiledPattern {
+    source: String,
+    exceptions: Vec<PathBuf>,
     matcher: GlobMatcher,
     match_scope: PathBuf,
     mount_root: PathBuf,
@@ -40,6 +44,7 @@ struct CompiledPattern {
 pub(crate) struct DynamicDenyPolicy {
     deny_read: Vec<CompiledPattern>,
     deny_write: Vec<CompiledPattern>,
+    write_denials: Arc<Mutex<Vec<WriteDenial>>>,
     mount_roots: Vec<PathBuf>,
     mount_destinations: Vec<PathBuf>,
     base_policy: FileSystemSandboxPolicy,
@@ -64,6 +69,7 @@ impl DynamicDenyPolicy {
         )
     }
 
+    #[cfg(test)]
     fn compile_with_base_policy(
         cwd: &Path,
         deny_read: &[String],
@@ -71,6 +77,27 @@ impl DynamicDenyPolicy {
         base_policy: FileSystemSandboxPolicy,
         exact_unix_sockets: &[PathBuf],
     ) -> Result<Option<Self>> {
+        Self::compile_with_exceptions(
+            cwd,
+            deny_read,
+            deny_write,
+            base_policy,
+            exact_unix_sockets,
+            &[],
+        )
+    }
+
+    fn compile_with_exceptions(
+        cwd: &Path,
+        deny_read: &[String],
+        deny_write: &[String],
+        base_policy: FileSystemSandboxPolicy,
+        exact_unix_sockets: &[PathBuf],
+        exceptions: &[WriteException],
+    ) -> Result<Option<Self>> {
+        if !exceptions.is_empty() && deny_write.is_empty() {
+            bail!("write exceptions require a denial glob");
+        }
         if deny_read.is_empty() && deny_write.is_empty() && exact_unix_sockets.is_empty() {
             return Ok(None);
         }
@@ -106,13 +133,67 @@ impl DynamicDenyPolicy {
             .into_iter()
             .filter(|pattern| pattern.can_affect_any(&readable_roots))
             .collect::<Vec<_>>();
-        let deny_write = deny_write
+        let mut deny_write = deny_write
             .iter()
             .map(|pattern| compile_pattern(cwd, &canonical_cwd, pattern))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|pattern| pattern.can_affect_any(&writable_roots))
             .collect::<Vec<_>>();
+        for rule in exceptions {
+            let Some(pattern) = deny_write
+                .iter_mut()
+                .find(|pattern| pattern.source == rule.pattern)
+            else {
+                bail!("write exception references an unknown denial glob");
+            };
+            if rule.paths.is_empty() {
+                bail!("write exceptions require literal paths");
+            }
+            for path in &rule.paths {
+                if path.is_empty()
+                    || path.contains('\0')
+                    || path.chars().any(|c| GLOB_META.contains(&c))
+                    || has_parent_component(Path::new(path))
+                {
+                    bail!("invalid write exception path");
+                }
+                let path = normalize_pattern_path(&canonical_cwd.join(expand_home(path)?))?;
+                let mut ancestor = path.as_path();
+                let mut suffix = Vec::new();
+                let canonical = loop {
+                    match std::fs::canonicalize(ancestor) {
+                        Ok(mut root) => {
+                            for component in suffix.iter().rev() {
+                                root.push(component);
+                            }
+                            break root;
+                        }
+                        Err(e)
+                            if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) =>
+                        {
+                            suffix.push(
+                                ancestor
+                                    .file_name()
+                                    .context("invalid exception ancestor")?
+                                    .to_os_string(),
+                            );
+                            ancestor = ancestor.parent().context("missing exception ancestor")?;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                if path != canonical
+                    || !base_policy.can_write_path_with_cwd(&path, &canonical_cwd)
+                    || !matches_any(std::slice::from_ref(pattern), &path)
+                {
+                    bail!(
+                        "write exception must be an unredirected writable path covered by its denial glob"
+                    );
+                }
+                pattern.exceptions.push(path);
+            }
+        }
         if deny_read.is_empty() && deny_write.is_empty() && exact_unix_sockets.is_empty() {
             return Ok(None);
         }
@@ -163,6 +244,7 @@ impl DynamicDenyPolicy {
         Ok(Some(Self {
             deny_read,
             deny_write,
+            write_denials: Arc::new(Mutex::new(Vec::new())),
             mount_roots,
             mount_destinations,
             base_policy,
@@ -182,6 +264,43 @@ impl DynamicDenyPolicy {
 
     pub(crate) fn is_write_denied(&self, requested: &Path, resolved: Option<&Path>) -> bool {
         self.path_access(requested).1 || resolved.is_some_and(|path| self.path_access(path).1)
+    }
+
+    fn record_write_denial(&self, requested: &Path, resolved: Option<&Path>) {
+        for path in std::iter::once(requested).chain(resolved) {
+            if self.path_access(path).0
+                || !self.base_policy.can_write_path_with_cwd(path, &self.cwd)
+            {
+                continue;
+            }
+            if let Some(pattern) = matching_pattern(&self.deny_write, path) {
+                let Some(path) = path.to_str() else {
+                    return;
+                };
+                if path
+                    .chars()
+                    .chain(pattern.source.chars())
+                    .any(char::is_control)
+                {
+                    return;
+                }
+                let denial = WriteDenial {
+                    path: path.to_owned(),
+                    pattern: pattern.source.clone(),
+                };
+                let mut entries = self
+                    .write_denials
+                    .lock()
+                    .expect("write denial collection poisoned");
+                if entries.len() < 3
+                    && !entries.contains(&denial)
+                    && serde_json::to_vec(&denial).is_ok_and(|bytes| bytes.len() <= 1024)
+                {
+                    entries.push(denial);
+                }
+                return;
+            }
+        }
     }
 
     fn is_structural_read_ancestor(&self, path: &Path) -> bool {
@@ -319,6 +438,8 @@ fn compile_pattern(cwd: &Path, canonical_cwd: &Path, source: &str) -> Result<Com
         .compile_matcher();
 
     Ok(CompiledPattern {
+        source: source.to_owned(),
+        exceptions: Vec::new(),
         matcher,
         match_scope,
         mount_root,
@@ -399,14 +520,25 @@ fn safe_static_prefix(pattern: &Path) -> Result<PathBuf> {
 }
 
 fn matches_any(patterns: &[CompiledPattern], path: &Path) -> bool {
-    path.ancestors().any(|candidate| {
-        patterns.iter().any(|pattern| {
-            pattern.matcher.is_match(candidate) || {
-                let mut directory = candidate.as_os_str().to_os_string();
-                directory.push("/");
-                pattern.matcher.is_match(Path::new(&directory))
-            }
-        })
+    matching_pattern(patterns, path).is_some()
+}
+
+fn matching_pattern<'a>(
+    patterns: &'a [CompiledPattern],
+    path: &Path,
+) -> Option<&'a CompiledPattern> {
+    patterns.iter().find(|pattern| {
+        !pattern
+            .exceptions
+            .iter()
+            .any(|exception| path.starts_with(exception))
+            && path.ancestors().any(|candidate| {
+                pattern.matcher.is_match(candidate) || {
+                    let mut directory = candidate.as_os_str().to_os_string();
+                    directory.push("/");
+                    pattern.matcher.is_match(Path::new(&directory))
+                }
+            })
     })
 }
 
@@ -431,7 +563,6 @@ pub(crate) struct DynamicDenyMounts {
     _sessions: Vec<fuser::BackgroundSession>,
     _root: tempfile::TempDir,
     binds: Vec<DynamicBindMount>,
-    #[cfg(test)]
     policy: Arc<DynamicDenyPolicy>,
 }
 
@@ -447,6 +578,7 @@ impl DynamicDenyMounts {
         Self::prepare_with_unix_sockets_in(cwd, deny_read, deny_write, &[], base_policy, parent)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_with_unix_sockets_in(
         cwd: &Path,
         deny_read: &[String],
@@ -455,12 +587,33 @@ impl DynamicDenyMounts {
         base_policy: &FileSystemSandboxPolicy,
         parent: &Path,
     ) -> Result<Option<Self>> {
-        let Some(policy) = DynamicDenyPolicy::compile_with_base_policy(
+        Self::prepare_with_exceptions_in(
+            cwd,
+            deny_read,
+            deny_write,
+            exact_unix_sockets,
+            base_policy,
+            parent,
+            &[],
+        )
+    }
+
+    pub(crate) fn prepare_with_exceptions_in(
+        cwd: &Path,
+        deny_read: &[String],
+        deny_write: &[String],
+        exact_unix_sockets: &[PathBuf],
+        base_policy: &FileSystemSandboxPolicy,
+        parent: &Path,
+        exceptions: &[WriteException],
+    ) -> Result<Option<Self>> {
+        let Some(policy) = DynamicDenyPolicy::compile_with_exceptions(
             cwd,
             deny_read,
             deny_write,
             base_policy.clone(),
             exact_unix_sockets,
+            exceptions,
         )?
         else {
             return Ok(None);
@@ -521,7 +674,6 @@ impl DynamicDenyMounts {
         }
 
         Ok(Some(Self {
-            #[cfg(test)]
             policy,
             _sessions: sessions,
             _root: root,
@@ -531,6 +683,14 @@ impl DynamicDenyMounts {
 
     pub(crate) fn binds(&self) -> &[DynamicBindMount] {
         &self.binds
+    }
+
+    pub(crate) fn write_denials(&self) -> Vec<WriteDenial> {
+        self.policy
+            .write_denials
+            .lock()
+            .expect("write denial collection poisoned")
+            .clone()
     }
 
     #[cfg(test)]
@@ -899,6 +1059,7 @@ impl GuardedPassthroughFs {
     fn check_write(&self, relative: &Path, resolved: Option<&Path>) -> io::Result<()> {
         let requested = self.absolute_path(relative);
         if self.policy.is_write_denied(&requested, resolved) {
+            self.policy.record_write_denial(&requested, resolved);
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         Ok(())

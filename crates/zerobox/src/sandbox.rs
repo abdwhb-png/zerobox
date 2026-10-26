@@ -144,6 +144,12 @@ pub struct SandboxOutput {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WriteDenial {
+    pub path: String,
+    pub pattern: String,
+}
+
 /// A typed failure that occurred before the sandboxed target crossed its final
 /// setup boundary. Target exit statuses are always returned separately.
 #[derive(Debug)]
@@ -206,6 +212,20 @@ impl SandboxChild {
 
     pub async fn wait(mut self) -> Result<ExitStatus> {
         Ok(self.inner.wait().await?)
+    }
+
+    pub async fn wait_with_write_denials(mut self) -> Result<(ExitStatus, Vec<WriteDenial>)> {
+        let status = self.inner.wait().await?;
+        #[cfg(target_os = "linux")]
+        let denials = self
+            ._resources
+            ._dynamic_fs
+            .as_ref()
+            .map(|view| view.write_denials())
+            .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let denials = Vec::new();
+        Ok((status, denials))
     }
 
     #[doc(hidden)]
@@ -825,6 +845,7 @@ impl Sandbox {
                 true
             }
         };
+        let mut deny_write_exceptions = Vec::new();
         if use_profile && apply_implicit_default_profile {
             let profile = if profile_names.is_empty() {
                 crate::profile_core::load_profile("default", &cwd)?
@@ -833,6 +854,8 @@ impl Sandbox {
             };
             effective_strict = is_strict(effective_strict, &profile);
             if !disabled && !full_access {
+                deny_write_exceptions
+                    .extend(profile.deny_write_exceptions.clone().unwrap_or_default());
                 apply_profile(
                     &profile,
                     &mut allow_read,
@@ -1241,7 +1264,7 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         let dynamic_fs = if sandbox_type == SandboxType::LinuxSeccomp {
-            DynamicDenyMounts::prepare_with_unix_sockets_in(
+            DynamicDenyMounts::prepare_with_exceptions_in(
                 &cwd,
                 &deny_read_globs,
                 &host_deny_write_globs,
@@ -1254,6 +1277,7 @@ impl Sandbox {
                     .as_ref()
                     .expect("Linux sandbox requires a private runtime")
                     .views_root(),
+                &deny_write_exceptions,
             )?
         } else if disabled || (deny_read_globs.is_empty() && host_deny_write_globs.is_empty()) {
             None
@@ -1701,7 +1725,7 @@ impl Sandbox {
                 if bundle.component == RuntimeComponent::Analysis {
                     mounts.push(serde_json::json!({"source": bundle.component_root, "destination": ANALYSIS_ROOT, "access":"ro", "origin":"runtime"}));
                 }
-                let admission_schema = if mediated_direct_tcp_ports.is_empty() { 1 } else { 2 };
+                let admission_schema = if !deny_write_exceptions.is_empty() { 3 } else if mediated_direct_tcp_ports.is_empty() { 1 } else { 2 };
                 let mut admission_network = serde_json::json!({
                     "mode": if net_enabled { "domain-allowlist" } else { "deny-all" },
                     "allow": allow_net.unwrap_or_default(),
@@ -1714,7 +1738,7 @@ impl Sandbox {
                         "ports": mediated_direct_tcp_ports,
                     });
                 }
-                let receipt = serde_json::json!({
+                let mut receipt = serde_json::json!({
                     "schema": admission_schema,
                     "runtime": {
                         "target": "x86_64-unknown-linux-gnu",
@@ -1748,6 +1772,7 @@ impl Sandbox {
                     "docker": docker_access,
                     "path": admission_target_env.get("PATH").map(|value| value.split(':').collect::<Vec<_>>()).unwrap_or_default(),
                 });
+                if !deny_write_exceptions.is_empty() { receipt["filesystem"]["denyWriteExceptions"] = serde_json::json!(deny_write_exceptions); }
                 serde_json::to_vec(&receipt).context("serialize runtime admission receipt")
             })
             .transpose()?;
