@@ -377,6 +377,7 @@ async fn sdk_targeted_docker_cli_and_compose_matrix_is_confined_to_the_granted_s
             },
             operations: None,
             allow_unsafe_target: false,
+            allow_unsafe_exec: None,
         }],
     };
     let script = format!(

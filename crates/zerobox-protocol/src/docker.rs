@@ -123,6 +123,9 @@ pub struct DockerTargetGrant {
     pub operations: Option<Vec<DockerOperation>>,
     #[serde(default)]
     pub allow_unsafe_target: bool,
+    /// Explicit permanent exception. Absence retains bounded inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unsafe_exec: Option<bool>,
 }
 
 impl DockerTargetGrant {

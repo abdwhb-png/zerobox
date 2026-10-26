@@ -38,6 +38,7 @@ struct TargetSnapshot {
     inspection_exec_ids: Mutex<HashSet<String>>,
     inspection_roots: HashMap<String, Vec<String>>,
     exec_expiries: HashMap<String, u64>,
+    reported_denials: Mutex<HashSet<std::mem::Discriminant<AuthorizationError>>>,
 }
 
 #[derive(Debug)]
@@ -223,6 +224,36 @@ enum AuthorizationError {
     ExecRestriction(&'static str),
 }
 
+impl TargetSnapshot {
+    fn rejection_response(&self, error: AuthorizationError) -> (u16, &'static str) {
+        let response = match error {
+            AuthorizationError::NotFound => (
+                404,
+                "Docker target is not authorized by this grant or no longer exists",
+            ),
+            AuthorizationError::Forbidden => (
+                403,
+                "Docker operation is not granted or route is unsupported",
+            ),
+            AuthorizationError::ExecOption(reason)
+            | AuthorizationError::ExecRestriction(reason) => (403, reason),
+        };
+        // Only the four authorization categories can enter this per-invocation set.
+        if self
+            .reported_denials
+            .lock()
+            .expect("Docker diagnostic registry poisoned")
+            .insert(std::mem::discriminant(&error))
+        {
+            eprintln!(
+                "Zerobox: Docker broker rejected request: {}. This denial does not establish host Docker daemon availability.",
+                response.1
+            );
+        }
+        response
+    }
+}
+
 async fn handle_targeted_connection(
     client: &mut UnixStream,
     endpoint: &Path,
@@ -256,32 +287,9 @@ async fn handle_targeted_connection_with_timeouts(
 
     let action = match authorize_request(snapshot, &request) {
         Ok(action) => action,
-        Err(AuthorizationError::NotFound) => {
-            write_error_with_timeout(
-                client,
-                404,
-                "Docker target is not authorized by this grant or no longer exists",
-                stream_idle_timeout,
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(AuthorizationError::Forbidden) => {
-            write_error_with_timeout(
-                client,
-                403,
-                "Docker operation is not granted or route is unsupported",
-                stream_idle_timeout,
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(AuthorizationError::ExecOption(reason)) => {
-            write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
-            return Ok(());
-        }
-        Err(AuthorizationError::ExecRestriction(reason)) => {
-            write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
+        Err(error) => {
+            let (status, reason) = snapshot.rejection_response(error);
+            write_error_with_timeout(client, status, reason, stream_idle_timeout).await?;
             return Ok(());
         }
     };
@@ -351,7 +359,9 @@ async fn handle_targeted_connection_with_timeouts(
             inspection,
         } => {
             if let Err(reason) = validate_exec_body(&request.body, true) {
-                write_error_with_timeout(client, 403, reason, stream_idle_timeout).await?;
+                let (status, reason) =
+                    snapshot.rejection_response(AuthorizationError::ExecOption(reason));
+                write_error_with_timeout(client, status, reason, stream_idle_timeout).await?;
                 return Ok(());
             }
             request.target = rewrite_container_target(&request.target, &container_id)?;
@@ -1431,7 +1441,7 @@ async fn resolve_target_snapshot(
                     .contains(&DockerOperation::Exec)
         });
         let persistent_exec = eligible_grants.iter().any(|grant| {
-            !grant.allow_unsafe_target
+            (!grant.allow_unsafe_target || grant.allow_unsafe_exec == Some(true))
                 && !matches!(
                     grant.selector,
                     DockerTargetSelector::EphemeralContainer { .. }
@@ -1464,7 +1474,7 @@ async fn resolve_target_snapshot(
                     .copied()
                     .filter(|operation| {
                         *operation != DockerOperation::Exec
-                            || !grant.allow_unsafe_target
+                            || persistent_exec
                             || matches!(
                                 grant.selector,
                                 DockerTargetSelector::EphemeralContainer { .. }
@@ -1476,7 +1486,7 @@ async fn resolve_target_snapshot(
         snapshot
             .containers
             .insert(id.to_string(), AllowedContainer { operations });
-        if inspection_requested {
+        if inspection_requested && !persistent_exec {
             snapshot
                 .inspection_roots
                 .insert(id.to_string(), bind_mount_destinations(&inspect));
@@ -2037,6 +2047,7 @@ mod tests {
                 },
                 operations: Some(vec![DockerOperation::Logs]),
                 allow_unsafe_target: false,
+                allow_unsafe_exec: None,
             }],
         };
 
@@ -2533,6 +2544,7 @@ mod tests {
             },
             operations: Some(vec![DockerOperation::Logs]),
             allow_unsafe_target: false,
+            allow_unsafe_exec: None,
         };
 
         let policy = DockerAccessPolicy::Targeted {
@@ -2589,6 +2601,7 @@ mod tests {
             },
             operations: Some(Vec::new()),
             allow_unsafe_target,
+            allow_unsafe_exec: None,
         };
 
         let denied = super::resolve_target_snapshot(&engine_path, &[grant(false)])
@@ -2607,6 +2620,7 @@ mod tests {
             },
             operations: Some(vec![DockerOperation::Exec]),
             allow_unsafe_target: true,
+            allow_unsafe_exec: None,
         };
         let restricted = super::resolve_target_snapshot(&engine_path, &[administration])
             .await
@@ -2649,6 +2663,23 @@ mod tests {
             );
         }
 
+        let trusted: DockerTargetGrant = serde_json::from_value(serde_json::json!({
+            "selector": {"type":"container-name","name":"api"},
+            "operations":["exec"], "allowUnsafeTarget":true, "allowUnsafeExec":true
+        }))
+        .unwrap();
+        let permanent = super::resolve_target_snapshot(&engine_path, &[trusted])
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::authorize_request(&permanent, &mutation),
+            Ok(super::TargetedAction::ExecCreate {
+                inspection: false,
+                ..
+            })
+        ));
+        assert!(!permanent.exec_expiries.contains_key(CONTAINER_ID));
+
         let expires_at = super::current_unix_time_ms().unwrap() + 60_000;
         let break_glass = DockerTargetGrant {
             selector: DockerTargetSelector::EphemeralContainer {
@@ -2657,6 +2688,7 @@ mod tests {
             },
             operations: Some(vec![DockerOperation::Exec]),
             allow_unsafe_target: true,
+            allow_unsafe_exec: None,
         };
         let elevated = super::resolve_target_snapshot(&engine_path, &[break_glass])
             .await
@@ -2704,6 +2736,7 @@ mod tests {
             },
             operations: None,
             allow_unsafe_target: false,
+            allow_unsafe_exec: None,
         };
         for id in ["replica-1", "replica-2"] {
             let summary = serde_json::json!({
@@ -2738,6 +2771,7 @@ mod tests {
             },
             operations: Some(vec![DockerOperation::Exec]),
             allow_unsafe_target: true,
+            allow_unsafe_exec: None,
         };
         let current = serde_json::json!({ "Id": "current" });
         let replacement = serde_json::json!({ "Id": "replacement" });

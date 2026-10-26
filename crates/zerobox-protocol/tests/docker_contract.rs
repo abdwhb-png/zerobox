@@ -5,6 +5,16 @@ use zerobox_protocol::docker::{
 };
 
 #[test]
+fn permanent_exec_exception_round_trips_without_changing_default_grants() {
+    let value = serde_json::json!({"selector":{"type":"container-name","name":"api"},"operations":["exec"],"allowUnsafeTarget":true,"allowUnsafeExec":true});
+    let grant: DockerTargetGrant = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(grant).unwrap(), value);
+    let default = serde_json::json!({"selector":{"type":"container-name","name":"api"},"operations":["exec"],"allowUnsafeTarget":true});
+    let grant: DockerTargetGrant = serde_json::from_value(default.clone()).unwrap();
+    assert_eq!(serde_json::to_value(grant).unwrap(), default);
+}
+
+#[test]
 fn docker_contract_round_trips_targeted_grants() {
     let policy = DockerAccessPolicy::Targeted {
         endpoint: UnixSocketPath::from_str("unix:///var/run/docker.sock").unwrap(),
@@ -15,6 +25,7 @@ fn docker_contract_round_trips_targeted_grants() {
             },
             operations: None,
             allow_unsafe_target: false,
+            allow_unsafe_exec: None,
         }],
     };
 
@@ -51,6 +62,7 @@ fn container_name_selector_has_an_explicit_json_field() {
             },
             operations: Some(vec![DockerOperation::Inspect]),
             allow_unsafe_target: false,
+            allow_unsafe_exec: None,
         }],
     };
 
