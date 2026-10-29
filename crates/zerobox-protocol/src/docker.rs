@@ -142,6 +142,12 @@ pub enum DockerAccessPolicy {
     Targeted {
         endpoint: UnixSocketPath,
         targets: Vec<DockerTargetGrant>,
+        #[serde(
+            rename = "engineInfo",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        engine_info: Option<bool>,
     },
     Full {
         endpoint: UnixSocketPath,

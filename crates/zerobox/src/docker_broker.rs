@@ -32,6 +32,7 @@ enum BrokerMode {
 
 #[derive(Debug, Default)]
 struct TargetSnapshot {
+    engine_info: bool,
     containers: HashMap<String, AllowedContainer>,
     aliases: HashMap<String, String>,
     exec_ids: Mutex<HashMap<String, String>>,
@@ -67,9 +68,14 @@ impl DockerBroker {
             DockerAccessPolicy::Full { endpoint } => {
                 (endpoint.as_path().to_path_buf(), BrokerMode::Full)
             }
-            DockerAccessPolicy::Targeted { endpoint, targets } => {
+            DockerAccessPolicy::Targeted {
+                endpoint,
+                targets,
+                engine_info,
+            } => {
                 let endpoint = endpoint.as_path().to_path_buf();
-                let snapshot = resolve_target_snapshot(&endpoint, targets).await?;
+                let mut snapshot = resolve_target_snapshot(&endpoint, targets).await?;
+                snapshot.engine_info = *engine_info == Some(true);
                 (endpoint, BrokerMode::Targeted(Arc::new(snapshot)))
             }
         };
@@ -220,6 +226,8 @@ enum TargetedAction {
 enum AuthorizationError {
     NotFound,
     Forbidden,
+    EngineInfo,
+    UnsupportedRoute,
     ExecOption(&'static str),
     ExecRestriction(&'static str),
 }
@@ -231,14 +239,17 @@ impl TargetSnapshot {
                 404,
                 "Docker target is not authorized by this grant or no longer exists",
             ),
-            AuthorizationError::Forbidden => (
-                403,
-                "Docker operation is not granted or route is unsupported",
-            ),
+            AuthorizationError::UnsupportedRoute => {
+                (403, "Docker API route is unsupported in targeted mode")
+            }
+            AuthorizationError::EngineInfo => {
+                (403, "Docker engine information permission is missing")
+            }
+            AuthorizationError::Forbidden => (403, "Docker operation is not granted"),
             AuthorizationError::ExecOption(reason)
             | AuthorizationError::ExecRestriction(reason) => (403, reason),
         };
-        // Only the four authorization categories can enter this per-invocation set.
+        // Each authorization category produces at most one notice per invocation.
         if self
             .reported_denials
             .lock()
@@ -544,6 +555,13 @@ fn authorize_request(
     {
         return Ok(TargetedAction::Forward);
     }
+    if path == "/info" && request.method == "GET" {
+        return if snapshot.engine_info {
+            Ok(TargetedAction::Forward)
+        } else {
+            Err(AuthorizationError::EngineInfo)
+        };
+    }
     if path == "/containers/json" {
         return if request.method == "GET" {
             Ok(TargetedAction::Discovery)
@@ -625,7 +643,7 @@ fn authorize_request(
         };
     }
 
-    Err(AuthorizationError::Forbidden)
+    Err(AuthorizationError::UnsupportedRoute)
 }
 
 fn strip_api_version(path: &str) -> &str {
@@ -2039,6 +2057,7 @@ mod tests {
             }
         });
         let policy = DockerAccessPolicy::Targeted {
+            engine_info: None,
             endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
             targets: vec![DockerTargetGrant {
                 selector: DockerTargetSelector::ComposeService {
@@ -2330,6 +2349,38 @@ mod tests {
     }
 
     #[test]
+    fn rejection_messages_are_independent_of_the_calling_harness() {
+        let snapshot = super::TargetSnapshot::default();
+        for (error, reason) in [
+            (super::AuthorizationError::UnsupportedRoute, "unsupported"),
+            (
+                super::AuthorizationError::EngineInfo,
+                "engine information permission",
+            ),
+            (
+                super::AuthorizationError::Forbidden,
+                "operation is not granted",
+            ),
+        ] {
+            let (status, message) = snapshot.rejection_response(error);
+            assert_eq!(status, 403);
+            assert!(message.contains(reason));
+            assert!(!message.contains("/sandbox"));
+        }
+    }
+
+    #[test]
+    fn engine_info_requires_explicit_permission() {
+        let mut snapshot = super::TargetSnapshot::default();
+        let info = request("GET", "/v1.52/info", b"");
+        assert!(super::authorize_request(&snapshot, &info).is_err());
+        snapshot.engine_info = true;
+        assert!(super::authorize_request(&snapshot, &info).is_ok());
+        assert!(super::authorize_request(&snapshot, &request("POST", "/info", b"")).is_err());
+        assert!(super::authorize_request(&snapshot, &request("GET", "/images/json", b"")).is_err());
+    }
+
+    #[test]
     fn buffered_engine_responses_decode_chunked_json() {
         let response = super::parse_engine_response(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n\r\n",
@@ -2471,7 +2522,7 @@ mod tests {
         ] {
             assert_eq!(
                 super::authorize_request(&snapshot, &request(method, target, b"{}")).unwrap_err(),
-                super::AuthorizationError::Forbidden,
+                super::AuthorizationError::UnsupportedRoute,
                 "expected {method} {target} to be forbidden"
             );
         }
@@ -2512,7 +2563,7 @@ mod tests {
         ] {
             assert_eq!(
                 super::authorize_request(&snapshot, &request(method, target, body)).unwrap_err(),
-                super::AuthorizationError::Forbidden,
+                super::AuthorizationError::UnsupportedRoute,
                 "expected exact route rejection for {method} {target}"
             );
         }
@@ -2548,6 +2599,7 @@ mod tests {
         };
 
         let policy = DockerAccessPolicy::Targeted {
+            engine_info: None,
             endpoint: UnixSocketPath::from_str(engine_path.to_str().unwrap()).unwrap(),
             targets: vec![grant],
         };

@@ -259,6 +259,12 @@
             "endpoint": {
               "$ref": "#/definitions/UnixSocketPath"
             },
+            "engineInfo": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "mode": {
               "type": "string",
               "enum": [

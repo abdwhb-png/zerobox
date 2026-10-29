@@ -279,6 +279,10 @@ host namespaces, host bind mounts, runtime sockets, devices, dangerous added
 capabilities, or disabled confinement are excluded unless the trusted grant
 explicitly accepts that unsafe target.
 
+Targeted policies may separately grant `engineInfo: true` to allow `GET /info`, including versioned routes. This optional permission defaults to denied and exposes the real engine response, which can include host identity, versions, container/image counts, and daemon configuration. It does not authorize another container or any creation/build route. Broker rejection messages are independent of the calling launcher.
+
+Rust SDK callers constructing `DockerAccessPolicy::Targeted` must now specify `engine_info: None` to retain the previous behavior, or `Some(true)` to grant engine information. Existing JSON without `engineInfo` remains accepted. Exhaustive Rust patterns must bind the new field or include `..`.
+
 The initial targeted snapshot is mandatory. Engine transport, timeout,
 protocol, status, or JSON failures abort broker startup; only a valid empty
 Engine result produces an empty snapshot. Non-streaming routes are one request

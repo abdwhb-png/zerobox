@@ -110,6 +110,7 @@ async fn sdk_real_docker_cli_sees_no_containers_without_target_grants() {
         .no_profile()
         .allow_read("/")
         .docker_access(DockerAccessPolicy::Targeted {
+            engine_info: None,
             endpoint: UnixSocketPath::from_str("/var/run/docker.sock").unwrap(),
             targets: Vec::new(),
         })
@@ -369,6 +370,7 @@ async fn sdk_targeted_docker_cli_and_compose_matrix_is_confined_to_the_granted_s
     create_test_container(&mut cleanup, &denied, &project, "db", &image);
 
     let policy = DockerAccessPolicy::Targeted {
+        engine_info: None,
         endpoint: docker_test_endpoint(),
         targets: vec![DockerTargetGrant {
             selector: DockerTargetSelector::ComposeService {

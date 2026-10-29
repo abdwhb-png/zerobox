@@ -17,6 +17,7 @@ fn permanent_exec_exception_round_trips_without_changing_default_grants() {
 #[test]
 fn docker_contract_round_trips_targeted_grants() {
     let policy = DockerAccessPolicy::Targeted {
+        engine_info: None,
         endpoint: UnixSocketPath::from_str("unix:///var/run/docker.sock").unwrap(),
         targets: vec![DockerTargetGrant {
             selector: DockerTargetSelector::ComposeService {
@@ -55,6 +56,7 @@ fn docker_endpoint_accepts_only_absolute_local_unix_sockets() {
 #[test]
 fn container_name_selector_has_an_explicit_json_field() {
     let policy = DockerAccessPolicy::Targeted {
+        engine_info: None,
         endpoint: UnixSocketPath::default(),
         targets: vec![DockerTargetGrant {
             selector: DockerTargetSelector::ContainerName {
@@ -95,4 +97,23 @@ fn ephemeral_container_selector_round_trips_an_exact_id_and_expiry() {
 
     let policy = serde_json::from_value::<DockerAccessPolicy>(encoded.clone()).unwrap();
     assert_eq!(serde_json::to_value(policy).unwrap(), encoded);
+}
+
+#[test]
+fn engine_information_is_optional_and_preserved_in_the_wire_contract() {
+    let base =
+        serde_json::json!({"mode":"targeted","endpoint":"unix:///run/docker.sock","targets":[]});
+    let policy: DockerAccessPolicy = serde_json::from_value(base.clone()).unwrap();
+    assert!(
+        serde_json::to_value(policy)
+            .unwrap()
+            .get("engineInfo")
+            .is_none()
+    );
+    let mut enabled = base.clone();
+    enabled["engineInfo"] = serde_json::json!(true);
+    let policy: DockerAccessPolicy = serde_json::from_value(enabled.clone()).unwrap();
+    assert_eq!(serde_json::to_value(policy).unwrap(), enabled);
+    enabled["engineInfo"] = serde_json::json!("true");
+    assert!(serde_json::from_value::<DockerAccessPolicy>(enabled).is_err());
 }
