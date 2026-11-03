@@ -297,7 +297,12 @@ fn preparse_status_fd(args: &[OsString]) -> Option<i32> {
 
 #[cfg(target_os = "linux")]
 fn prepare_arg0_aliases(cli: &Cli) -> Option<arg0::Arg0PathEntryGuard> {
-    if cli.subcommand.is_some() || cli.command.is_empty() || cli.no_sandbox || cli.allow_all {
+    if cli.runtime_bundle.is_some()
+        || cli.subcommand.is_some()
+        || cli.command.is_empty()
+        || cli.no_sandbox
+        || cli.allow_all
+    {
         return None;
     }
 
