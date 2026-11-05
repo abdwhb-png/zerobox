@@ -11,21 +11,26 @@
  /// 5. `--bind <root> <root>` re-enables writes for allowed roots, including
  ///    writable subpaths under `/dev` (for example, `/dev/shm`).
  /// 6. `--ro-bind <subpath> <subpath>` re-applies read-only protections under
-@@ -631,8 +631,11 @@
+@@ -631,9 +631,15 @@
          {
              append_mount_target_parent_dir_args(&mut bwrap_args.args, readable_root, masking_root);
          }
 -        bwrap_args.args.push("--ro-bind".to_string());
 -        bwrap_args.args.push(path_to_string(readable_root));
+-        bwrap_args.args.push(path_to_string(readable_root));
 +        let source = File::open(readable_root)?;
 +        let source_fd = source.as_raw_fd().to_string();
++        let mount_root = fs::read_link(format!("/proc/self/fd/{source_fd}"))?;
 +        bwrap_args.preserved_files.push(source);
 +        bwrap_args.args.push("--ro-bind-fd".to_string());
 +        bwrap_args.args.push(source_fd);
-         bwrap_args.args.push(path_to_string(readable_root));
++        // bind-fd checks the mounted inode, so its destination must not be a
++        // symlink. Runtime aliases preserve the policy path separately.
++        bwrap_args.args.push(path_to_string(&mount_root));
  
          let mut nested_unreadable_roots: Vec<PathBuf> = unreadable_roots
-@@ -2526,10 +2529,9 @@
+             .iter()
+@@ -2526,10 +2532,9 @@
          let readable_bind_index = args
              .args
              .windows(3)
@@ -38,7 +43,7 @@
  
          assert!(
              blocked_none_index < readable_dir_index && readable_dir_index < readable_bind_index,
-@@ -2583,10 +2585,9 @@
+@@ -2583,10 +2588,9 @@
          let readable_bind_index = args
              .args
              .windows(3)
@@ -51,7 +56,7 @@
          let secret_mask_index = args
              .args
              .windows(4)
-@@ -2598,6 +2599,68 @@
+@@ -2598,6 +2602,68 @@
              "expected nested unreadable path to be remasked after readable carveout: {:#?}",
              args.args
          );
