@@ -1,6 +1,6 @@
 --- upstream/linux-sandbox/src/bwrap.rs
 +++ upstream/linux-sandbox/src/bwrap.rs
-@@ -387,8 +387,8 @@
+@@ -373,8 +373,8 @@
  ///    (including `/dev/urandom`) even under a read-only root.
  /// 3. Unreadable ancestors of explicitly reopened roots are masked before
  ///    their child mounts are rebound so nested carveouts can be reopened safely.
@@ -11,26 +11,21 @@
  /// 5. `--bind <root> <root>` re-enables writes for allowed roots, including
  ///    writable subpaths under `/dev` (for example, `/dev/shm`).
  /// 6. `--ro-bind <subpath> <subpath>` re-applies read-only protections under
-@@ -631,9 +631,15 @@
+@@ -619,8 +619,11 @@
          {
              append_mount_target_parent_dir_args(&mut bwrap_args.args, readable_root, masking_root);
          }
 -        bwrap_args.args.push("--ro-bind".to_string());
 -        bwrap_args.args.push(path_to_string(readable_root));
--        bwrap_args.args.push(path_to_string(readable_root));
 +        let source = File::open(readable_root)?;
 +        let source_fd = source.as_raw_fd().to_string();
-+        let mount_root = fs::read_link(format!("/proc/self/fd/{source_fd}"))?;
 +        bwrap_args.preserved_files.push(source);
 +        bwrap_args.args.push("--ro-bind-fd".to_string());
 +        bwrap_args.args.push(source_fd);
-+        // bind-fd checks the mounted inode, so its destination must not be a
-+        // symlink. Runtime aliases preserve the policy path separately.
-+        bwrap_args.args.push(path_to_string(&mount_root));
+         bwrap_args.args.push(path_to_string(readable_root));
  
          let mut nested_unreadable_roots: Vec<PathBuf> = unreadable_roots
-             .iter()
-@@ -2526,10 +2532,9 @@
+@@ -2499,10 +2502,9 @@
          let readable_bind_index = args
              .args
              .windows(3)
@@ -43,7 +38,7 @@
  
          assert!(
              blocked_none_index < readable_dir_index && readable_dir_index < readable_bind_index,
-@@ -2583,10 +2588,9 @@
+@@ -2553,10 +2555,9 @@
          let readable_bind_index = args
              .args
              .windows(3)
@@ -56,75 +51,6 @@
          let secret_mask_index = args
              .args
              .windows(4)
-@@ -2598,6 +2602,68 @@
-             "expected nested unreadable path to be remasked after readable carveout: {:#?}",
-             args.args
-         );
-+    }
-+
-+    #[test]
-+    fn split_policy_readable_symlinks_bind_the_pinned_target() {
-+        for kind in ["relative", "absolute", "directory", "ancestor"] {
-+            let fixture = TempDir::new().expect("fixture");
-+            let resource = fixture.path().join("resource");
-+            let alias = fixture.path().join("alias");
-+            std::fs::create_dir(&resource).expect("resource directory");
-+            std::fs::write(resource.join("visible"), "visible").expect("resource file");
-+            let directory = matches!(kind, "directory" | "ancestor");
-+            let target = if directory {
-+                PathBuf::from("resource")
-+            } else if kind == "absolute" {
-+                resource.join("visible")
-+            } else {
-+                PathBuf::from("resource/visible")
-+            };
-+            std::os::unix::fs::symlink(target, &alias).expect("alias");
-+            let grant = if kind == "ancestor" {
-+                alias.join("visible")
-+            } else {
-+                alias
-+            };
-+            let expected = if kind == "directory" {
-+                resource
-+            } else {
-+                resource.join("visible")
-+            };
-+            let expected = expected.canonicalize().expect("canonical fixture target");
-+            let policy = FileSystemSandboxPolicy::restricted(vec![
-+                FileSystemSandboxEntry {
-+                    path: FileSystemPath::Special {
-+                        value: FileSystemSpecialPath::Root,
-+                    },
-+                    access: FileSystemAccessMode::None,
-+                },
-+                FileSystemSandboxEntry {
-+                    path: FileSystemPath::Path {
-+                        path: AbsolutePathBuf::from_absolute_path(grant).expect("grant"),
-+                    },
-+                    access: FileSystemAccessMode::Read,
-+                },
-+            ]);
-+            let args =
-+                create_filesystem_args(&policy, fixture.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
-+                    .expect("filesystem args");
-+            let mount = args
-+                .args
-+                .windows(3)
-+                .find(|args| args[0] == "--ro-bind-fd" && args[2] == path_to_string(&expected))
-+                .expect("bind destination must be the pinned target, never a symlink");
-+            let source = args
-+                .preserved_files
-+                .iter()
-+                .find(|file| file.as_raw_fd().to_string() == mount[1])
-+                .expect("preserved source FD");
-+            assert_eq!(
-+                source.metadata().expect("pinned metadata").ino(),
-+                std::fs::metadata(expected).expect("target metadata").ino()
-+            );
-+        }
-     }
- 
-     #[test]
 --- upstream/linux-sandbox/src/launcher.rs
 +++ upstream/linux-sandbox/src/launcher.rs
 @@ -32,6 +32,7 @@
