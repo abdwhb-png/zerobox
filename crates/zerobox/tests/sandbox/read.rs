@@ -3,6 +3,67 @@ use crate::support::*;
 mod allow_read {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_symlink_grants_preserve_aliases() {
+        for kind in ["relative-file", "absolute-file", "directory", "ancestor"] {
+            let fixture = tempfile::tempdir_in("/var/tmp").expect("fixture");
+            let project = fixture.path().join("project");
+            let resource = fixture.path().join("resource");
+            let alias = fixture.path().join("alias");
+            std::fs::create_dir(&project).expect("project");
+            std::fs::create_dir(&resource).expect("resource");
+            std::fs::write(resource.join("visible"), "visible").expect("visible");
+            std::fs::write(resource.join("secret"), "secret").expect("secret");
+            let directory = matches!(kind, "directory" | "ancestor");
+            let target = if directory {
+                PathBuf::from("resource")
+            } else if kind == "absolute-file" {
+                resource.join("visible")
+            } else {
+                PathBuf::from("resource/visible")
+            };
+            std::os::unix::fs::symlink(target, &alias).expect("alias");
+            let grant = if kind == "ancestor" {
+                alias.join("visible")
+            } else {
+                alias.clone()
+            };
+            let visible = if directory {
+                alias.join("visible")
+            } else {
+                alias.clone()
+            };
+            let home = tempfile::tempdir_in("/var/tmp").expect("home");
+            let mut command = Command::new(zerobox_exec());
+            command
+                .env("ZEROBOX_HOME", home.path())
+                .current_dir(&project)
+                .arg(format!("--allow-read={}", project.display()))
+                .arg(format!("--allow-read={}", grant.display()))
+                .arg(format!("--allow-write={}", project.display()));
+            if directory {
+                command.arg(format!("--deny-read={}", alias.join("secret").display()));
+            }
+            let output = command
+                .args([
+                    "--", "sh", "-c",
+                    "test -L \"$1\" && test \"$(cat \"$2\")\" = visible && ! cat \"$3\" 2>/dev/null && ! printf changed > \"$2\" 2>/dev/null",
+                    "probe",
+                ])
+                .arg(&alias)
+                .arg(&visible)
+                .arg(resource.join("secret"))
+                .output()
+                .expect("run sandbox");
+            assert!(output.status.success(), "{kind}: {}", stderr(&output));
+            assert_eq!(
+                std::fs::read_to_string(resource.join("visible")).unwrap(),
+                "visible"
+            );
+        }
+    }
+
     #[test]
     fn allowed_path_readable() {
         std::fs::write("/tmp/zerobox-e2e-ar", "secret").expect("setup");
