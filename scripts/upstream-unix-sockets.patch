@@ -37,7 +37,7 @@
      }
  }
  
-@@ -217,13 +228,84 @@
+@@ -217,13 +228,50 @@
              rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
              rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
          }
@@ -77,41 +77,7 @@
 +                libc::SYS_socket,
 +                vec![deny_non_unix_socket, deny_unix_non_stream],
 +            );
-+            rules.insert(
-+                libc::SYS_socketpair,
-+                vec![
-+                    SeccompRule::new(vec![SeccompCondition::new(
-+                        0,
-+                        SeccompCmpArgLen::Dword,
-+                        SeccompCmpOp::Ne,
-+                        libc::AF_UNIX as u64,
-+                    )?])?,
-+                    SeccompRule::new(
-+                        [
-+                            0,
-+                            libc::SOCK_CLOEXEC,
-+                            libc::SOCK_NONBLOCK,
-+                            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-+                        ]
-+                        .into_iter()
-+                        .map(|flags| {
-+                            SeccompCondition::new(
-+                                1,
-+                                SeccompCmpArgLen::Dword,
-+                                SeccompCmpOp::Ne,
-+                                (libc::SOCK_STREAM | flags) as u64,
-+                            )
-+                        })
-+                        .collect::<std::result::Result<Vec<_>, _>>()?,
-+                    )?,
-+                    SeccompRule::new(vec![SeccompCondition::new(
-+                        2,
-+                        SeccompCmpArgLen::Dword,
-+                        SeccompCmpOp::Ne,
-+                        0,
-+                    )?])?,
-+                ],
-+            );
++            rules.insert(libc::SYS_socketpair, private_connected_socketpair_rules()?);
 +        }
 +        NetworkSeccompMode::ProxyRouted | NetworkSeccompMode::ProxyRoutedWithUnixSockets => {
 +            let allow_unix_sockets = matches!(mode, NetworkSeccompMode::ProxyRoutedWithUnixSockets);
@@ -142,9 +108,9 @@
 +                )?);
 +            }
 +            let deny_non_ip_socket = SeccompRule::new(non_ip_socket_conditions)?;
-             // Connected stream pairs are private IPC (buffered child stdio).
+             // Connected stream and sequenced-packet pairs are private IPC.
              // Datagram pairs can be reconnected to named host sockets, so
-             // permit only AF_UNIX/SOCK_STREAM/protocol 0 and known flags.
+             // permit only AF_UNIX/protocol 0 and known connected types/flags.
 --- upstream/linux-sandbox/src/linux_run_main.rs
 +++ upstream/linux-sandbox/src/linux_run_main.rs
 @@ -372,6 +372,7 @@

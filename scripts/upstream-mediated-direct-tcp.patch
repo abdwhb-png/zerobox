@@ -136,9 +136,7 @@
                  NetworkSeccompMode::ProxyRoutedWithUnixSockets
              } else {
                  NetworkSeccompMode::ProxyRouted
-@@ -299,8 +308,20 @@
-                 ],
-             );
+@@ -301,6 +310,18 @@
          }
 -        NetworkSeccompMode::ProxyRouted | NetworkSeccompMode::ProxyRoutedWithUnixSockets => {
 -            let allow_unix_sockets = matches!(mode, NetworkSeccompMode::ProxyRoutedWithUnixSockets);

@@ -1,39 +1,54 @@
 --- upstream/linux-sandbox/src/landlock.rs
 +++ upstream/linux-sandbox/src/landlock.rs
-@@ -235,10 +235,26 @@
+@@ -186,5 +186,28 @@
++fn private_connected_socketpair_rules() -> std::result::Result<Vec<SeccompRule>, SandboxErr> {
++    let mut denied_types = Vec::new();
++    for kind in [libc::SOCK_STREAM, libc::SOCK_SEQPACKET] {
++        for flags in [0, libc::SOCK_CLOEXEC, libc::SOCK_NONBLOCK,
++            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK] {
++            denied_types.push(SeccompCondition::new(
++                1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, (kind | flags) as u64,
++            )?);
++        }
++    }
++    // Connected pairs cannot choose a new peer. Datagram pairs can reconnect
++    // to named endpoints, so their existing restrictions remain separate.
++    Ok(vec![
++        SeccompRule::new(vec![SeccompCondition::new(
++            0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, libc::AF_UNIX as u64,
++        )?])?,
++        SeccompRule::new(vec![SeccompCondition::new(
++            2, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0,
++        )?])?,
++        SeccompRule::new(denied_types)?,
++    ])
++}
++
+ /// Installs a seccomp filter for Linux network sandboxing.
+ ///
+ /// The filter is applied to the current thread so only the sandboxed child
+ /// inherits it.
+ fn install_network_seccomp_filter_on_current_thread(
+@@ -235,10 +235,8 @@
                  )?,
              ])?;
 -            let deny_unix_socketpair = SeccompRule::new(vec![SeccompCondition::new(
-+            // Connected stream pairs are private IPC (buffered child stdio).
-+            // Datagram pairs can be reconnected to named host sockets, so
-+            // permit only AF_UNIX/SOCK_STREAM/protocol 0 and known flags.
-+            let deny_pair_domain = SeccompRule::new(vec![SeccompCondition::new(
-                 0,
-                 SeccompCmpArgLen::Dword,
+-                0,
+-                SeccompCmpArgLen::Dword,
 -                SeccompCmpOp::Eq,
-+                SeccompCmpOp::Ne,
-                 libc::AF_UNIX as u64,
-             )?])?;
-+            let deny_pair_protocol = SeccompRule::new(vec![SeccompCondition::new(
-+                2, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0,
-+            )?])?;
-+            let deny_pair_type = SeccompRule::new(
-+                [0, libc::SOCK_CLOEXEC, libc::SOCK_NONBLOCK,
-+                    libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK]
-+                    .into_iter()
-+                    .map(|flags| SeccompCondition::new(
-+                        1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne,
-+                        (libc::SOCK_STREAM | flags) as u64,
-+                    ))
-+                    .collect::<std::result::Result<Vec<_>, _>>()?,
-+            )?;
+-                libc::AF_UNIX as u64,
+-            )?])?;
++            // Connected stream and sequenced-packet pairs are private IPC.
++            // Datagram pairs can be reconnected to named host sockets, so
++            // permit only AF_UNIX/protocol 0 and known connected types/flags.
++            let private_pair_rules = private_connected_socketpair_rules()?;
              // The target may connect only to the host-managed outbound TCP
              // bridge. Binding is used by some clients for ephemeral source
 @@ -270,6 +286,6 @@
              }
              rules.insert(libc::SYS_socket, socket_rules);
 -            rules.insert(libc::SYS_socketpair, vec![deny_unix_socketpair]);
-+            rules.insert(libc::SYS_socketpair, vec![deny_pair_domain, deny_pair_protocol, deny_pair_type]);
++            rules.insert(libc::SYS_socketpair, private_pair_rules);
          }
      }
  

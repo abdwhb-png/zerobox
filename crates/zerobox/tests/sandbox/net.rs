@@ -2,6 +2,178 @@ use crate::support::*;
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_sequenced_packet_pairs_work_in_filtered_network_modes() {
+    let root = tempfile::tempdir().unwrap();
+    let socket_path = root.path().join("granted.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let grant = format!("--allow-unix-socket={}", socket_path.display());
+    let script = r#"import errno, socket
+for kind in [socket.SOCK_STREAM, socket.SOCK_SEQPACKET]:
+    for flags in [0, socket.SOCK_CLOEXEC, socket.SOCK_NONBLOCK, socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK]:
+        a, b = socket.socketpair(socket.AF_UNIX, kind | flags, 0)
+        a.sendall(b'private payload')
+        assert b.recv(128) == b'private payload'
+        a.close(); b.close()
+try:
+    socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+except OSError as error:
+    assert error.errno == errno.EPERM, error
+else:
+    raise AssertionError('reconnectable datagram pair allowed')
+print('connected-ipc-ok')
+"#;
+    for mode in [
+        vec!["--allow-net=example.invalid"],
+        vec!["--allow-local-binding"],
+        vec![grant.as_str()],
+        vec!["--allow-net=example.invalid", grant.as_str()],
+        vec![
+            "--allow-net=example.invalid",
+            "--mediated-direct-tcp-port=443",
+        ],
+        vec![
+            "--allow-net=example.invalid",
+            "--mediated-direct-tcp-port=443",
+            grant.as_str(),
+        ],
+    ] {
+        let mut args = vec![
+            "--profile=analysis-strict",
+            "--strict-sandbox",
+            "--allow-read=/usr",
+        ];
+        args.extend(mode.iter().copied());
+        args.extend(["--", "/usr/bin/python3", "-c", script]);
+        let output = run(&args);
+        assert!(output.status.success(), "{mode:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), "connected-ipc-ok\n");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn offline_private_streams_support_inspection_and_half_close() {
+    let script = r#"import errno, os, socket
+a, b = socket.socketpair()
+assert a.getsockname() == ''
+assert a.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_STREAM
+for operation in [lambda: a.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR), lambda: a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)]:
+    try: operation()
+    except OSError as error: assert error.errno == errno.EPERM, error
+    else: raise AssertionError('offline socket options expanded beyond type inspection')
+assert os.write(a.fileno(), b'captured output') == len(b'captured output')
+a.shutdown(socket.SHUT_WR)
+assert b.recv(128) == b'captured output'
+assert b.recv(1) == b''
+a.close(); b.close()
+for operation in [lambda: socket.socket(socket.AF_INET), lambda: socket.socket().bind(('127.0.0.1', 0))]:
+    try: operation()
+    except OSError as error: assert error.errno == errno.EPERM, error
+    else: raise AssertionError('offline network authority expanded')
+print('offline-ipc-ok')
+"#;
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--strict-sandbox",
+        "--allow-read=/usr",
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "offline-ipc-ok\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_connected_pairs_preserve_peer_and_descriptor_boundaries() {
+    use std::os::linux::net::SocketAddrExt;
+    let root = tempfile::tempdir().unwrap();
+    let granted = root.path().join("granted.sock");
+    let forbidden = root.path().join("forbidden.sock");
+    let _granted = std::os::unix::net::UnixListener::bind(&granted).unwrap();
+    let _forbidden = std::os::unix::net::UnixListener::bind(&forbidden).unwrap();
+    let abstract_name = format!(
+        "zbx-{}-{}",
+        std::process::id(),
+        root.path().file_name().unwrap().to_string_lossy()
+    );
+    let address =
+        std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes()).unwrap();
+    let _abstract = std::os::unix::net::UnixListener::bind_addr(&address).unwrap();
+    let script = format!(
+        r#"import array, ctypes, errno, os, socket
+granted = {granted}
+forbidden = {forbidden}
+abstract = '\0' + {abstract_name}
+for kind in [socket.SOCK_STREAM, socket.SOCK_SEQPACKET]:
+    a, b = socket.socketpair(socket.AF_UNIX, kind)
+    try: a.connect(granted)
+    except OSError as error: assert error.errno in (errno.EISCONN, errno.EPERM, errno.EACCES, errno.EPROTOTYPE), error
+    else: raise AssertionError('private pair acquired a named peer')
+    address = ctypes.create_string_buffer(16)
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.connect(a.fileno(), address, 16) == -1
+    assert ctypes.get_errno() in (errno.EINVAL, errno.EAFNOSUPPORT, errno.EPERM)
+    a.sendall(b'original peer')
+    assert b.recv(128) == b'original peer'
+    pid = os.fork()
+    if pid == 0:
+        try:
+            b.close()
+            read, write = os.pipe()
+            os.write(write, b'private descriptor'); os.close(write)
+            a.sendmsg([b'fd'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [read]))])
+            os.close(read); a.close()
+        except BaseException: os._exit(1)
+        os._exit(0)
+    a.close(); b.settimeout(2)
+    data, ancillary, flags, sender = b.recvmsg(16, socket.CMSG_SPACE(array.array('i').itemsize))
+    assert data == b'fd' and len(ancillary) == 1
+    level, kind, payload = ancillary[0]
+    assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+    descriptors = array.array('i'); descriptors.frombytes(payload)
+    assert len(descriptors) == 1
+    assert os.read(descriptors[0], 128) == b'private descriptor'
+    os.close(descriptors[0]); b.close()
+    assert os.waitpid(pid, 0)[1] == 0
+for target in [forbidden, abstract]:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(1); peer.connect(target)
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EACCES, errno.ENOENT, errno.ECONNREFUSED), error
+    else: raise AssertionError('unauthorized host socket reached')
+for domain, kind, protocol in [(socket.AF_INET, socket.SOCK_STREAM, 0), (socket.AF_UNIX, socket.SOCK_SEQPACKET, 1), (socket.AF_UNIX, socket.SOCK_SEQPACKET | 0x10000000, 0)]:
+    try: socket.socketpair(domain, kind, protocol)
+    except OSError as error: assert error.errno == errno.EPERM, error
+    else: raise AssertionError('unsupported pair arguments allowed')
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+    peer.connect(granted)
+print('private-boundary-ok')
+"#,
+        granted = serde_json::to_string(&granted).unwrap(),
+        forbidden = serde_json::to_string(&forbidden).unwrap(),
+        abstract_name = serde_json::to_string(&abstract_name).unwrap()
+    );
+    let output = run(&[
+        "--profile=analysis-strict",
+        "--strict-sandbox",
+        "--allow-read=/usr",
+        "--allow-net=example.invalid",
+        &format!("--allow-unix-socket={}", granted.display()),
+        "--",
+        "/usr/bin/python3",
+        "-c",
+        &script,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "private-boundary-ok\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn mediated_direct_tcp_uses_an_outer_setup_namespace() {
     let script = r#"import errno, glob, os, socket, subprocess
 with open('/proc/self/status', encoding='ascii') as status:

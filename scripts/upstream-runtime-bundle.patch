@@ -84,7 +84,7 @@
          {
              target.insert(name, value);
          }
-@@ -513,14 +541,166 @@
+@@ -513,14 +541,172 @@
          options,
      )
      .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
@@ -134,6 +134,7 @@
 +            )
 +        })?;
 +    let mut additions = Vec::new();
++    let mut destinations = std::collections::BTreeMap::new();
 +    for alias in &aliases {
 +        if !alias.destination.is_absolute()
 +            || !alias.target.is_absolute()
@@ -169,12 +170,17 @@
 +            std::io::Error::new(std::io::ErrorKind::InvalidInput, "runtime alias has no parent"))?;
 +        let filename = alias.destination.file_name().ok_or_else(||
 +            std::io::Error::new(std::io::ErrorKind::InvalidInput, "runtime alias has no filename"))?;
++        let destination = resolve_runtime_alias_path(parent, &aliases).join(filename);
++        if let Some(previous) = destinations.insert(destination.clone(), alias.target.clone()) {
++            if previous != alias.target {
++                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
++                    "conflicting runtime aliases resolve to one destination"));
++            }
++            continue;
++        }
 +        additions.extend([
 +            "--symlink".to_string(),
-+            relative_runtime_alias_target(
-+                &resolve_runtime_alias_path(parent, &aliases).join(filename),
-+                &alias.target,
-+            )?,
++            relative_runtime_alias_target(&destination, &alias.target)?,
 +            alias.destination.to_string_lossy().into_owned(),
 +        ]);
 +    }
@@ -693,7 +699,7 @@
          exact_unix_socket: None,
          source_fd: None,
      }])
-@@ -760,15 +804,100 @@
+@@ -760,15 +804,102 @@
              "--new-session".to_string(),
              "--dir".to_string(),
              "/work".to_string(),
@@ -732,8 +738,10 @@
 +    inject_runtime_path_aliases(&mut args, vec![
 +        RuntimePathAlias { destination: PathBuf::from("/lib"), target: PathBuf::from("/usr/lib"), directory: true },
 +        RuntimePathAlias { destination: PathBuf::from("/lib/x86/libexample.so.1"), target: PathBuf::from("/usr/lib/x86/libexample.so.1.2"), directory: false },
++        RuntimePathAlias { destination: PathBuf::from("/usr/lib/x86/libexample.so.1"), target: PathBuf::from("/usr/lib/x86/libexample.so.1.2"), directory: false },
 +    ]).unwrap();
 +    assert!(args.windows(3).any(|args| args == ["--symlink", "libexample.so.1.2", "/lib/x86/libexample.so.1"]));
++    assert_eq!(args.windows(3).filter(|args| args[0] == "--symlink" && args[1] == "libexample.so.1.2").count(), 1);
 +}
 +
 +#[test]

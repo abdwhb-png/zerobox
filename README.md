@@ -55,11 +55,9 @@ managed proxy; other loopback ports stay private. Unrestricted unproxied
 network access cannot be combined with private listeners. Neither option
 falls back to unsandboxed execution.
 
-Buffered subprocess I/O may use private Unix stream socketpairs. Named host
-Unix sockets, datagram socketpairs, UDP, and raw sockets remain prohibited in
-managed-network mode. Setup errors retain helper diagnostics separately from
-the target's exit code and output. FUSE caches immutable policy computations,
-not file contents or backing metadata.
+Buffered subprocess I/O may use private Unix stream and sequenced-packet socketpairs. In managed-network mode, named host Unix sockets require their exact grants and datagram pairs remain denied. Existing UDP and raw-socket restrictions remain in place. Offline programs may inspect and half-close existing descriptors and query `SOL_SOCKET/SO_TYPE`; these operations grant no new connection or listener authority. Setup errors retain helper diagnostics separately from the target's exit code and output. FUSE caches immutable policy computations, not file contents or backing metadata.
+
+With a selected runtime bundle, executable shell entries from its validated manifest receive conventional `/bin` and `/usr/bin` aliases. Explicit host selections and read denials take precedence. The aliases point into the private runtime rather than granting host directory access, and their normalized layout is included in admission reporting.
 
 Reproducible external install recipe:
 

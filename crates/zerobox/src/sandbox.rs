@@ -21,7 +21,7 @@ use zerobox_protocol::mediated_direct::MediatedDirectListenerManifest;
 use zerobox_protocol::models::PermissionProfile;
 use zerobox_protocol::permissions::{
     FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
-    FileSystemSpecialPath, NetworkSandboxPolicy,
+    FileSystemSpecialPath, NetworkSandboxPolicy, ReadDenyMatcher,
 };
 #[cfg(test)]
 use zerobox_protocol::protocol::SandboxPolicy;
@@ -1187,12 +1187,6 @@ impl Sandbox {
         #[cfg(target_os = "linux")]
         let admission_target_env = child_env.clone();
         #[cfg(target_os = "linux")]
-        let runtime_path_aliases = if runtime_bundle.is_some() {
-            collect_runtime_path_aliases(&allow_read, &allow_write, &cwd)?
-        } else {
-            Vec::new()
-        };
-        #[cfg(target_os = "linux")]
         let target_env_file = if sandbox_type == SandboxType::LinuxSeccomp {
             let file = PrivateTargetEnvironment::create_in(
                 &child_env,
@@ -1260,6 +1254,38 @@ impl Sandbox {
             fs_policy
         } else {
             with_linux_helper_read_root(fs_policy, linux_sandbox_exe.as_deref(), &cwd)
+        };
+
+        #[cfg(target_os = "linux")]
+        let runtime_path_aliases = if let Some(bundle) = runtime_bundle.as_ref() {
+            let mut aliases = collect_runtime_path_aliases(&allow_read, &allow_write, &cwd)?;
+            let denied = ReadDenyMatcher::try_new(&fs_policy, &cwd).map_err(anyhow::Error::msg)?;
+            for directory in ["/bin", "/usr/bin"] {
+                let directory = aliases
+                    .iter()
+                    .find(|alias| alias.directory && alias.destination == Path::new(directory))
+                    .map(|alias| alias.target.clone())
+                    .unwrap_or_else(|| PathBuf::from(directory));
+                for command in &bundle.shell_commands {
+                    let destination = directory.join(command);
+                    if fs_policy.can_read_path_with_cwd(&destination, &cwd)
+                        || denied
+                            .as_ref()
+                            .is_some_and(|matcher| matcher.is_read_denied(&destination))
+                        || aliases.iter().any(|alias| alias.destination == destination)
+                    {
+                        continue;
+                    }
+                    aliases.push(RuntimePathAlias {
+                        destination,
+                        target: Path::new(SHELL_PATH).join(command),
+                        directory: false,
+                    });
+                }
+            }
+            aliases
+        } else {
+            Vec::new()
         };
 
         #[cfg(target_os = "linux")]
@@ -1642,19 +1668,10 @@ impl Sandbox {
                 bind_values.push(control.bind_value());
             }
             if let Some(bundle) = runtime_bundle.as_ref() {
-                let runtime = linux_runtime
-                    .as_ref()
-                    .expect("runtime bundles require a Linux runtime");
                 bind_values.extend([
                     serde_json::json!({"source": &bundle.shell_root, "destination": RUNTIME_ROOT, "read_only": true}),
                     serde_json::json!({"source": &bundle.helper, "destination": INNER_HELPER_PATH, "read_only": true}),
                 ]);
-                if !policy_grants_public_destination(&allow_read, Path::new("/bin"), &cwd) {
-                    bind_values.push(serde_json::json!({"source": runtime.runtime_alias_bin(), "destination": "/bin", "read_only": true}));
-                }
-                if !policy_grants_public_destination(&allow_read, Path::new("/usr/bin"), &cwd) {
-                    bind_values.push(serde_json::json!({"source": runtime.runtime_alias_usr_bin(), "destination": "/usr/bin", "read_only": true}));
-                }
                 if bundle.component == RuntimeComponent::Analysis {
                     bind_values.push(serde_json::json!({"source": &bundle.component_root, "destination": ANALYSIS_ROOT, "read_only": true}));
                 }
@@ -1686,9 +1703,6 @@ impl Sandbox {
                     &admission_target_env,
                     &final_env,
                 ));
-                let runtime = linux_runtime
-                    .as_ref()
-                    .expect("runtime bundles require a Linux runtime");
                 let mut mounts = vec![
                     serde_json::json!({"source": bundle.shell_root, "destination": RUNTIME_ROOT, "access":"ro", "origin":"runtime"}),
                     serde_json::json!({"source": bundle.helper, "destination":INNER_HELPER_PATH, "access":"ro", "origin":"runtime"}),
@@ -1716,12 +1730,6 @@ impl Sandbox {
                     mounts.extend(dynamic.binds().iter().map(|bind| serde_json::json!({"source": bind.source, "destination": bind.destination, "access":"rw", "origin":"internal"})));
                 }
                 mounts.extend(exact_unix_sockets.iter().map(|socket| serde_json::json!({"source": socket.source, "destination": socket.source, "access":"rw", "origin":"policy"})));
-                if !policy_grants_public_destination(&allow_read, Path::new("/bin"), &cwd) {
-                    mounts.push(serde_json::json!({"source": runtime.runtime_alias_bin(), "destination":"/bin", "access":"ro", "origin":"internal"}));
-                }
-                if !policy_grants_public_destination(&allow_read, Path::new("/usr/bin"), &cwd) {
-                    mounts.push(serde_json::json!({"source": runtime.runtime_alias_usr_bin(), "destination":"/usr/bin", "access":"ro", "origin":"internal"}));
-                }
                 if bundle.component == RuntimeComponent::Analysis {
                     mounts.push(serde_json::json!({"source": bundle.component_root, "destination": ANALYSIS_ROOT, "access":"ro", "origin":"runtime"}));
                 }
@@ -2362,20 +2370,6 @@ fn display_paths(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-fn policy_grants_public_destination(
-    granted_roots: &[PathBuf],
-    destination: &Path,
-    cwd: &Path,
-) -> bool {
-    granted_roots.iter().any(|path| {
-        resolve_path(cwd, path)
-            .map(|path| {
-                destination.starts_with(path.as_path()) || path.as_path().starts_with(destination)
-            })
-            .unwrap_or(false)
-    })
-}
-
 #[cfg(target_os = "linux")]
 #[derive(serde::Serialize)]
 struct RuntimePathAlias {
@@ -2390,6 +2384,9 @@ fn collect_runtime_path_aliases(
     write: &[PathBuf],
     cwd: &Path,
 ) -> Result<Vec<RuntimePathAlias>> {
+    // Reproduce conventional directory links on the empty private root. This
+    // selects layout only; host contents still require explicit policy mounts.
+    let shell_directories = [PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
     let grants = read
         .iter()
         .chain(write)
@@ -2406,7 +2403,7 @@ fn collect_runtime_path_aliases(
         .filter_map(|path| std::fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     let mut aliases = std::collections::BTreeMap::new();
-    for grant in grants {
+    for grant in grants.into_iter().chain(shell_directories) {
         let mut prefix = PathBuf::new();
         for component in grant.components() {
             prefix.push(component);
@@ -4426,6 +4423,7 @@ mod tests {
             root: root.clone(),
             component: RuntimeComponent::Shell,
             shell_root: root.join("components/shell"),
+            shell_commands: Vec::new(),
             component_root: root.join("components/shell"),
             helper: root.join("helper/zerobox-linux-sandbox"),
             manifest_sha256: "0".repeat(64),
@@ -4467,26 +4465,6 @@ mod tests {
             host_dynamic_deny_write_globs(&globs),
             vec!["/project/.env".to_string()]
         );
-    }
-
-    #[test]
-    fn runtime_aliases_do_not_shadow_explicit_public_path_grants() {
-        let cwd = Path::new("/work");
-        assert!(policy_grants_public_destination(
-            &[PathBuf::from("/usr")],
-            Path::new("/usr/bin"),
-            cwd,
-        ));
-        assert!(policy_grants_public_destination(
-            &[PathBuf::from("/bin/bash")],
-            Path::new("/bin"),
-            cwd,
-        ));
-        assert!(!policy_grants_public_destination(
-            &[PathBuf::from("/opt/project")],
-            Path::new("/bin"),
-            cwd,
-        ));
     }
 
     #[test]

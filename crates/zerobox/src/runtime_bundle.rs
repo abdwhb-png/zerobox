@@ -35,6 +35,7 @@ pub(crate) struct RuntimeBundle {
     pub(crate) root: PathBuf,
     pub(crate) component: RuntimeComponent,
     pub(crate) shell_root: PathBuf,
+    pub(crate) shell_commands: Vec<PathBuf>,
     pub(crate) component_root: PathBuf,
     pub(crate) helper: PathBuf,
     pub(crate) manifest_sha256: String,
@@ -118,6 +119,28 @@ impl RuntimeBundle {
         validate_component_tree(&shell_root, &manifest.components.shell.files)?;
         validate_regular_executable(&shell_root.join("bin/bash"), "runtime shell bash")?;
         validate_regular_executable(&shell_root.join("bin/env"), "runtime shell env")?;
+        let mut shell_commands = Vec::new();
+        for entry in &manifest.components.shell.files {
+            if entry.path.parent() != Some(Path::new("bin")) {
+                continue;
+            }
+            let path = shell_root.join(&entry.path);
+            let target = path
+                .canonicalize()
+                .context("resolve a declared shell command")?;
+            if !target.starts_with(&shell_root) {
+                bail!(
+                    "runtime shell command escapes its component: {}",
+                    entry.path.display()
+                );
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&target)?;
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                shell_commands.push(entry.path.file_name().expect("bin entry has a name").into());
+            }
+        }
+        shell_commands.sort();
         let tree = match component {
             RuntimeComponent::Shell => &manifest.components.shell,
             RuntimeComponent::Analysis => &manifest.components.analysis,
@@ -139,6 +162,7 @@ impl RuntimeBundle {
             root,
             component,
             shell_root,
+            shell_commands,
             component_root,
             helper,
             manifest_sha256: hex_digest(&manifest_bytes),
@@ -376,6 +400,36 @@ pub(crate) mod tests {
         );
         assert_eq!(bundle.component, RuntimeComponent::Shell);
         assert_eq!(bundle.version, "test");
+        assert_eq!(
+            bundle.shell_commands,
+            [
+                PathBuf::from("bash"),
+                PathBuf::from("env"),
+                PathBuf::from("sh")
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_bundle_does_not_expose_nonexecutable_bin_files_as_commands() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fixture(None, None);
+        let notes = fixture.path().join("components/shell/bin/notes");
+        fs::write(&notes, b"notes").unwrap();
+        fs::set_permissions(&notes, fs::Permissions::from_mode(0o400)).unwrap();
+        let manifest_path = fixture.path().join(MANIFEST_NAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["components"]["shell"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"path":"bin/notes", "sha256":sha256(b"notes")}));
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let bundle = RuntimeBundle::load(fixture.path(), RuntimeComponent::Shell).unwrap();
+        assert_eq!(
+            bundle.shell_commands,
+            [PathBuf::from("bash"), PathBuf::from("env")]
+        );
     }
 
     #[test]

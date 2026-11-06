@@ -33,8 +33,6 @@ pub(crate) struct LinuxRuntime {
     docker_root: PathBuf,
     private_tmp: PathBuf,
     private_home: PathBuf,
-    runtime_alias_bin: PathBuf,
-    runtime_alias_usr_bin: PathBuf,
 }
 
 impl LinuxRuntime {
@@ -110,19 +108,6 @@ impl LinuxRuntime {
         let docker_root = create_private_subdirectory(root.path(), "d", uid)?;
         let private_tmp = create_private_subdirectory(root.path(), "t", uid)?;
         let private_home = create_private_subdirectory(root.path(), "u", uid)?;
-        let aliases = create_private_subdirectory(root.path(), "a", uid)?;
-        let runtime_alias_bin = create_private_subdirectory(&aliases, "bin", uid)?;
-        let alias_usr = create_private_subdirectory(&aliases, "usr", uid)?;
-        let runtime_alias_usr_bin = create_private_subdirectory(&alias_usr, "bin", uid)?;
-        std::os::unix::fs::symlink(
-            "/__zerobox/runtime/bin/bash",
-            runtime_alias_bin.join("bash"),
-        )?;
-        std::os::unix::fs::symlink("/__zerobox/runtime/bin/bash", runtime_alias_bin.join("sh"))?;
-        std::os::unix::fs::symlink(
-            "/__zerobox/runtime/bin/env",
-            runtime_alias_usr_bin.join("env"),
-        )?;
         let helper = helper_dir.join(ZEROBOX_LINUX_SANDBOX_ARG0);
         stage_helper(helper_source, &helper, uid)?;
 
@@ -136,8 +121,6 @@ impl LinuxRuntime {
             docker_root,
             private_tmp,
             private_home,
-            runtime_alias_bin,
-            runtime_alias_usr_bin,
         })
     }
 
@@ -171,14 +154,6 @@ impl LinuxRuntime {
 
     pub(crate) fn private_home(&self) -> &Path {
         &self.private_home
-    }
-
-    pub(crate) fn runtime_alias_bin(&self) -> &Path {
-        &self.runtime_alias_bin
-    }
-
-    pub(crate) fn runtime_alias_usr_bin(&self) -> &Path {
-        &self.runtime_alias_usr_bin
     }
 
     #[cfg(test)]
