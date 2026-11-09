@@ -71,7 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (workspace, excluding upstream)
         run: >
-          cargo clippy --workspace
+          cargo clippy --workspace --no-deps
           --exclude zerobox-sandboxing
           --exclude zerobox-linux-sandbox
           --exclude zerobox-windows-sandbox
