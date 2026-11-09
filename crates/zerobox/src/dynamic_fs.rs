@@ -842,13 +842,13 @@ fn decode_mountinfo_path(encoded: &[u8]) -> Result<PathBuf> {
 #[derive(Debug)]
 struct OpenHandle {
     file: File,
-    path: Arc<Path>,
+    path: PathBuf,
 }
 
 #[derive(Debug)]
 struct FuseState {
-    path_by_inode: HashMap<u64, Arc<Path>>,
-    inode_by_path: HashMap<Arc<Path>, u64>,
+    path_by_inode: HashMap<u64, PathBuf>,
+    inode_by_path: HashMap<PathBuf, u64>,
     handles: HashMap<u64, OpenHandle>,
     next_inode: u64,
     next_handle: u64,
@@ -856,10 +856,9 @@ struct FuseState {
 
 impl FuseState {
     fn new() -> Self {
-        let root: Arc<Path> = Path::new("").into();
         Self {
-            path_by_inode: HashMap::from([(INodeNo::ROOT.0, Arc::clone(&root))]),
-            inode_by_path: HashMap::from([(root, INodeNo::ROOT.0)]),
+            path_by_inode: HashMap::from([(INodeNo::ROOT.0, PathBuf::new())]),
+            inode_by_path: HashMap::from([(PathBuf::new(), INodeNo::ROOT.0)]),
             handles: HashMap::new(),
             next_inode: INodeNo::ROOT.0 + 1,
             next_handle: 1,
@@ -872,13 +871,13 @@ impl FuseState {
         }
         let inode = self.next_inode;
         self.next_inode = self.next_inode.saturating_add(1);
-        let path: Arc<Path> = path.into();
-        self.path_by_inode.insert(inode, Arc::clone(&path));
+        let path = path.to_path_buf();
+        self.path_by_inode.insert(inode, path.clone());
         self.inode_by_path.insert(path, inode);
         INodeNo(inode)
     }
 
-    fn insert_handle(&mut self, file: File, path: Arc<Path>) -> FileHandle {
+    fn insert_handle(&mut self, file: File, path: PathBuf) -> FileHandle {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
         self.handles.insert(handle, OpenHandle { file, path });
@@ -889,7 +888,7 @@ impl FuseState {
         let paths = self
             .inode_by_path
             .keys()
-            .filter(|candidate| candidate.as_ref() == path || candidate.starts_with(path))
+            .filter(|candidate| candidate.as_path() == path || candidate.starts_with(path))
             .cloned()
             .collect::<Vec<_>>();
         for candidate in paths {
@@ -907,20 +906,20 @@ impl FuseState {
         let paths = self
             .inode_by_path
             .keys()
-            .filter(|candidate| candidate.as_ref() == old || candidate.starts_with(old))
+            .filter(|candidate| candidate.as_path() == old || candidate.starts_with(old))
             .cloned()
             .collect::<Vec<_>>();
         for old_path in paths {
             let Some(inode) = self.inode_by_path.remove(&old_path) else {
                 continue;
             };
-            let new_path: Arc<Path> = rebase_path(&old_path, old, new).into();
-            self.path_by_inode.insert(inode, Arc::clone(&new_path));
+            let new_path = rebase_path(&old_path, old, new);
+            self.path_by_inode.insert(inode, new_path.clone());
             self.inode_by_path.insert(new_path, inode);
         }
         for handle in self.handles.values_mut() {
-            if handle.path.as_ref() == old || handle.path.starts_with(old) {
-                handle.path = rebase_path(&handle.path, old, new).into();
+            if handle.path == old || handle.path.starts_with(old) {
+                handle.path = rebase_path(&handle.path, old, new);
             }
         }
     }
@@ -933,13 +932,13 @@ impl FuseState {
         let old_paths = self
             .inode_by_path
             .iter()
-            .filter(|(candidate, _)| candidate.as_ref() == old || candidate.starts_with(old))
+            .filter(|(candidate, _)| candidate.as_path() == old || candidate.starts_with(old))
             .map(|(path, inode)| (path.clone(), *inode))
             .collect::<Vec<_>>();
         let new_paths = self
             .inode_by_path
             .iter()
-            .filter(|(candidate, _)| candidate.as_ref() == new || candidate.starts_with(new))
+            .filter(|(candidate, _)| candidate.as_path() == new || candidate.starts_with(new))
             .map(|(path, inode)| (path.clone(), *inode))
             .collect::<Vec<_>>();
 
@@ -947,27 +946,25 @@ impl FuseState {
             self.inode_by_path.remove(path);
         }
         for (path, inode) in old_paths {
-            let exchanged_path: Arc<Path> = rebase_path(&path, old, new).into();
-            self.path_by_inode
-                .insert(inode, Arc::clone(&exchanged_path));
+            let exchanged_path = rebase_path(&path, old, new);
+            self.path_by_inode.insert(inode, exchanged_path.clone());
             self.inode_by_path.insert(exchanged_path, inode);
         }
         for (path, inode) in new_paths {
-            let exchanged_path: Arc<Path> = rebase_path(&path, new, old).into();
-            self.path_by_inode
-                .insert(inode, Arc::clone(&exchanged_path));
+            let exchanged_path = rebase_path(&path, new, old);
+            self.path_by_inode.insert(inode, exchanged_path.clone());
             self.inode_by_path.insert(exchanged_path, inode);
         }
         for handle in self.handles.values_mut() {
-            let exchanged_path = if handle.path.as_ref() == old || handle.path.starts_with(old) {
+            let exchanged_path = if handle.path == old || handle.path.starts_with(old) {
                 Some(rebase_path(&handle.path, old, new))
-            } else if handle.path.as_ref() == new || handle.path.starts_with(new) {
+            } else if handle.path == new || handle.path.starts_with(new) {
                 Some(rebase_path(&handle.path, new, old))
             } else {
                 None
             };
             if let Some(exchanged_path) = exchanged_path {
-                handle.path = exchanged_path.into();
+                handle.path = exchanged_path;
             }
         }
     }
@@ -1020,7 +1017,7 @@ impl GuardedPassthroughFs {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn path_for_inode(&self, inode: INodeNo) -> io::Result<Arc<Path>> {
+    fn path_for_inode(&self, inode: INodeNo) -> io::Result<PathBuf> {
         self.state()
             .path_by_inode
             .get(&inode.0)
@@ -1519,7 +1516,7 @@ impl Filesystem for GuardedPassthroughFs {
             self.check_write(&path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref())?;
             let stat = fstat(fd.as_raw_fd())?;
             let inode = self.state().inode_for_path(&path);
-            let handle = self.state().insert_handle(File::from(fd), path.into());
+            let handle = self.state().insert_handle(File::from(fd), path);
             Ok((file_attr(inode, &stat), handle))
         })();
         match result {
@@ -2062,8 +2059,8 @@ mod tests {
             Some(&source.0)
         );
         assert_eq!(
-            state.path_by_inode.get(&source.0).map(AsRef::as_ref),
-            Some(Path::new("config"))
+            state.path_by_inode.get(&source.0),
+            Some(&PathBuf::from("config"))
         );
         assert!(!state.path_by_inode.contains_key(&destination.0));
         assert!(!state.inode_by_path.contains_key(Path::new("config.lock")));
@@ -2078,38 +2075,38 @@ mod tests {
         let right_child = state.inode_for_path(Path::new("right/child"));
         let left_handle = state.insert_handle(
             File::open("/dev/null").unwrap(),
-            PathBuf::from("left/child").into(),
+            PathBuf::from("left/child"),
         );
         let right_handle = state.insert_handle(
             File::open("/dev/null").unwrap(),
-            PathBuf::from("right/child").into(),
+            PathBuf::from("right/child"),
         );
 
         state.exchange_path_trees(Path::new("left"), Path::new("right"));
 
         assert_eq!(
-            state.path_by_inode.get(&left.0).map(AsRef::as_ref),
-            Some(Path::new("right"))
+            state.path_by_inode.get(&left.0),
+            Some(&PathBuf::from("right"))
         );
         assert_eq!(
-            state.path_by_inode.get(&left_child.0).map(AsRef::as_ref),
-            Some(Path::new("right/child"))
+            state.path_by_inode.get(&left_child.0),
+            Some(&PathBuf::from("right/child"))
         );
         assert_eq!(
-            state.path_by_inode.get(&right.0).map(AsRef::as_ref),
-            Some(Path::new("left"))
+            state.path_by_inode.get(&right.0),
+            Some(&PathBuf::from("left"))
         );
         assert_eq!(
-            state.path_by_inode.get(&right_child.0).map(AsRef::as_ref),
-            Some(Path::new("left/child"))
+            state.path_by_inode.get(&right_child.0),
+            Some(&PathBuf::from("left/child"))
         );
         assert_eq!(
-            state.handles.get(&left_handle.0).unwrap().path.as_ref(),
-            Path::new("right/child")
+            state.handles.get(&left_handle.0).unwrap().path,
+            PathBuf::from("right/child")
         );
         assert_eq!(
-            state.handles.get(&right_handle.0).unwrap().path.as_ref(),
-            Path::new("left/child")
+            state.handles.get(&right_handle.0).unwrap().path,
+            PathBuf::from("left/child")
         );
     }
 
