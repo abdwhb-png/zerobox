@@ -3,7 +3,7 @@
 
 name: Release (disabled)
 
-on: {}
+on: workflow_dispatch
 
 jobs:
   disabled:

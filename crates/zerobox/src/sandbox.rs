@@ -2303,7 +2303,9 @@ async fn wait_for_admission_ack(channel: File, digest: &str) -> Result<()> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
-    let channel = tokio::io::unix::AsyncFd::new(channel)?;
+    // SAFETY: File owns this descriptor, and the AsyncFd never exposes mutable
+    // access that could replace or close it before deregistration.
+    let channel = unsafe { tokio::io::unix::AsyncFd::register(channel) }?;
     let expected = format!("ACK:{digest}\n");
     let receive = async {
         let mut bytes = Vec::new();
