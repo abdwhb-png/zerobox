@@ -621,6 +621,7 @@ impl DynamicDenyMounts {
             return Ok(None);
         };
         ensure_fuse_available()?;
+        prepare_inode_descriptor_limit()?;
         create_private_directory(parent)?;
         cleanup_stale_view_roots(parent)?;
         let root = tempfile::Builder::new()
@@ -842,13 +843,52 @@ fn decode_mountinfo_path(encoded: &[u8]) -> Result<PathBuf> {
 #[derive(Debug)]
 struct OpenHandle {
     file: File,
-    path: PathBuf,
+    inode: INodeNo,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BackingIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+impl BackingIdentity {
+    fn from_stat(stat: &libc::stat) -> Self {
+        Self {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BackingInode {
+    fd: OwnedFd,
+    identity: BackingIdentity,
+    lookups: u64,
+    open_handles: u64,
+}
+
+fn prepare_inode_descriptor_limit() -> Result<()> {
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    cvt(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) })
+        .context("failed to read descriptor limit for guarded FUSE inodes")?;
+    let mut limits = unsafe { limits.assume_init() };
+    if limits.rlim_cur < limits.rlim_max {
+        // Live kernel inode references each pin one O_PATH descriptor. Use the
+        // existing hard budget; do not change the machine's configured ceiling.
+        limits.rlim_cur = limits.rlim_max;
+        cvt(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) })
+            .context("failed to raise soft descriptor limit for guarded FUSE inodes")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 struct FuseState {
     path_by_inode: HashMap<u64, PathBuf>,
     inode_by_path: HashMap<PathBuf, u64>,
+    backing_by_inode: HashMap<u64, BackingInode>,
     handles: HashMap<u64, OpenHandle>,
     next_inode: u64,
     next_handle: u64,
@@ -859,6 +899,7 @@ impl FuseState {
         Self {
             path_by_inode: HashMap::from([(INodeNo::ROOT.0, PathBuf::new())]),
             inode_by_path: HashMap::from([(PathBuf::new(), INodeNo::ROOT.0)]),
+            backing_by_inode: HashMap::new(),
             handles: HashMap::new(),
             next_inode: INodeNo::ROOT.0 + 1,
             next_handle: 1,
@@ -877,11 +918,81 @@ impl FuseState {
         INodeNo(inode)
     }
 
-    fn insert_handle(&mut self, file: File, path: PathBuf) -> FileHandle {
+    fn remember_lookup(
+        &mut self,
+        path: &Path,
+        fd: OwnedFd,
+        stat: &libc::stat,
+    ) -> io::Result<INodeNo> {
+        let identity = BackingIdentity::from_stat(stat);
+        let resolved = resolved_for_fd(fd.as_raw_fd())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))?;
+        if let Some(&inode) = self.inode_by_path.get(path)
+            && self.backing_by_inode.get(&inode).is_some_and(|backing| {
+                backing.identity != identity
+                    || resolved_for_fd(backing.fd.as_raw_fd()).as_ref() != Some(&resolved)
+            })
+        {
+            // A pathname can now name a different object while the old inode
+            // remains referenced. A recreated hardlink can share its device and
+            // inode while naming a different dentry with different policy rights.
+            self.remove_path_tree(path);
+        }
+        let inode = self.inode_for_path(path);
+        let backing = self
+            .backing_by_inode
+            .entry(inode.0)
+            .or_insert(BackingInode {
+                fd,
+                identity,
+                lookups: 0,
+                open_handles: 0,
+            });
+        backing.lookups += 1;
+        Ok(inode)
+    }
+
+    fn forget(&mut self, inode: INodeNo, lookups: u64) {
+        if let Some(backing) = self.backing_by_inode.get_mut(&inode.0) {
+            backing.lookups = backing.lookups.saturating_sub(lookups);
+        }
+        self.collect_inode(inode);
+    }
+
+    fn collect_inode(&mut self, inode: INodeNo) {
+        if inode == INodeNo::ROOT
+            || self
+                .backing_by_inode
+                .get(&inode.0)
+                .is_some_and(|backing| backing.lookups != 0 || backing.open_handles != 0)
+        {
+            return;
+        }
+        self.backing_by_inode.remove(&inode.0);
+        if let Some(path) = self.path_by_inode.remove(&inode.0)
+            && self.inode_by_path.get(&path) == Some(&inode.0)
+        {
+            self.inode_by_path.remove(&path);
+        }
+    }
+
+    fn insert_handle(&mut self, file: File, inode: INodeNo) -> FileHandle {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
-        self.handles.insert(handle, OpenHandle { file, path });
+        if let Some(backing) = self.backing_by_inode.get_mut(&inode.0) {
+            backing.open_handles += 1;
+        }
+        self.handles.insert(handle, OpenHandle { file, inode });
         FileHandle(handle)
+    }
+
+    fn release_handle(&mut self, handle: FileHandle) {
+        if let Some(open) = self.handles.remove(&handle.0) {
+            if let Some(backing) = self.backing_by_inode.get_mut(&open.inode.0) {
+                backing.open_handles -= 1;
+            }
+            self.collect_inode(open.inode);
+        }
     }
 
     fn remove_path_tree(&mut self, path: &Path) {
@@ -893,7 +1004,7 @@ impl FuseState {
             .collect::<Vec<_>>();
         for candidate in paths {
             if let Some(inode) = self.inode_by_path.remove(&candidate) {
-                self.path_by_inode.remove(&inode);
+                self.collect_inode(INodeNo(inode));
             }
         }
     }
@@ -916,11 +1027,6 @@ impl FuseState {
             let new_path = rebase_path(&old_path, old, new);
             self.path_by_inode.insert(inode, new_path.clone());
             self.inode_by_path.insert(new_path, inode);
-        }
-        for handle in self.handles.values_mut() {
-            if handle.path == old || handle.path.starts_with(old) {
-                handle.path = rebase_path(&handle.path, old, new);
-            }
         }
     }
 
@@ -955,18 +1061,6 @@ impl FuseState {
             self.path_by_inode.insert(inode, exchanged_path.clone());
             self.inode_by_path.insert(exchanged_path, inode);
         }
-        for handle in self.handles.values_mut() {
-            let exchanged_path = if handle.path == old || handle.path.starts_with(old) {
-                Some(rebase_path(&handle.path, old, new))
-            } else if handle.path == new || handle.path.starts_with(new) {
-                Some(rebase_path(&handle.path, new, old))
-            } else {
-                None
-            };
-            if let Some(exchanged_path) = exchanged_path {
-                handle.path = exchanged_path;
-            }
-        }
     }
 }
 
@@ -977,6 +1071,21 @@ fn rebase_path(path: &Path, old: &Path, new: &Path) -> PathBuf {
     } else {
         new.join(suffix)
     }
+}
+
+fn without_deleted_suffix(path: &Path) -> Option<&Path> {
+    // procfs appends this marker to unlinked dentries. Check both spellings:
+    // the marker is ambiguous with a literal filename and must not bypass denies.
+    path.as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+        .map(|bytes| Path::new(OsStr::from_bytes(bytes)))
+}
+
+fn resolved_for_fd(fd: RawFd) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .ok()
+        .filter(|path| path.is_absolute())
 }
 
 #[derive(Debug)]
@@ -1044,15 +1153,13 @@ impl GuardedPassthroughFs {
         )
     }
 
-    fn resolved_for_fd(fd: RawFd) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/self/fd/{fd}"))
-            .ok()
-            .filter(|path| path.is_absolute())
-    }
-
     fn check_read(&self, relative: &Path, resolved: Option<&Path>) -> io::Result<()> {
         let requested = self.absolute_path(relative);
-        if self.policy.is_read_denied(&requested, resolved) {
+        if self.policy.is_read_denied(&requested, resolved)
+            || resolved
+                .and_then(without_deleted_suffix)
+                .is_some_and(|path| self.policy.is_read_denied(&requested, Some(path)))
+        {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         Ok(())
@@ -1060,11 +1167,18 @@ impl GuardedPassthroughFs {
 
     fn check_write(&self, relative: &Path, resolved: Option<&Path>) -> io::Result<()> {
         let requested = self.absolute_path(relative);
-        if self.policy.is_write_denied(&requested, resolved) {
-            self.policy.record_write_denial(&requested, resolved);
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        Ok(())
+        let denied = if self.policy.is_write_denied(&requested, resolved) {
+            resolved
+        } else if let Some(path) = resolved
+            .and_then(without_deleted_suffix)
+            .filter(|path| self.policy.is_write_denied(&requested, Some(path)))
+        {
+            Some(path)
+        } else {
+            return Ok(());
+        };
+        self.policy.record_write_denial(&requested, denied);
+        Err(io::Error::from_raw_os_error(libc::EACCES))
     }
 
     fn open_checked(&self, path: &Path, flags: i32, mode: u32) -> io::Result<OwnedFd> {
@@ -1084,7 +1198,7 @@ impl GuardedPassthroughFs {
             mode,
             resolve,
         )?;
-        let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+        let resolved = resolved_for_fd(fd.as_raw_fd());
         if write {
             self.check_write(path, resolved.as_deref())?;
         } else {
@@ -1095,7 +1209,7 @@ impl GuardedPassthroughFs {
 
     fn check_existing_resolved_write(&self, path: &Path) -> io::Result<()> {
         match self.open_relative(path, libc::O_PATH, 0) {
-            Ok(fd) => self.check_write(path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref()),
+            Ok(fd) => self.check_write(path, resolved_for_fd(fd.as_raw_fd()).as_deref()),
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             Err(error) => Err(error),
         }
@@ -1104,7 +1218,7 @@ impl GuardedPassthroughFs {
     fn check_existing_entry_write(&self, path: &Path) -> io::Result<()> {
         match self.open_relative(path, libc::O_PATH | libc::O_NOFOLLOW, 0) {
             Ok(fd) => {
-                let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+                let resolved = resolved_for_fd(fd.as_raw_fd());
                 self.check_write(path, resolved.as_deref())?;
                 if fstat(fd.as_raw_fd())?.st_mode & libc::S_IFMT == libc::S_IFLNK {
                     let target = readlink_fd(fd.as_raw_fd())?;
@@ -1117,12 +1231,6 @@ impl GuardedPassthroughFs {
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             Err(error) => Err(error),
         }
-    }
-
-    fn stat_path(&self, path: &Path) -> io::Result<libc::stat> {
-        let (_fd, stat) = self.open_metadata_checked(path)?;
-        self.check_socket(path, &stat)?;
-        Ok(stat)
     }
 
     fn check_socket(&self, path: &Path, stat: &libc::stat) -> io::Result<()> {
@@ -1140,16 +1248,24 @@ impl GuardedPassthroughFs {
     fn open_metadata_checked(&self, path: &Path) -> io::Result<(OwnedFd, libc::stat)> {
         self.check_read(path, None)?;
         let fd = self.open_relative(path, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
-        let stat = fstat(fd.as_raw_fd())?;
-        let resolved = Self::resolved_for_fd(fd.as_raw_fd());
-        self.check_read(path, resolved.as_deref())?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            let target = readlink_fd(fd.as_raw_fd())?;
-            let link = resolved.unwrap_or_else(|| self.absolute_path(path));
-            let target = resolve_symlink_target(&link, &target)?;
-            self.check_read(path, Some(&target))?;
-        }
+        let stat = self.stat_metadata_checked(path, fd.as_raw_fd())?;
         Ok((fd, stat))
+    }
+
+    fn stat_metadata_checked(&self, path: &Path, fd: RawFd) -> io::Result<libc::stat> {
+        let stat = fstat(fd)?;
+        let resolved =
+            resolved_for_fd(fd).ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))?;
+        self.check_read(path, Some(&resolved))?;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            let target = readlink_fd(fd)?;
+            let target = resolve_symlink_target(&resolved, &target)?;
+            self.check_read(path, Some(&target))?;
+            if std::fs::metadata(&target).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
+        }
+        Ok(stat)
     }
 
     fn readlink_path(&self, path: &Path) -> io::Result<PathBuf> {
@@ -1165,7 +1281,7 @@ impl GuardedPassthroughFs {
             self.check_read(path, None)?;
         }
         let fd = self.open_relative(path, libc::O_PATH, 0)?;
-        let resolved = Self::resolved_for_fd(fd.as_raw_fd());
+        let resolved = resolved_for_fd(fd.as_raw_fd());
         if write {
             self.check_write(path, resolved.as_deref())?;
         } else {
@@ -1174,7 +1290,31 @@ impl GuardedPassthroughFs {
         faccessat_empty(fd.as_raw_fd(), mask.bits())
     }
 
-    fn attr_for_path(&self, path: &Path, inode: INodeNo) -> io::Result<FileAttr> {
+    fn attr_for_inode(&self, inode: INodeNo) -> io::Result<FileAttr> {
+        let state = self.state();
+        let path = state
+            .path_by_inode
+            .get(&inode.0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let fd = if inode == INodeNo::ROOT {
+            self.lower_fd.as_raw_fd()
+        } else {
+            state
+                .backing_by_inode
+                .get(&inode.0)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                .fd
+                .as_raw_fd()
+        };
+        self.attr_for_fd(path, inode, fd).map(|(attr, _)| attr)
+    }
+
+    fn attr_for_fd(
+        &self,
+        path: &Path,
+        inode: INodeNo,
+        fd: RawFd,
+    ) -> io::Result<(FileAttr, libc::stat)> {
         // The FUSE root is constructed from a directory. When its lower path is
         // intentionally unreadable, bwrap still needs a directory type to bind
         // the view and traverse to separately allowed descendants. Return only
@@ -1182,21 +1322,20 @@ impl GuardedPassthroughFs {
         // operations continue through their normal read-policy checks.
         let absolute = self.absolute_path(path);
         if path.as_os_str().is_empty() && self.policy.is_read_denied(&self.lower_root, None) {
-            return Ok(synthetic_mount_root_attr(inode));
+            return Ok((synthetic_mount_root_attr(inode), fstat(fd)?));
         }
         if self.policy.is_structural_read_ancestor(&absolute) {
-            self.open_structural_directory(path)
-                .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
-            return Ok(synthetic_mount_root_attr(inode));
+            let stat = fstat(fd)?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                || resolved_for_fd(fd).as_deref() != Some(absolute.as_path())
+            {
+                return Err(io::Error::from_raw_os_error(libc::EACCES));
+            }
+            return Ok((synthetic_mount_root_attr(inode), stat));
         }
-        let stat = self.stat_path(path)?;
-        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
-            && std::fs::metadata(self.absolute_path(path))
-                .is_ok_and(|metadata| metadata.file_type().is_socket())
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-        Ok(file_attr(inode, &stat))
+        let stat = self.stat_metadata_checked(path, fd)?;
+        self.check_socket(path, &stat)?;
+        Ok((file_attr(inode, &stat), stat))
     }
 
     fn open_structural_directory(&self, path: &Path) -> io::Result<OwnedFd> {
@@ -1221,7 +1360,7 @@ impl GuardedPassthroughFs {
     fn open_parent_checked_for_write(&self, path: &Path) -> io::Result<(OwnedFd, CString)> {
         self.check_write(path, None)?;
         let (parent, name) = self.open_parent(path)?;
-        let resolved = Self::resolved_for_fd(parent.as_raw_fd())
+        let resolved = resolved_for_fd(parent.as_raw_fd())
             .map(|path| path.join(OsStr::from_bytes(name.as_bytes())));
         self.check_write(path, resolved.as_deref())?;
         Ok((parent, name))
@@ -1240,13 +1379,78 @@ impl GuardedPassthroughFs {
     }
 
     fn reply_entry(&self, path: &Path, reply: ReplyEntry) {
-        let inode = self.state().inode_for_path(path);
-        match self.attr_for_path(path, inode) {
+        match self.lookup_entry(path) {
             Ok(attr) => {
                 reply.entry(&Duration::ZERO, &attr, Generation(0));
             }
             Err(error) => reply.error(errno(error)),
         }
+    }
+
+    fn lookup_entry(&self, path: &Path) -> io::Result<FileAttr> {
+        let fd = if self
+            .policy
+            .is_structural_read_ancestor(&self.absolute_path(path))
+        {
+            self.open_structural_directory(path)
+                .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?
+        } else {
+            self.check_read(path, None)?;
+            self.open_relative(path, libc::O_PATH | libc::O_NOFOLLOW, 0)?
+        };
+        // Attributes are fetched anew; the descriptor pins identity, not metadata.
+        let (mut attr, stat) = self.attr_for_fd(path, INodeNo(0), fd.as_raw_fd())?;
+        attr.ino = self.state().remember_lookup(path, fd, &stat)?;
+        Ok(attr)
+    }
+
+    fn open_inode(&self, inode: INodeNo, flags: i32) -> io::Result<FileHandle> {
+        let (path, pinned) = {
+            let state = self.state();
+            let path = state
+                .path_by_inode
+                .get(&inode.0)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
+                .clone();
+            let pinned = state
+                .backing_by_inode
+                .get(&inode.0)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                .fd
+                .try_clone()?;
+            (path, pinned)
+        };
+        let flags = flags & !(libc::O_CREAT | libc::O_EXCL | FMODE_EXEC);
+        let write = flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_TRUNC | libc::O_APPEND) != 0;
+        let resolved = resolved_for_fd(pinned.as_raw_fd())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))?;
+        if write {
+            self.check_write(&path, Some(&resolved))?;
+        } else {
+            self.check_read(&path, Some(&resolved))?;
+        }
+        if fstat(pinned.as_raw_fd())?.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        // Reopen our pinned object, rather than a name that may now be reused.
+        // O_NOFOLLOW was enforced against the pinned entry above; it must not
+        // reject the procfs link used solely to reopen our own descriptor.
+        let fd = open_path(
+            libc::AT_FDCWD,
+            Path::new(&format!("/proc/self/fd/{}", pinned.as_raw_fd())),
+            (flags & !libc::O_NOFOLLOW) | libc::O_CLOEXEC,
+            0,
+            0,
+        )?;
+        let resolved = resolved_for_fd(fd.as_raw_fd())
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))?;
+        if write {
+            self.check_write(&path, Some(&resolved))?;
+        } else {
+            self.check_read(&path, Some(&resolved))?;
+        }
+        Ok(self.state().insert_handle(File::from(fd), inode))
     }
 }
 
@@ -1258,10 +1462,12 @@ impl Filesystem for GuardedPassthroughFs {
         }
     }
 
+    fn forget(&self, _req: &Request, inode: INodeNo, lookups: u64) {
+        self.state().forget(inode, lookups);
+    }
+
     fn getattr(&self, _req: &Request, inode: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let result = self
-            .path_for_inode(inode)
-            .and_then(|path| self.attr_for_path(&path, inode));
+        let result = self.attr_for_inode(inode);
         match result {
             Ok(attr) => reply.attr(&Duration::ZERO, &attr),
             Err(error) => reply.error(errno(error)),
@@ -1280,13 +1486,7 @@ impl Filesystem for GuardedPassthroughFs {
     }
 
     fn open(&self, _req: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let result = (|| {
-            let path = self.path_for_inode(inode)?;
-            let flags = flags.0 & !(libc::O_CREAT | libc::O_EXCL | FMODE_EXEC);
-            let fd = self.open_checked(&path, flags, 0)?;
-            let file = File::from(fd);
-            Ok(self.state().insert_handle(file, path))
-        })();
+        let result = self.open_inode(inode, flags.0);
         match result {
             Ok(handle) => reply.opened(handle, FopenFlags::FOPEN_DIRECT_IO),
             Err(error) => reply.error(errno(error)),
@@ -1310,10 +1510,11 @@ impl Filesystem for GuardedPassthroughFs {
             .get(&handle.0)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))
             .and_then(|open| {
-                self.check_read(
-                    &open.path,
-                    Self::resolved_for_fd(open.file.as_raw_fd()).as_deref(),
-                )?;
+                let path = state
+                    .path_by_inode
+                    .get(&open.inode.0)
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+                self.check_read(path, resolved_for_fd(open.file.as_raw_fd()).as_deref())?;
                 let mut data = vec![0_u8; size as usize];
                 let count = pread(open.file.as_raw_fd(), &mut data, offset)?;
                 data.truncate(count);
@@ -1343,10 +1544,11 @@ impl Filesystem for GuardedPassthroughFs {
             .get(&handle.0)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))
             .and_then(|open| {
-                self.check_write(
-                    &open.path,
-                    Self::resolved_for_fd(open.file.as_raw_fd()).as_deref(),
-                )?;
+                let path = state
+                    .path_by_inode
+                    .get(&open.inode.0)
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+                self.check_write(path, resolved_for_fd(open.file.as_raw_fd()).as_deref())?;
                 pwrite(open.file.as_raw_fd(), data, offset)
             });
         match result {
@@ -1380,7 +1582,7 @@ impl Filesystem for GuardedPassthroughFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.state().handles.remove(&handle.0);
+        self.state().release_handle(handle);
         reply.ok();
     }
 
@@ -1408,7 +1610,7 @@ impl Filesystem for GuardedPassthroughFs {
         let result = self.path_for_inode(inode).and_then(|path| {
             self.check_read(&path, None)?;
             let fd = self.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            self.check_read(&path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref())?;
+            self.check_read(&path, resolved_for_fd(fd.as_raw_fd()).as_deref())?;
             Ok(())
         });
         match result {
@@ -1429,7 +1631,7 @@ impl Filesystem for GuardedPassthroughFs {
             let path = self.path_for_inode(inode)?;
             self.check_read(&path, None)?;
             let fd = self.open_relative(&path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            let resolved_directory = Self::resolved_for_fd(fd.as_raw_fd());
+            let resolved_directory = resolved_for_fd(fd.as_raw_fd());
             self.check_read(&path, resolved_directory.as_deref())?;
             let proc_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
             let mut children = std::fs::read_dir(proc_path)?.collect::<io::Result<Vec<_>>>()?;
@@ -1513,10 +1715,11 @@ impl Filesystem for GuardedPassthroughFs {
                 mode & !umask & 0o7777,
                 libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
             )?;
-            self.check_write(&path, Self::resolved_for_fd(fd.as_raw_fd()).as_deref())?;
+            self.check_write(&path, resolved_for_fd(fd.as_raw_fd()).as_deref())?;
             let stat = fstat(fd.as_raw_fd())?;
-            let inode = self.state().inode_for_path(&path);
-            let handle = self.state().insert_handle(File::from(fd), path);
+            let mut state = self.state();
+            let inode = state.remember_lookup(&path, fd.try_clone()?, &stat)?;
+            let handle = state.insert_handle(File::from(fd), inode);
             Ok((file_attr(inode, &stat), handle))
         })();
         match result {
@@ -1739,7 +1942,7 @@ impl Filesystem for GuardedPassthroughFs {
                     )
                 })?;
             }
-            self.attr_for_path(&path, inode)
+            self.attr_for_inode(inode)
         })();
         match result {
             Ok(attr) => reply.attr(&Duration::ZERO, &attr),
@@ -2073,14 +2276,8 @@ mod tests {
         let left_child = state.inode_for_path(Path::new("left/child"));
         let right = state.inode_for_path(Path::new("right"));
         let right_child = state.inode_for_path(Path::new("right/child"));
-        let left_handle = state.insert_handle(
-            File::open("/dev/null").unwrap(),
-            PathBuf::from("left/child"),
-        );
-        let right_handle = state.insert_handle(
-            File::open("/dev/null").unwrap(),
-            PathBuf::from("right/child"),
-        );
+        let left_handle = state.insert_handle(File::open("/dev/null").unwrap(), left_child);
+        let right_handle = state.insert_handle(File::open("/dev/null").unwrap(), right_child);
 
         state.exchange_path_trees(Path::new("left"), Path::new("right"));
 
@@ -2101,12 +2298,16 @@ mod tests {
             Some(&PathBuf::from("left/child"))
         );
         assert_eq!(
-            state.handles.get(&left_handle.0).unwrap().path,
-            PathBuf::from("right/child")
+            state
+                .path_by_inode
+                .get(&state.handles.get(&left_handle.0).unwrap().inode.0),
+            Some(&PathBuf::from("right/child"))
         );
         assert_eq!(
-            state.handles.get(&right_handle.0).unwrap().path,
-            PathBuf::from("left/child")
+            state
+                .path_by_inode
+                .get(&state.handles.get(&right_handle.0).unwrap().inode.0),
+            Some(&PathBuf::from("left/child"))
         );
     }
 
@@ -2320,7 +2521,7 @@ mod tests {
 
         assert_eq!(
             filesystem
-                .stat_path(Path::new("public/token"))
+                .lookup_entry(Path::new("public/token"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
@@ -2620,6 +2821,448 @@ mod tests {
         .unwrap();
         std::fs::remove_file(mounts.binds()[0].source.join("link")).unwrap();
         assert!(std::fs::symlink_metadata(link).is_err());
+    }
+
+    #[test]
+    fn mounted_open_file_metadata_rechecks_denied_renames() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let opened = File::open(mounts.binds()[0].source.join("visible")).unwrap();
+
+        std::fs::rename(
+            lower.path().join("visible"),
+            lower.path().join("secret.pem"),
+        )
+        .unwrap();
+        std::fs::write(lower.path().join("visible"), "replacement").unwrap();
+        assert_eq!(
+            opened.metadata().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(lower.path().join("secret.pem")).unwrap();
+        assert_eq!(
+            opened.metadata().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn mounted_open_file_metadata_survives_path_replacement_and_unlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let opened = File::open(view.join("visible")).unwrap();
+
+        std::fs::rename(lower.path().join("visible"), lower.path().join("moved")).unwrap();
+        std::fs::write(
+            lower.path().join("visible"),
+            "replacement has a different length",
+        )
+        .unwrap();
+        assert_eq!(opened.metadata().unwrap().len(), 8);
+        let replacement = File::open(view.join("visible")).unwrap();
+        assert_eq!(replacement.metadata().unwrap().len(), 34);
+        assert_ne!(
+            opened.metadata().unwrap().ino(),
+            replacement.metadata().unwrap().ino()
+        );
+        std::fs::write(lower.path().join("moved"), "fresh attributes").unwrap();
+        assert_eq!(opened.metadata().unwrap().len(), 16);
+
+        std::fs::remove_file(lower.path().join("visible")).unwrap();
+        std::fs::remove_file(lower.path().join("moved")).unwrap();
+        assert_eq!(opened.metadata().unwrap().len(), 16);
+        assert_eq!(replacement.metadata().unwrap().len(), 34);
+    }
+
+    #[test]
+    fn mounted_path_only_metadata_survives_replacement() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        std::fs::create_dir(lower.path().join("directory")).unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        for name in ["visible", "directory"] {
+            // O_PATH does not issue the FUSE open callback on Linux.
+            let opened = open_path(
+                libc::AT_FDCWD,
+                &view.join(name),
+                libc::O_PATH | libc::O_CLOEXEC,
+                0,
+                0,
+            )
+            .unwrap();
+            let host = open_path(
+                libc::AT_FDCWD,
+                &lower.path().join(name),
+                libc::O_PATH | libc::O_CLOEXEC,
+                0,
+                0,
+            )
+            .unwrap();
+            std::fs::rename(lower.path().join(name), lower.path().join("moved")).unwrap();
+            std::fs::write(lower.path().join(name), "replacement").unwrap();
+            let before = fstat(host.as_raw_fd()).unwrap();
+            let after = fstat(opened.as_raw_fd()).unwrap();
+            assert_eq!(after.st_mode, before.st_mode);
+            assert_eq!(after.st_size, before.st_size);
+            if name == "directory" {
+                std::fs::remove_dir(lower.path().join("moved")).unwrap();
+            } else {
+                std::fs::remove_file(lower.path().join("moved")).unwrap();
+            }
+            assert_eq!(
+                fstat(opened.as_raw_fd()).unwrap().st_size,
+                fstat(host.as_raw_fd()).unwrap().st_size
+            );
+        }
+    }
+
+    #[test]
+    fn mounted_regular_file_open_preserves_nofollow_behavior() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        std::os::unix::fs::symlink("visible", lower.path().join("alias")).unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let regular = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(view.join("visible"))
+            .unwrap();
+        assert_eq!(regular.metadata().unwrap().len(), 8);
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(view.join("alias"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+    }
+
+    #[test]
+    fn mounted_open_file_metadata_keeps_recreated_hardlink_aliases_distinct() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let original = File::open(view.join("visible")).unwrap();
+        std::fs::rename(
+            lower.path().join("visible"),
+            lower.path().join("secret.pem"),
+        )
+        .unwrap();
+        std::fs::hard_link(
+            lower.path().join("secret.pem"),
+            lower.path().join("visible"),
+        )
+        .unwrap();
+        let allowed_alias = File::open(view.join("visible")).unwrap();
+        assert_eq!(allowed_alias.metadata().unwrap().len(), 8);
+        assert_eq!(
+            original.metadata().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn mounted_symlink_descriptor_metadata_ignores_replacement_target() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("target"), "data").unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(lower.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("target", lower.path().join("visible")).unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let opened = open_path(
+            libc::AT_FDCWD,
+            &view.join("visible"),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+            0,
+        )
+        .unwrap();
+        std::fs::rename(lower.path().join("visible"), lower.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink("socket", lower.path().join("visible")).unwrap();
+        let stat = fstat(opened.as_raw_fd()).unwrap();
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        assert_eq!(stat.st_size, 6);
+        assert_eq!(
+            std::fs::symlink_metadata(view.join("visible"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn mounted_open_file_metadata_survives_fuse_rename_overwrite_and_unlink() {
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("source"), "source").unwrap();
+        std::fs::write(lower.path().join("destination"), "old destination").unwrap();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let view = &mounts.binds()[0].source;
+        let source = File::open(view.join("source")).unwrap();
+        let destination = File::open(view.join("destination")).unwrap();
+        std::fs::rename(view.join("source"), view.join("destination")).unwrap();
+        assert_eq!(source.metadata().unwrap().len(), 6);
+        assert_eq!(destination.metadata().unwrap().len(), 15);
+        assert_eq!(
+            std::fs::metadata(view.join("destination")).unwrap().len(),
+            6
+        );
+        std::fs::remove_file(view.join("destination")).unwrap();
+        assert_eq!(source.metadata().unwrap().len(), 6);
+        assert_eq!(destination.metadata().unwrap().len(), 15);
+    }
+
+    #[test]
+    fn inode_references_release_old_objects_without_forgetting_replacements() {
+        let lower = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        let filesystem = GuardedPassthroughFs::new(
+            lower.path(),
+            Arc::new(policy(lower.path(), &["*.pem"], &[])),
+        )
+        .unwrap();
+        let path = Path::new("visible");
+        let original = filesystem.lookup_entry(path).unwrap().ino;
+        assert_eq!(filesystem.lookup_entry(path).unwrap().ino, original);
+        let handle = filesystem
+            .state()
+            .insert_handle(File::open(lower.path().join(path)).unwrap(), original);
+        std::fs::rename(lower.path().join(path), lower.path().join("moved")).unwrap();
+        std::fs::write(lower.path().join(path), "replacement").unwrap();
+        let replacement = filesystem.lookup_entry(path).unwrap().ino;
+        assert_ne!(replacement, original);
+        filesystem.state().forget(original, 1);
+        assert_eq!(filesystem.attr_for_inode(original).unwrap().size, 8);
+        filesystem.state().forget(original, 1);
+        assert_eq!(filesystem.attr_for_inode(original).unwrap().size, 8);
+        filesystem.state().release_handle(handle);
+        assert_eq!(
+            filesystem
+                .attr_for_inode(original)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            filesystem.state().inode_by_path.get(path),
+            Some(&replacement.0)
+        );
+        filesystem.state().forget(replacement, 1);
+        let state = filesystem.state();
+        assert!(state.backing_by_inode.is_empty());
+        assert!(state.handles.is_empty());
+        assert_eq!(state.path_by_inode.len(), 1);
+        assert_eq!(state.inode_by_path.len(), 1);
+    }
+
+    #[test]
+    fn mounted_metadata_uses_hard_descriptor_budget_and_releases_pins() {
+        const CHILD: &str = "ZEROBOX_INODE_DESCRIPTOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dynamic_fs::tests::mounted_metadata_uses_hard_descriptor_budget_and_releases_pins", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        cvt(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) }).unwrap();
+        assert!(
+            limits.rlim_max > 6100,
+            "test requires a hard descriptor budget above 6100"
+        );
+        limits.rlim_cur = 256;
+        cvt(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) }).unwrap();
+        let count_descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let lower = TempDir::new().unwrap();
+        let private = TempDir::new().unwrap();
+        for index in 0..6000 {
+            std::fs::write(lower.path().join(index.to_string()), "data").unwrap();
+        }
+        let before = count_descriptors();
+        let mounts = DynamicDenyMounts::prepare_in(
+            lower.path(),
+            &["*.pem".to_string()],
+            &[],
+            &FileSystemSandboxPolicy::unrestricted(),
+            private.path(),
+        )
+        .unwrap()
+        .unwrap();
+        let count_backing_descriptors = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|entry| {
+                        std::fs::read_link(entry.path())
+                            .is_ok_and(|path| path.starts_with(lower.path()))
+                    })
+                })
+                .count()
+        };
+        let mounted_baseline = count_backing_descriptors();
+        for index in 0..6000 {
+            assert_eq!(
+                std::fs::metadata(mounts.binds()[0].source.join(index.to_string()))
+                    .unwrap()
+                    .len(),
+                4
+            );
+        }
+        for index in 0..6000 {
+            std::fs::remove_file(mounts.binds()[0].source.join(index.to_string())).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while count_backing_descriptors() > mounted_baseline && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            count_backing_descriptors(),
+            mounted_baseline,
+            "kernel forget did not release unlinked inode descriptors"
+        );
+        let mut after_limits = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        cvt(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after_limits) }).unwrap();
+        assert_eq!(after_limits.rlim_cur, limits.rlim_max);
+        assert_eq!(after_limits.rlim_max, limits.rlim_max);
+        drop(mounts);
+        assert_eq!(count_descriptors(), before);
+    }
+
+    #[test]
+    fn opening_inode_uses_pinned_object_after_namespace_replacement() {
+        let lower = TempDir::new().unwrap();
+        std::fs::write(lower.path().join("visible"), "original").unwrap();
+        let filesystem = GuardedPassthroughFs::new(
+            lower.path(),
+            Arc::new(policy(lower.path(), &["*.pem"], &[])),
+        )
+        .unwrap();
+        let original = filesystem.lookup_entry(Path::new("visible")).unwrap().ino;
+        std::fs::rename(lower.path().join("visible"), lower.path().join("moved")).unwrap();
+        std::fs::write(lower.path().join("visible"), "replacement").unwrap();
+        let handle = filesystem.open_inode(original, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            filesystem.state().handles[&handle.0]
+                .file
+                .metadata()
+                .unwrap()
+                .len(),
+            8
+        );
+        let state = filesystem.state();
+        for fd in [
+            state.backing_by_inode[&original.0].fd.as_raw_fd(),
+            state.handles[&handle.0].file.as_raw_fd(),
+        ] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+        drop(state);
+        filesystem.state().release_handle(handle);
+
+        std::fs::rename(lower.path().join("moved"), lower.path().join("secret.pem")).unwrap();
+        assert_eq!(
+            filesystem
+                .open_inode(original, libc::O_WRONLY | libc::O_TRUNC)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::metadata(lower.path().join("secret.pem"))
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            std::fs::metadata(lower.path().join("visible"))
+                .unwrap()
+                .len(),
+            11
+        );
     }
 
     #[test]
