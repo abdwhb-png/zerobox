@@ -94,6 +94,8 @@ jobs:
           bun-version: "1.3.14"
       - name: Export the installed Bun root for development-tool fixtures
         run: printf 'BUN_INSTALL=%s\n' "$(dirname "$(dirname "$(readlink -f "$(command -v bun)")")")" >> "$GITHUB_ENV"
+      - name: Benchmark comparison contracts
+        run: python3 -m unittest discover -s scripts/performance -p test_compare.py
       - uses: actions/download-artifact@v4
         with:
           name: upstream

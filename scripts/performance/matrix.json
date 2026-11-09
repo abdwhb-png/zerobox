@@ -1,0 +1,13 @@
+[
+  {"op":"stat","depth":1,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"stat","depth":3,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"stat","depth":8,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"fstat","depth":8,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"read_fd","depth":8,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"read_path","depth":8,"family":"filesystem","checksumPerIteration":4096},
+  {"op":"open_close","depth":8,"family":"filesystem","checksumPerIteration":1},
+  {"op":"missing","depth":8,"family":"filesystem","checksumPerIteration":1},
+  {"op":"node_modules","family":"tools","checksumPerIteration":4950},
+  {"op":"python_imports","family":"tools","checksumPerIteration":4950},
+  {"op":"git","family":"tools","checksumPerIteration":1}
+]
