@@ -21,3 +21,5 @@ Do not run profilers, compilers or other deliberately heavy work during accepted
 Application tests are additional integration evidence. Record their exact command, executable, source revision, output assertions and cache state. Restore the same owned experimental cache snapshot before each alternating trial when the application mutates caches. Do not clear or replace live user caches, download tools during samples, or use an application-specific result as the generic filesystem promotion gate.
 
 Run comparator checks with `python3 -m unittest discover -s scripts/performance -p test_compare.py`. Existing baselines and deferred defects belong in the measurement report rather than silent exclusions or weakened assertions.
+
+The [2026-11-09 qualification report](../../docs/performance-qualification-2026-11-09.md) records the rejected experimental candidate, retained changes and unchanged daily runtime.
