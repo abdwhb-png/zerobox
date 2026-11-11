@@ -37,6 +37,9 @@ Lightweight, cross-platform process sandboxing powered by [OpenAI Codex](https:/
   </a>
 </p>
 
+
+Mediated direct TCP preserves the caller's effective UID and GID through its private user and network namespaces. Each mapping contains only that caller identity; supplementary groups and root access are not added. Setup still configures private listeners before Bubblewrap drops all target capabilities, disables nested user namespaces and applies seccomp and no-new-privileges. Namespace or mapping failures abort setup without running the target. A caller that is already root remains root.
+
 ## Fork provenance
 
 - Base upstream: Zerobox `0.3.3` at commit `9a7affd6c68fb2541c7c709559c40e08ba0a1872`

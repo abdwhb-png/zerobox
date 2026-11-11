@@ -174,11 +174,74 @@ print('private-boundary-ok')
 
 #[cfg(target_os = "linux")]
 #[test]
+fn mediated_direct_tcp_preserves_caller_identity() {
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let gid = unsafe { libc::getegid() }.to_string();
+    let root = temp_dir();
+    let owned = root.path().join("owned");
+    std::fs::write(&owned, "identity fixture").unwrap();
+    let grant = format!("--allow-read={},/usr", root.path().display());
+    let write = format!("--allow-write={}", root.path().display());
+    let script = r#"import os, sys
+uid, gid = map(int, sys.argv[1:3])
+assert os.getresuid() == (uid, uid, uid), os.getresuid()
+assert os.getresgid() == (gid, gid, gid), os.getresgid()
+assert os.stat(sys.argv[3]).st_uid == uid
+with open(sys.argv[3] + '.created', 'w') as target:
+    target.write('created')
+print('identity-ok')
+"#;
+    for mediated in [false, true] {
+        let mut args = vec![
+            "--profile=analysis-strict",
+            grant.as_str(),
+            write.as_str(),
+            "--allow-net=example.invalid",
+        ];
+        if mediated {
+            args.push("--mediated-direct-tcp-port=443");
+        }
+        args.extend([
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+            &uid,
+            &gid,
+            owned.to_str().unwrap(),
+        ]);
+        let output = run(&args);
+        assert!(
+            output.status.success(),
+            "mediated={mediated}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "identity-ok\n");
+        use std::os::unix::fs::MetadataExt;
+        let created = std::fs::metadata(owned.with_file_name("owned.created")).unwrap();
+        assert_eq!(created.uid().to_string(), uid);
+        assert_eq!(created.gid().to_string(), gid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn mediated_direct_tcp_uses_an_outer_setup_namespace() {
     let script = r#"import errno, glob, os, socket, subprocess
 with open('/proc/self/status', encoding='ascii') as status:
     fields = dict(line.split(':', 1) for line in status if ':' in line)
-assert int(fields['CapEff'].strip(), 16) == 0
+for name in ['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb']:
+    assert int(fields[name].strip(), 16) == 0, (name, fields[name])
+assert fields['NoNewPrivs'].strip() == '1'
+assert fields['Seccomp'].strip() == '2'
+if os.geteuid() != 0:
+    for change in [os.setuid, os.setgid]:
+        try:
+            change(0)
+        except OSError as error:
+            assert error.errno in (errno.EPERM, errno.EINVAL), error
+        else:
+            raise AssertionError('root identity became available')
 pids = sorted(int(pid) for pid in os.listdir('/proc') if pid.isdigit())
 assert 1 in pids and os.getpid() in pids, pids
 assert subprocess.run(['unshare', '-Ur', '/bin/true'], capture_output=True).returncode != 0

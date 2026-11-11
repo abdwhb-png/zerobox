@@ -572,9 +572,9 @@
 +        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
 +        Err(error) => return Err(error),
 +    }
-+    fs::write("/proc/self/uid_map", format!("0 {outer_uid} 1\n"))?;
-+    fs::write("/proc/self/gid_map", format!("0 {outer_gid} 1\n"))?;
-+    if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
++    fs::write("/proc/self/uid_map", format!("{outer_uid} {outer_uid} 1\n"))?;
++    fs::write("/proc/self/gid_map", format!("{outer_gid} {outer_gid} 1\n"))?;
++    if unsafe { libc::setresgid(outer_gid, outer_gid, outer_gid) } != 0 || unsafe { libc::setresuid(outer_uid, outer_uid, outer_uid) } != 0 {
 +        return Err(io::Error::last_os_error());
 +    }
 +    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
