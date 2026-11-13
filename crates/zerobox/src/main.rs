@@ -87,7 +87,7 @@ pub struct Cli {
     #[arg(long)]
     pub allow_local_binding: bool,
 
-    /// Permit host.localhost on arbitrary host loopback TCP ports. Requires system ip and nft.
+    /// Permit host.zerobox.internal on arbitrary host loopback TCP ports. Requires system ip and nft.
     #[arg(long)]
     pub host_loopback: bool,
 

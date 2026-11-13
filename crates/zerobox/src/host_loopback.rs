@@ -220,7 +220,7 @@ mod tests {
             .set_allowed_host_domains(vec![HOST_ALIAS.to_string()]);
         config.network.set_denied_domains(vec![
             "localhost:3216".to_string(),
-            "host.localhost:5173".to_string(),
+            "host.zerobox.internal:5173".to_string(),
         ]);
         let state = NetworkProxyState::with_reloader(
             build_config_state(config, NetworkProxyConstraints::default()).unwrap(),

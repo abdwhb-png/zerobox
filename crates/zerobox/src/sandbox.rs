@@ -531,7 +531,7 @@ impl Sandbox {
         self
     }
 
-    /// Expose host.localhost on arbitrary host loopback TCP ports.
+    /// Expose host.zerobox.internal on arbitrary host loopback TCP ports.
     pub fn host_loopback(mut self, enabled: bool) -> Self {
         self.host_loopback = enabled;
         self

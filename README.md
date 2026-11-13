@@ -323,7 +323,9 @@ buffer stdin/stdout/stderr. Setup/delivery errors exit 125; a real target exit
 
 ## Host loopback on dynamic ports
 
-`--host-loopback` (Rust builder: `.host_loopback(true)`) is an explicit Linux-only permission, disabled by default. It exposes host `127.0.0.1` and `::1` TCP services through `host.localhost` on any port, including services started after the command. Private `localhost` listeners remain independent, except for existing explicit per-port loopback bridges. External domains, UDP, host Unix sockets and inbound publications keep their existing policies. A denial for `host.localhost`, `localhost`, `127.0.0.1` or `::1` wins for the corresponding port.
+`--host-loopback` (Rust builder: `.host_loopback(true)`) is an explicit Linux-only permission, disabled by default. It exposes host `127.0.0.1` and `::1` TCP services through `host.zerobox.internal` on any port, including services started after the command. Private `localhost` listeners remain independent, except for existing explicit per-port loopback bridges. External domains, UDP, host Unix sockets and inbound publications keep their existing policies. A denial for `host.zerobox.internal`, `localhost`, `127.0.0.1` or `::1` wins for the corresponding port.
+
+The alias avoids the `.localhost` suffix because [curl resolves that suffix directly to loopback](https://github.com/curl/curl/blob/curl-8_5_0/lib/hostip.c#L740-L742), bypassing hosts-file mappings.
 
 Setup requires trusted root-owned system `ip` and `nft` executables and namespace-local nftables NAT support. A dedicated address in the private network namespace redirects TCP to one listener; its descriptor is transferred to the host broker, which validates the original destination and policy before connecting only to host loopback. IPv6-only host services are reached when the IPv4 loopback connection is refused. The command drops setup capabilities before execution. Proxy-aware clients receive a `NO_PROXY` entry for the alias. No setup failure falls back to host networking. At most 64 connections are relayed concurrently.
 
@@ -402,7 +404,7 @@ Sandbox overhead is minimal, typically ~10ms and ~7MB:
 | `--deny-write-glob <pattern>`   | `--deny-write-glob='generated/**'`     | Dynamically block mutations matching one glob while preserving reads. Repeat for multiple patterns.         |
 | `--allow-net [domains]`         | `--allow-net=example.com`              | Allow outbound network. Without a value, allows all domains. Default: no network.                            |
 | `--allow-host-net <domains>`    | `--allow-host-net='*.dev.test:443'`    | Route exact hostnames or scoped wildcards to host loopback on an explicit port.                              |
-| `--host-loopback` | `--host-loopback -- curl http://host.localhost:3216` | Explicit Linux host-loopback access on all TCP ports, with policy denials preserved. |
+| `--host-loopback` | `--host-loopback -- curl http://host.zerobox.internal:3216` | Explicit Linux host-loopback access on all TCP ports, with policy denials preserved. |
 | `--deny-net <domains>`          | `--deny-net=evil.com`                  | Block network to these domains. Takes precedence over `--allow-net`.                                         |
 | `--env <KEY=VALUE>`             | `--env NODE_ENV=prod`                  | Set env var in the sandbox. Can be repeated.                                                                 |
 | `--allow-env [keys]`            | `--allow-env=PATH,HOME`                | Inherit parent env vars. Without a value, inherits all. Default: only PATH, HOME, USER, SHELL, TERM, LANG.   |
