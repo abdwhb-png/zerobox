@@ -571,6 +571,12 @@ if [ -f "$MEDIATED_DIRECT_TCP_PATCH" ]; then
     fi
 fi
 
+HOST_LOOPBACK_PATCH="$SCRIPT_DIR/upstream-host-loopback.patch"
+if [ -f "$HOST_LOOPBACK_PATCH" ]; then
+    echo "    host-loopback"
+    patch --fuzz=0 -p0 < "$HOST_LOOPBACK_PATCH"
+fi
+
 cd -
 
 {

@@ -86,7 +86,7 @@ pub async fn build_proxy(
 }
 
 /// A ConfigReloader that never reloads (static config for CLI use).
-struct StaticReloader;
+pub(crate) struct StaticReloader;
 
 #[async_trait::async_trait]
 impl ConfigReloader for StaticReloader {

@@ -30,6 +30,8 @@ mod docker_broker;
 #[cfg(target_os = "linux")]
 mod dynamic_fs;
 #[cfg(target_os = "linux")]
+mod host_loopback;
+#[cfg(target_os = "linux")]
 mod linux_runtime;
 #[cfg(target_os = "linux")]
 mod mediated_direct;

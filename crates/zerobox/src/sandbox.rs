@@ -283,6 +283,7 @@ pub struct Sandbox {
     host_tmp: bool,
     private_home: Option<PathBuf>,
     allow_local_binding: bool,
+    host_loopback: bool,
     allow_unix_sockets: Vec<PathBuf>,
     tcp_publications: Vec<TcpPublication>,
 }
@@ -427,6 +428,7 @@ impl Sandbox {
             host_tmp: false,
             private_home: None,
             allow_local_binding: false,
+            host_loopback: false,
             allow_unix_sockets: Vec::new(),
             tcp_publications: Vec::new(),
         }
@@ -526,6 +528,12 @@ impl Sandbox {
     /// Permit TCP listeners inside the private network namespace only.
     pub fn allow_local_binding(mut self, enabled: bool) -> Self {
         self.allow_local_binding = enabled;
+        self
+    }
+
+    /// Expose host.localhost on arbitrary host loopback TCP ports.
+    pub fn host_loopback(mut self, enabled: bool) -> Self {
+        self.host_loopback = enabled;
         self
     }
 
@@ -813,6 +821,7 @@ impl Sandbox {
             host_tmp,
             mut private_home,
             allow_local_binding,
+            host_loopback,
             allow_unix_sockets,
             tcp_publications,
         } = self;
@@ -982,6 +991,14 @@ impl Sandbox {
             validate_paths(&allow_read, &deny_read, &allow_write, &deny_write, &cwd)?;
         }
 
+        if host_loopback {
+            if disabled || full_access || !cfg!(target_os = "linux") {
+                return Err(
+                    anyhow::anyhow!("host loopback requires the Linux isolated sandbox").into(),
+                );
+            }
+            allow_host_net.push(zerobox_network_proxy::HOST_LOOPBACK_ALIAS.to_string());
+        }
         if allow_local_binding && (disabled || full_access || !cfg!(target_os = "linux")) {
             return Err(anyhow::anyhow!("local binding requires the Linux sandbox").into());
         }
@@ -1392,6 +1409,22 @@ impl Sandbox {
             None
         };
         #[cfg(target_os = "linux")]
+        let host_loopback_broker = if host_loopback {
+            Some(crate::host_loopback::HostLoopbackBroker::start(
+                proxy_root
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("host loopback requires a private proxy root"))?
+                    .path(),
+                proxy
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("host loopback requires a managed proxy"))?
+                    .state
+                    .clone(),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
         let mediated_direct_broker = if mediated_direct_tcp_ports.is_empty() {
             None
         } else {
@@ -1518,6 +1551,21 @@ impl Sandbox {
             exec_request.command.splice(separator..separator, options);
         }
 
+        #[cfg(target_os = "linux")]
+        if let Some(broker) = host_loopback_broker.as_ref() {
+            let separator = exec_request
+                .command
+                .iter()
+                .position(|argument| argument == "--")
+                .ok_or_else(|| anyhow::anyhow!("missing Linux sandbox command separator"))?;
+            exec_request.command.splice(
+                separator..separator,
+                [
+                    "--host-loopback-broker-path".to_string(),
+                    broker.socket_path().to_string_lossy().into_owned(),
+                ],
+            );
+        }
         let mut cmd = tokio::process::Command::new(&exec_request.command[0]);
         cmd.args(&exec_request.command[1..]);
         cmd.current_dir(outer_cwd);
@@ -1664,6 +1712,9 @@ impl Sandbox {
                     }
                 }
             }
+            if let Some(broker) = host_loopback_broker.as_ref() {
+                bind_values.push(serde_json::json!({ "source": broker.hosts_path(), "destination": "/etc/hosts", "read_only": true }));
+            }
             if let Some(control) = admission_control.as_ref() {
                 bind_values.push(control.bind_value());
             }
@@ -1707,6 +1758,9 @@ impl Sandbox {
                     serde_json::json!({"source": bundle.shell_root, "destination": RUNTIME_ROOT, "access":"ro", "origin":"runtime"}),
                     serde_json::json!({"source": bundle.helper, "destination":INNER_HELPER_PATH, "access":"ro", "origin":"runtime"}),
                 ];
+                if let Some(broker) = host_loopback_broker.as_ref() {
+                    mounts.push(serde_json::json!({"source":broker.hosts_path(),"destination":"/etc/hosts","access":"ro","origin":"internal"}));
+                }
                 if let Some(control) = admission_control.as_ref() {
                     mounts.push(serde_json::json!({"source": control.root, "destination":"/__zerobox", "access":"ro", "origin":"internal"}));
                 }
@@ -1733,14 +1787,15 @@ impl Sandbox {
                 if bundle.component == RuntimeComponent::Analysis {
                     mounts.push(serde_json::json!({"source": bundle.component_root, "destination": ANALYSIS_ROOT, "access":"ro", "origin":"runtime"}));
                 }
-                let admission_schema = if !deny_write_exceptions.is_empty() { 3 } else if mediated_direct_tcp_ports.is_empty() { 1 } else { 2 };
+                let admission_schema = if host_loopback { 4 } else if !deny_write_exceptions.is_empty() { 3 } else if mediated_direct_tcp_ports.is_empty() { 1 } else { 2 };
                 let mut admission_network = serde_json::json!({
                     "mode": if net_enabled { "domain-allowlist" } else { "deny-all" },
                     "allow": allow_net.unwrap_or_default(),
-                    "allowHost": allow_host_net,
+                    "allowHost": allow_host_net.iter().filter(|rule| !host_loopback || rule.as_str() != zerobox_network_proxy::HOST_LOOPBACK_ALIAS).collect::<Vec<_>>(),
                     "deny": deny_net,
                     "allowLocalBinding": allow_local_binding,
                 });
+                if host_loopback { admission_network["hostLoopback"] = serde_json::json!(true); }
                 if !mediated_direct_tcp_ports.is_empty() {
                     admission_network["mediatedDirectTcp"] = serde_json::json!({
                         "ports": mediated_direct_tcp_ports,
@@ -1829,6 +1884,10 @@ impl Sandbox {
                 _proxy: proxy.map(|proxy| proxy.proxy),
                 _proxy_root: proxy_root,
                 _mediated_direct_broker: mediated_direct_broker,
+                #[cfg(target_os = "linux")]
+                _host_loopback_broker: host_loopback_broker,
+                #[cfg(not(target_os = "linux"))]
+                _host_loopback_broker: None,
                 setup_channel,
                 _target_env_file: target_env_file,
                 _dynamic_fs: dynamic_fs,
@@ -2001,6 +2060,10 @@ struct ManagedExecutionResources {
     _proxy: Option<zerobox_network_proxy::NetworkProxy>,
     _proxy_root: Option<PrivateProxyRoot>,
     #[cfg(target_os = "linux")]
+    _host_loopback_broker: Option<crate::host_loopback::HostLoopbackBroker>,
+    #[cfg(not(target_os = "linux"))]
+    _host_loopback_broker: Option<()>,
+    #[cfg(target_os = "linux")]
     _mediated_direct_broker: Option<crate::mediated_direct::MediatedDirectBroker>,
     #[cfg(not(target_os = "linux"))]
     _mediated_direct_broker: Option<()>,
@@ -2053,6 +2116,7 @@ impl ManagedExecutionResources {
             && self._proxy.is_none()
             && self._proxy_root.is_none()
             && self._mediated_direct_broker.is_none()
+            && self._host_loopback_broker.is_none()
             && self.setup_channel.is_none()
             && self._target_env_file.is_none()
             && self._dynamic_fs.is_none()
@@ -4866,6 +4930,7 @@ mod tests {
                 _proxy: None,
                 _proxy_root: None,
                 _mediated_direct_broker: None,
+                _host_loopback_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
@@ -4895,6 +4960,7 @@ mod tests {
                 _proxy: None,
                 _proxy_root: Some(proxy_root),
                 _mediated_direct_broker: None,
+                _host_loopback_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,
@@ -4931,6 +4997,7 @@ mod tests {
                 _proxy: None,
                 _proxy_root: Some(proxy_root),
                 _mediated_direct_broker: None,
+                _host_loopback_broker: None,
                 setup_channel: None,
                 _target_env_file: None,
                 _dynamic_fs: None,

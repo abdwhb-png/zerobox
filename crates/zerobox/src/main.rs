@@ -87,6 +87,10 @@ pub struct Cli {
     #[arg(long)]
     pub allow_local_binding: bool,
 
+    /// Permit host.localhost on arbitrary host loopback TCP ports. Requires system ip and nft.
+    #[arg(long)]
+    pub host_loopback: bool,
+
     /// Permit connections to exact existing Unix stream sockets.
     #[arg(long = "allow-unix-socket", value_delimiter = ',', num_args = 1..)]
     pub allow_unix_socket: Option<Vec<PathBuf>>,
@@ -407,7 +411,9 @@ async fn tokio_main(
     if let Some(fd) = cli.admission_ack_fd {
         sandbox = sandbox.admission_ack_fd(fd);
     }
-    sandbox = sandbox.allow_local_binding(cli.allow_local_binding);
+    sandbox = sandbox
+        .allow_local_binding(cli.allow_local_binding)
+        .host_loopback(cli.host_loopback);
     if let Some(ref paths) = cli.allow_unix_socket {
         for path in paths {
             sandbox = sandbox.allow_unix_socket(path);

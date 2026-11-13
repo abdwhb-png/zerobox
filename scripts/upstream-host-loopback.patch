@@ -1,0 +1,232 @@
+--- upstream/linux-sandbox/src/lib.rs
++++ upstream/linux-sandbox/src/lib.rs
+@@ -13,6 +13,9 @@
+ pub mod error;
+ #[cfg(target_os = "linux")]
+ mod exec_util;
++#[cfg(target_os = "linux")]
++#[path = "../../../scripts/host-loopback-helper.rs"]
++mod host_loopback;
+ #[cfg(target_os = "linux")]
+ mod landlock;
+ #[cfg(target_os = "linux")]
+--- upstream/linux-sandbox/src/linux_run_main.rs
++++ upstream/linux-sandbox/src/linux_run_main.rs
+@@ -142,6 +142,10 @@
+     /// Owner-only host broker socket created by the trusted Zerobox parent.
+     #[arg(long = "mediated-direct-broker-path", hide = true)]
+     pub mediated_direct_broker_path: Option<PathBuf>,
++    #[arg(long, hide = true)]
++    pub host_loopback_broker_path: Option<PathBuf>,
++    #[arg(long, hide = true)]
++    pub host_loopback_active: bool,
+ 
+     /// Explicit private root for host-side managed proxy bridge sockets.
+     #[arg(long = "proxy-root", hide = true)]
+@@ -192,6 +196,8 @@
+         proxy_route_spec,
+         mediated_direct_tcp_ports,
+         mediated_direct_broker_path,
++        host_loopback_broker_path,
++        host_loopback_active,
+         proxy_root,
+         tcp_publication_spec,
+         tcp_publication_revoke_fd,
+@@ -244,6 +250,20 @@
+             crate::proxy_routing::prepare_private_loopback(proxy_route_spec.as_deref())
+                 .unwrap_or_else(|err| panic!("failed to prepare private loopback: {err}"));
+         }
++        if host_loopback_active {
++            let bypass = if std::env::var("ZEROBOX_ALLOW_LOCAL_BINDING").as_deref() == Ok("1") {
++                format!(
++                    "localhost,127.0.0.1,::1,{}",
++                    zerobox_protocol::host_loopback::ALIAS
++                )
++            } else {
++                zerobox_protocol::host_loopback::ALIAS.to_string()
++            };
++            unsafe {
++                std::env::set_var("NO_PROXY", &bypass);
++                std::env::set_var("no_proxy", &bypass);
++            }
++        }
+         if let Some(spec) = tcp_publication_spec.as_deref() {
+             crate::proxy_routing::start_tcp_publication_monitor(spec)
+                 .unwrap_or_else(|err| panic!("failed to start TCP publication monitor: {err}"));
+@@ -255,7 +275,7 @@
+             /*apply_landlock_fs*/ false,
+             allow_network_for_proxy,
+             proxy_routing_active,
+-            !mediated_direct_tcp_ports.is_empty(),
++            !mediated_direct_tcp_ports.is_empty() || host_loopback_active,
+         ) {
+             panic!("error applying Linux sandbox restrictions: {e:?}");
+         }
+@@ -320,6 +340,10 @@
+                     panic!("failed to prepare TCP publication host bridge: {err}")
+                 })
+         });
++        let host_loopback_tools = host_loopback_broker_path.as_ref().map(|_| {
++            crate::host_loopback::setup_tools()
++                .unwrap_or_else(|error| panic!("host loopback setup tools unavailable: {error}"))
++        });
+         if !mediated_direct_tcp_ports.is_empty() {
+             let broker_path = mediated_direct_broker_path.as_deref().unwrap_or_else(|| {
+                 panic!("mediated direct TCP requires an explicit private broker path")
+@@ -332,12 +356,23 @@
+                 panic!("failed to prepare mediated network namespace: {error}")
+             });
+         }
++        if let Some(path) = host_loopback_broker_path.as_deref() {
++            crate::host_loopback::prepare(
++                path,
++                !mediated_direct_tcp_ports.is_empty(),
++                host_loopback_tools
++                    .as_ref()
++                    .expect("host loopback setup tools were verified"),
++            )
++            .unwrap_or_else(|error| panic!("failed to prepare host loopback namespace: {error}"));
++        }
+         let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
+             sandbox_policy_cwd: &sandbox_policy_cwd,
+             command_cwd: command_cwd.as_deref(),
+             permission_profile: &permission_profile,
+             allow_network_for_proxy,
+             mediated_direct_tcp_ports: &mediated_direct_tcp_ports,
++            host_loopback_active: host_loopback_broker_path.is_some(),
+             proxy_route_spec,
+             tcp_publication_spec: tcp_publication_host
+                 .as_ref()
+@@ -353,7 +388,7 @@
+             inner,
+             !no_proc,
+             allow_network_for_proxy,
+-            !mediated_direct_tcp_ports.is_empty(),
++            !mediated_direct_tcp_ports.is_empty() || host_loopback_broker_path.is_some(),
+             private_proxy_source,
+             private_bind_mounts,
+             tcp_publication_host.is_some(),
+@@ -2181,6 +2216,7 @@
+     permission_profile: &'a PermissionProfile,
+     allow_network_for_proxy: bool,
+     mediated_direct_tcp_ports: &'a [u16],
++    host_loopback_active: bool,
+     proxy_route_spec: Option<String>,
+     tcp_publication_spec: Option<String>,
+     setup_status_fd: Option<i32>,
+@@ -2372,6 +2408,7 @@
+         permission_profile,
+         allow_network_for_proxy,
+         mediated_direct_tcp_ports,
++        host_loopback_active,
+         proxy_route_spec,
+         tcp_publication_spec,
+         setup_status_fd,
+@@ -2412,6 +2449,9 @@
+             .unwrap_or_else(|| panic!("managed proxy mode requires a proxy route spec"));
+         inner.push("--proxy-route-spec".to_string());
+         inner.push(proxy_route_spec);
++    }
++    if host_loopback_active {
++        inner.push("--host-loopback-active".to_string());
+     }
+     for port in mediated_direct_tcp_ports {
+         inner.push("--mediated-direct-tcp-port".to_string());
+--- upstream/linux-sandbox/src/linux_run_main_tests.rs
++++ upstream/linux-sandbox/src/linux_run_main_tests.rs
+@@ -577,6 +577,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: true,
+         mediated_direct_tcp_ports: &[],
++        host_loopback_active: false,
+         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -596,6 +597,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: true,
+         mediated_direct_tcp_ports: &[80, 443],
++        host_loopback_active: false,
+         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -619,6 +621,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         mediated_direct_tcp_ports: &[],
++        host_loopback_active: false,
+         proxy_route_spec: None,
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -641,6 +644,7 @@
+         permission_profile: &permission_profile,
+         allow_network_for_proxy: false,
+         mediated_direct_tcp_ports: &[],
++        host_loopback_active: false,
+         proxy_route_spec: None,
+         tcp_publication_spec: None,
+         setup_status_fd: None,
+@@ -660,6 +664,7 @@
+             permission_profile: &permission_profile,
+             allow_network_for_proxy: true,
+             mediated_direct_tcp_ports: &[],
++            host_loopback_active: false,
+             proxy_route_spec: None,
+             tcp_publication_spec: None,
+             setup_status_fd: None,
+--- upstream/linux-sandbox/src/mediated_direct.rs
++++ upstream/linux-sandbox/src/mediated_direct.rs
+@@ -106,7 +106,7 @@
+     Ok(())
+ }
+ 
+-fn enter_setup_namespaces() -> io::Result<()> {
++pub(crate) fn enter_setup_namespaces() -> io::Result<()> {
+     let outer_uid = unsafe { libc::geteuid() };
+     let outer_gid = unsafe { libc::getegid() };
+     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+--- upstream/network-proxy/src/lib.rs
++++ upstream/network-proxy/src/lib.rs
+@@ -15,6 +15,8 @@
+ mod state;
+ mod upstream;
+ 
++#[path = "../../../crates/zerobox-protocol/src/host_loopback.rs"]
++pub mod host_loopback;
+ pub use config::NetworkDomainPermission;
+ pub use config::NetworkDomainPermissionEntry;
+ pub use config::NetworkDomainPermissions;
+@@ -23,6 +25,7 @@
+ pub use config::NetworkUnixSocketPermission;
+ pub use config::NetworkUnixSocketPermissions;
+ pub use config::host_and_port_from_network_addr;
++pub use host_loopback::ALIAS as HOST_LOOPBACK_ALIAS;
+ pub use network_policy::NetworkDecision;
+ pub use network_policy::NetworkDecisionSource;
+ pub use network_policy::NetworkPolicyDecider;
+--- upstream/network-proxy/src/runtime.rs
++++ upstream/network-proxy/src/runtime.rs
+@@ -515,7 +515,11 @@
+             Err(_) => return Ok(false),
+         };
+         let guard = self.state.read().await;
+-        if rules_match_host_or_unscoped(&guard.deny_rules, host.as_str(), port, true)
++        if (host.as_str() == crate::HOST_LOOPBACK_ALIAS
++            && ["localhost", "127.0.0.1", "::1"]
++                .iter()
++                .any(|alias| rules_match_host_or_unscoped(&guard.deny_rules, alias, port, true)))
++            || rules_match_host_or_unscoped(&guard.deny_rules, host.as_str(), port, true)
+             || (guard.deny_rules.is_empty()
+                 && globset_matches_host_or_unscoped(&guard.deny_set, host.as_str()))
+         {
+--- upstream/network-proxy/src/state.rs
++++ upstream/network-proxy/src/state.rs
+@@ -113,7 +113,7 @@
+             let valid_domain = !domain.is_empty()
+                 && !domain.contains('*')
+                 && matches!(url::Host::parse(domain), Ok(url::Host::Domain(_)));
+-            if rule.port.is_none()
++            if (rule.port.is_none() && rule.pattern != crate::HOST_LOOPBACK_ALIAS)
+                 || rule.pattern == "*"
+                 || rule.is_explicit_loopback()
+                 || rule.pattern.parse::<IpAddr>().is_ok()
