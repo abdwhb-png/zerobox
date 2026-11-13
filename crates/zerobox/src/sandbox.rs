@@ -1713,7 +1713,7 @@ impl Sandbox {
                 }
             }
             if let Some(broker) = host_loopback_broker.as_ref() {
-                bind_values.push(serde_json::json!({ "source": broker.hosts_path(), "destination": "/etc/hosts", "read_only": true }));
+                bind_values.push(serde_json::json!({ "source": broker.hosts_path(), "destination": "/etc/hosts", "read_only": true, "pre_remount": true }));
             }
             if let Some(control) = admission_control.as_ref() {
                 bind_values.push(control.bind_value());
