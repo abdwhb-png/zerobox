@@ -116,7 +116,7 @@ pub(crate) fn prepare(
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let rules = format!(
-        "table ip zerobox_host_loopback {{ chain output {{ type nat hook output priority dstnat; policy accept; ip daddr {address} meta l4proto tcp redirect to :{port} }} }}\n"
+        "table ip zerobox_host_loopback {{\n chain output {{\n  type nat hook output priority dstnat; policy accept;\n  ip daddr {address} meta l4proto tcp redirect to :{port}\n }}\n}}\n"
     );
     let mut command = setup_command(&nft)
         .args(["-f", "-"])
